@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.14.0",
     "asyncpg>=0.30.0",
+    "celery>=5.5.0",
     "fastapi>=0.115.0",
     "openpyxl>=3.1.0",
     "pandas>=2.0.0",
@@ -13,7 +14,9 @@ dependencies = [
     "pypdfium2>=5.8.0",
     "python-docx>=1.2.0",
     "python-multipart>=0.0.20",
+    "redis>=6.0.0",
     "sqlalchemy[asyncio]>=2.0.36",
+    "tenacity>=9.0.0",
     "uvicorn[standard]>=0.30.0",
     "xlrd>=2.0.0",
 ]
