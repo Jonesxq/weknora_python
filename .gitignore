@@ -1,0 +1,23 @@
+# uv 创建的虚拟环境，不应提交
+.venv/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 测试和代码检查缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 测试覆盖率
+.coverage
+htmlcov/
+
+# 本地环境变量，可能包含密码或密钥
+.env
+
+# Python 构建产物
+build/
+dist/
+*.egg-info/
