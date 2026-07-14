@@ -42,6 +42,7 @@ postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/graph
 
 - `GRAPH_DATABASE_URL`：必须使用 `postgresql+asyncpg` 驱动。
 - `GRAPH_DATABASE_ECHO`：设置为 `true` 时输出 SQL 日志。
+- `GRAPH_WIKI_CONTEXT_SECRET`：至少 32 个字符，用于验证可信网关注入的访问上下文。
 
 ```powershell
 # 启动仓库内定义的 PostgreSQL 16 服务
@@ -56,15 +57,18 @@ uv run alembic upgrade head --sql
 
 ## 临时访问上下文
 
-当前仓库还没有统一鉴权模块，因此 Wiki API 通过可替换的 FastAPI 依赖读取以下请求头：
+当前仓库还没有统一鉴权模块，因此 Wiki API 通过可替换的 FastAPI 依赖读取可信网关注入的请求头。网关必须移除外部请求中的同名头，再使用 `GRAPH_WIKI_CONTEXT_SECRET` 生成签名：
 
 | 请求头 | 说明 |
 | --- | --- |
 | `X-Tenant-ID` | 当前租户整数 ID |
 | `X-User-ID` | 当前用户或调用方 ID |
 | `X-Role` | `viewer`、`contributor`、`owner` 或 `admin` |
+| `X-Wiki-Context-Signature` | 对 tenant、user、role 和 kb_id 计算的 HMAC-SHA256 十六进制签名 |
 
-`viewer` 只能读取；其余三个角色可以写入。接入正式鉴权后，应替换 `app.api.dependencies.get_wiki_scope`，Wiki 服务和仓储不需要改动。
+`viewer` 和尚未携带 KB 编辑授权证明的 `contributor` 只能读取；`owner` 和 `admin` 可以写入。接入正式鉴权后，应替换 `app.api.dependencies.get_wiki_scope`，并由认证/ACL 层确认 KB 归属或共享权限；Wiki 服务和仓储不需要改动。
+
+签名载荷使用换行连接以下字段：`tenant_id`、`user_id`、规范化小写 `role`、`kb_id`。服务端未配置密钥时返回 503，签名不匹配时返回 401。
 
 ## 接口清单
 
@@ -88,3 +92,17 @@ uv run alembic upgrade head --sql
 | PUT | `/issues/{issue_id}/status` | 范围化更新问题状态 |
 
 页面更新建议提交 `version`。版本冲突返回 HTTP 409 和 `VERSION_CONFLICT`；暂时缺失版本时使用读取到的当前版本，供旧客户端过渡。
+
+## PostgreSQL 集成测试
+
+仓储集成测试只连接专用 PostgreSQL 测试库。设置测试连接后运行：
+
+```powershell
+# 指向允许创建临时 schema 的专用 PostgreSQL 测试库
+$env:GRAPH_TEST_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/graph_test"
+
+# 运行真实 PostgreSQL 仓储集成测试
+uv run pytest tests/wiki/test_postgres_integration.py -q
+```
+
+未设置 `GRAPH_TEST_DATABASE_URL` 时该测试会跳过，不会回退到 SQLite。

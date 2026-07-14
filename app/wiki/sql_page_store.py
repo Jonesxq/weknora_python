@@ -106,6 +106,34 @@ def build_page_list_statement(
     return statement.order_by(order, WikiPage.slug.asc()).offset(query.offset).limit(query.page_size)
 
 
+def build_folder_path_statement(scope: WikiScope, folder_id: UUID):
+    return (
+        select(WikiFolder.path)
+        .where(
+            WikiFolder.id == folder_id,
+            WikiFolder.tenant_id == scope.tenant_id,
+            WikiFolder.knowledge_base_id == scope.knowledge_base_id,
+            WikiFolder.deleted_at.is_(None),
+        )
+        .with_for_update()
+    )
+
+
+def build_link_backfill_statement(
+    scope: WikiScope, slug: str, target_page_id: UUID
+):
+    return (
+        update(WikiLink)
+        .where(
+            WikiLink.tenant_id == scope.tenant_id,
+            WikiLink.knowledge_base_id == scope.knowledge_base_id,
+            WikiLink.target_slug == slug,
+            WikiLink.target_page_id.is_(None),
+        )
+        .values(target_page_id=target_page_id)
+    )
+
+
 class SqlAlchemyPageStore:
     """使用同一 AsyncSession 原子维护页面、链接和日志。"""
 
@@ -123,14 +151,7 @@ class SqlAlchemyPageStore:
     async def get_folder_path(self, scope: WikiScope, folder_id: UUID | None) -> list[str]:
         if folder_id is None:
             return []
-        result = await self._session.execute(
-            select(WikiFolder.path).where(
-                WikiFolder.id == folder_id,
-                WikiFolder.tenant_id == scope.tenant_id,
-                WikiFolder.knowledge_base_id == scope.knowledge_base_id,
-                WikiFolder.deleted_at.is_(None),
-            )
-        )
+        result = await self._session.execute(build_folder_path_statement(scope, folder_id))
         path = result.scalar_one_or_none()
         if path is None:
             raise WikiNotFoundError("FOLDER_NOT_FOUND", "Wiki 目录不存在")
@@ -184,10 +205,16 @@ class SqlAlchemyPageStore:
         page = result.scalar_one_or_none()
         if page is None:
             raise WikiNotFoundError("PAGE_NOT_FOUND", "Wiki 页面不存在")
-        await self._session.execute(delete(WikiLink).where(WikiLink.source_page_id == page.id))
+        await self._session.execute(
+            delete(WikiLink).where(
+                WikiLink.tenant_id == scope.tenant_id,
+                WikiLink.source_page_id == page.id,
+            )
+        )
         await self._session.execute(
             update(WikiLink)
             .where(
+                WikiLink.tenant_id == scope.tenant_id,
                 WikiLink.knowledge_base_id == scope.knowledge_base_id,
                 WikiLink.target_page_id == page.id,
             )
@@ -203,6 +230,7 @@ class SqlAlchemyPageStore:
         outgoing_result = await self._session.execute(
             select(WikiLink.target_slug)
             .where(
+                WikiLink.tenant_id == scope.tenant_id,
                 WikiLink.knowledge_base_id == scope.knowledge_base_id,
                 WikiLink.source_page_id == page.id,
             )
@@ -214,6 +242,7 @@ class SqlAlchemyPageStore:
             .where(
                 *_page_scope(scope),
                 WikiPage.status == "published",
+                WikiLink.tenant_id == scope.tenant_id,
                 WikiLink.target_slug == page.slug,
             )
             .order_by(WikiPage.slug)
@@ -238,7 +267,12 @@ class SqlAlchemyPageStore:
     async def _replace_links(
         self, scope: WikiScope, page: WikiPage, targets: list[str]
     ) -> None:
-        await self._session.execute(delete(WikiLink).where(WikiLink.source_page_id == page.id))
+        await self._session.execute(
+            delete(WikiLink).where(
+                WikiLink.tenant_id == scope.tenant_id,
+                WikiLink.source_page_id == page.id,
+            )
+        )
         if not targets:
             return
         target_rows = await self._session.execute(
@@ -249,6 +283,7 @@ class SqlAlchemyPageStore:
         target_ids = dict(target_rows.all())
         self._session.add_all(
             WikiLink(
+                tenant_id=scope.tenant_id,
                 knowledge_base_id=scope.knowledge_base_id,
                 source_page_id=page.id,
                 target_slug=target,
@@ -259,13 +294,7 @@ class SqlAlchemyPageStore:
 
     async def _backfill_target(self, scope: WikiScope, page: WikiPage) -> None:
         await self._session.execute(
-            update(WikiLink)
-            .where(
-                WikiLink.knowledge_base_id == scope.knowledge_base_id,
-                WikiLink.target_slug == page.slug,
-                WikiLink.target_page_id.is_(None),
-            )
-            .values(target_page_id=page.id)
+            build_link_backfill_statement(scope, page.slug, page.id)
         )
 
     def _append_log(

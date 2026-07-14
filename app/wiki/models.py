@@ -131,17 +131,36 @@ class WikiPage(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+Index(
+    "ix_wiki_pages_title_trgm",
+    func.lower(WikiPage.title).label("title_lower"),
+    postgresql_using="gin",
+    postgresql_ops={"title_lower": "gin_trgm_ops"},
+    postgresql_where=WikiPage.deleted_at.is_(None),
+)
+Index(
+    "ix_wiki_pages_search_fts",
+    func.to_tsvector(
+        text("'simple'"),
+        WikiPage.title + " " + WikiPage.summary + " " + WikiPage.content,
+    ),
+    postgresql_using="gin",
+    postgresql_where=WikiPage.deleted_at.is_(None),
+)
+
+
 class WikiLink(Base):
     """从页面正文解析得到的结构化链接投影。"""
 
     __tablename__ = "wiki_links"
     __table_args__ = (
         UniqueConstraint("source_page_id", "target_slug", name="uq_wiki_links_source_target"),
-        Index("ix_wiki_links_scope_target", "knowledge_base_id", "target_slug"),
+        Index("ix_wiki_links_scope_target", "tenant_id", "knowledge_base_id", "target_slug"),
         Index("ix_wiki_links_target_page", "target_page_id"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    tenant_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     knowledge_base_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     source_page_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("wiki_pages.id", ondelete="CASCADE"), nullable=False

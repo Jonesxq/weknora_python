@@ -7,6 +7,8 @@ from sqlalchemy.dialects import postgresql
 from app.schemas.wiki.pages import WikiPageListQuery
 from app.wiki.scope import WikiScope
 from app.wiki.sql_page_store import (
+    build_folder_path_statement,
+    build_link_backfill_statement,
     build_page_list_statement,
     build_page_lookup_statement,
     build_page_update_statement,
@@ -60,3 +62,22 @@ def test_page_list_sql_is_a_narrow_projection() -> None:
     assert "wiki_pages.content" not in selected
     assert "wiki_pages.source_refs" not in selected
     assert "wiki_pages.chunk_refs" not in selected
+
+
+def test_folder_path_lookup_locks_scoped_folder() -> None:
+    scope = WikiScope(tenant_id=7, knowledge_base_id=uuid4(), actor_id="user")
+
+    sql = _sql(build_folder_path_statement(scope, uuid4()))
+
+    assert "wiki_folders.tenant_id = 7" in sql
+    assert "wiki_folders.deleted_at IS NULL" in sql
+    assert "FOR UPDATE" in sql
+
+
+def test_link_backfill_is_explicitly_tenant_scoped() -> None:
+    scope = WikiScope(tenant_id=7, knowledge_base_id=uuid4(), actor_id="user")
+
+    sql = _sql(build_link_backfill_statement(scope, "entity/acme", uuid4()))
+
+    assert "wiki_links.tenant_id = 7" in sql
+    assert f"wiki_links.knowledge_base_id = '{scope.knowledge_base_id}'" in sql

@@ -3,6 +3,9 @@
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from functools import lru_cache
+import hashlib
+import hmac
+import os
 from typing import Annotated
 from uuid import UUID
 
@@ -12,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from app.docreader import DocumentReaderService
 from app.infrastructure.database.config import DatabaseSettings
 from app.infrastructure.database.session import create_database_engine, create_session_factory
-from app.wiki.errors import WikiPermissionError, WikiValidationError
+from app.wiki.errors import WikiError, WikiPermissionError, WikiValidationError
 from app.wiki.folder_service import WikiFolderService
 from app.wiki.page_service import WikiPageService
 from app.wiki.query_service import WikiQueryService
@@ -72,10 +75,34 @@ def get_wiki_scope(
     tenant_id: Annotated[int, Header(alias="X-Tenant-ID")],
     user_id: Annotated[str, Header(alias="X-User-ID", min_length=1)],
     role: Annotated[str, Header(alias="X-Role")],
+    signature: Annotated[
+        str,
+        Header(alias="X-Wiki-Context-Signature", min_length=64, max_length=64),
+    ],
 ) -> WikiScope:
     """临时访问适配层；接入真实鉴权后只需替换此依赖。"""
 
     normalized_role = role.strip().casefold()
+    secret = os.getenv("GRAPH_WIKI_CONTEXT_SECRET", "")
+    if len(secret) < 32:
+        raise WikiError(
+            "WIKI_CONTEXT_NOT_CONFIGURED",
+            "服务端未配置安全的 Wiki 访问上下文密钥",
+            503,
+        )
+    expected_signature = sign_wiki_context(
+        secret,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        role=normalized_role,
+        knowledge_base_id=kb_id,
+    )
+    if not hmac.compare_digest(signature.casefold(), expected_signature):
+        raise WikiError(
+            "INVALID_WIKI_CONTEXT_SIGNATURE",
+            "Wiki 访问上下文签名无效",
+            401,
+        )
     allowed_roles = {"viewer", "contributor", "owner", "admin"}
     if normalized_role not in allowed_roles:
         raise WikiValidationError("INVALID_WIKI_ROLE", "X-Role 不是受支持的 Wiki 角色")
@@ -83,8 +110,29 @@ def get_wiki_scope(
         tenant_id=tenant_id,
         knowledge_base_id=kb_id,
         actor_id=user_id,
-        can_write=normalized_role in {"contributor", "owner", "admin"},
+        can_write=normalized_role in {"owner", "admin"},
     )
+
+
+def sign_wiki_context(
+    secret: str,
+    *,
+    tenant_id: int,
+    user_id: str,
+    role: str,
+    knowledge_base_id: UUID,
+) -> str:
+    """为可信网关注入的 Wiki 上下文生成 HMAC-SHA256 签名。"""
+
+    payload = "\n".join(
+        (
+            str(tenant_id),
+            user_id,
+            role.strip().casefold(),
+            str(knowledge_base_id),
+        )
+    ).encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
 
 
 def get_wiki_write_scope(

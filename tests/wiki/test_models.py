@@ -33,4 +33,15 @@ def test_phase_one_models_are_scoped_by_tenant_and_knowledge_base() -> None:
         assert "tenant_id" in columns
         assert "knowledge_base_id" in columns
 
+    assert "tenant_id" in WikiLink.__table__.columns
     assert "knowledge_base_id" in WikiLink.__table__.columns
+
+
+def test_orm_metadata_tracks_search_indexes_created_by_migration() -> None:
+    index_names = {index.name for index in WikiPage.__table__.indexes}
+
+    assert "ix_wiki_pages_title_trgm" in index_names
+    assert "ix_wiki_pages_search_fts" in index_names
+
+    for index in WikiPage.__table__.indexes:
+        str(CreateIndex(index).compile(dialect=postgresql.dialect()))

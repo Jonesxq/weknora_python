@@ -6,16 +6,28 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.dependencies import get_wiki_services
+from app.api.dependencies import get_wiki_services, sign_wiki_context
 from app.main import app
 from app.schemas.wiki.queries import WikiStatsResponse
 
 KB_ID = uuid4()
-VIEWER_HEADERS = {
-    "X-Tenant-ID": "7",
-    "X-User-ID": "viewer-1",
-    "X-Role": "viewer",
-}
+CONTEXT_SECRET = "test-wiki-context-secret-at-least-32-bytes"
+
+
+def wiki_headers(role: str = "viewer", *, signature: str | None = None) -> dict[str, str]:
+    headers = {
+        "X-Tenant-ID": "7",
+        "X-User-ID": "viewer-1",
+        "X-Role": role,
+    }
+    headers["X-Wiki-Context-Signature"] = signature or sign_wiki_context(
+        CONTEXT_SECRET,
+        tenant_id=7,
+        user_id="viewer-1",
+        role=role,
+        knowledge_base_id=KB_ID,
+    )
+    return headers
 
 
 class FakeQueryService:
@@ -24,7 +36,8 @@ class FakeQueryService:
 
 
 @pytest.fixture
-def client() -> TestClient:
+def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    monkeypatch.setenv("GRAPH_WIKI_CONTEXT_SECRET", CONTEXT_SECRET)
     services = SimpleNamespace(query=FakeQueryService(), page=SimpleNamespace(), folder=SimpleNamespace())
     app.dependency_overrides[get_wiki_services] = lambda: services
     with TestClient(app) as test_client:
@@ -89,7 +102,7 @@ def test_wiki_endpoint_requires_access_headers(client: TestClient) -> None:
 def test_stats_returns_frontend_polling_fields(client: TestClient) -> None:
     response = client.get(
         f"/api/v1/knowledgebase/{KB_ID}/wiki/stats",
-        headers=VIEWER_HEADERS,
+        headers=wiki_headers(),
     )
 
     assert response.status_code == 200
@@ -106,7 +119,18 @@ def test_stats_returns_frontend_polling_fields(client: TestClient) -> None:
 def test_viewer_cannot_create_page(client: TestClient) -> None:
     response = client.post(
         f"/api/v1/knowledgebase/{KB_ID}/wiki/pages",
-        headers=VIEWER_HEADERS,
+        headers=wiki_headers(),
+        json={"slug": "entity/acme", "title": "Acme", "page_type": "entity"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "WIKI_WRITE_FORBIDDEN"
+
+
+def test_contributor_without_kb_edit_proof_cannot_create_page(client: TestClient) -> None:
+    response = client.post(
+        f"/api/v1/knowledgebase/{KB_ID}/wiki/pages",
+        headers=wiki_headers("contributor"),
         json={"slug": "entity/acme", "title": "Acme", "page_type": "entity"},
     )
 
@@ -117,8 +141,18 @@ def test_viewer_cannot_create_page(client: TestClient) -> None:
 def test_rejects_unknown_role_with_stable_error_code(client: TestClient) -> None:
     response = client.get(
         f"/api/v1/knowledgebase/{KB_ID}/wiki/stats",
-        headers={**VIEWER_HEADERS, "X-Role": "superuser"},
+        headers=wiki_headers("superuser"),
     )
 
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "INVALID_WIKI_ROLE"
+
+
+def test_rejects_forged_access_context_signature(client: TestClient) -> None:
+    response = client.get(
+        f"/api/v1/knowledgebase/{KB_ID}/wiki/stats",
+        headers=wiki_headers(signature="0" * 64),
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"]["code"] == "INVALID_WIKI_CONTEXT_SIGNATURE"

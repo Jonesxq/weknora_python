@@ -6,6 +6,9 @@
 # 同步 Python 依赖
 uv sync
 
+# 创建本地环境变量文件并替换其中的 Wiki 上下文密钥
+Copy-Item .env.example .env
+
 # 启动本地 PostgreSQL
 docker compose up -d postgres
 
@@ -13,7 +16,7 @@ docker compose up -d postgres
 uv run alembic upgrade head
 
 # 启动 FastAPI 开发服务
-uv run uvicorn app.main:app --reload
+uv run uvicorn app.main:app --reload --env-file .env
 
 # 运行全部自动化测试
 uv run pytest -q

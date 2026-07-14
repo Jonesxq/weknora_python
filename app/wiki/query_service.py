@@ -55,6 +55,7 @@ def build_search_statement(scope: WikiScope, query: str, *, limit: int):
         + case((func.lower(WikiPage.slug).ilike(contains_pattern), 1.5), else_=0.0)
         + func.ts_rank_cd(vector, ts_query)
     ).label("rank")
+    total_count = func.count().over().label("total_count")
     return (
         select(
             WikiPage.id,
@@ -63,6 +64,7 @@ def build_search_statement(scope: WikiScope, query: str, *, limit: int):
             WikiPage.summary,
             WikiPage.page_type,
             rank,
+            total_count,
         )
         .where(
             WikiPage.tenant_id == scope.tenant_id,
@@ -76,6 +78,69 @@ def build_search_statement(scope: WikiScope, query: str, *, limit: int):
             ),
         )
         .order_by(rank.desc(), WikiPage.slug.asc())
+        .limit(limit)
+    )
+
+
+def build_ego_edge_statement(scope: WikiScope, frontier: set[UUID], *, limit: int):
+    """构建有稳定顺序和硬上限的单跳边查询。"""
+
+    return (
+        select(WikiLink.source_page_id, WikiLink.target_page_id)
+        .where(
+            WikiLink.tenant_id == scope.tenant_id,
+            WikiLink.knowledge_base_id == scope.knowledge_base_id,
+            WikiLink.target_page_id.is_not(None),
+            or_(
+                WikiLink.source_page_id.in_(frontier),
+                WikiLink.target_page_id.in_(frontier),
+            ),
+        )
+        .order_by(WikiLink.source_page_id, WikiLink.target_page_id)
+        .limit(limit)
+    )
+
+
+def build_broken_link_statement(scope: WikiScope, *, limit: int):
+    return (
+        select(WikiPage.slug, WikiLink.target_slug)
+        .join(WikiLink, WikiLink.source_page_id == WikiPage.id)
+        .where(
+            *_active_page_scope(scope),
+            WikiLink.tenant_id == scope.tenant_id,
+            WikiLink.target_page_id.is_(None),
+        )
+        .order_by(WikiPage.slug, WikiLink.target_slug)
+        .limit(limit)
+    )
+
+
+def build_empty_page_statement(scope: WikiScope, *, limit: int):
+    return (
+        select(WikiPage.slug)
+        .where(*_active_page_scope(scope), func.length(func.trim(WikiPage.content)) == 0)
+        .order_by(WikiPage.slug)
+        .limit(limit)
+    )
+
+
+def build_orphan_page_statement(scope: WikiScope, *, limit: int):
+    outgoing = exists(
+        select(WikiLink.id).where(
+            WikiLink.tenant_id == scope.tenant_id,
+            WikiLink.source_page_id == WikiPage.id,
+        )
+    )
+    incoming = exists(
+        select(WikiLink.id).where(
+            WikiLink.tenant_id == scope.tenant_id,
+            WikiLink.target_page_id == WikiPage.id,
+        )
+    )
+    return (
+        select(WikiPage.slug)
+        .where(*_active_page_scope(scope), ~outgoing, ~incoming)
+        .order_by(WikiPage.slug)
         .limit(limit)
     )
 
@@ -196,7 +261,10 @@ class WikiQueryService:
             )
             for row in rows
         ]
-        return WikiSearchResponse(results=results, total=len(results))
+        return WikiSearchResponse(
+            results=results,
+            total=int(rows[0].total_count) if rows else 0,
+        )
 
     async def get_stats(self, scope: WikiScope) -> WikiStatsResponse:
         page_count = await self._count(
@@ -212,7 +280,7 @@ class WikiQueryService:
         link_count = await self._count(
             select(func.count(WikiLink.id))
             .join(WikiPage, WikiPage.id == WikiLink.source_page_id)
-            .where(*_active_page_scope(scope))
+            .where(*_active_page_scope(scope), WikiLink.tenant_id == scope.tenant_id)
         )
         issue_count = await self._count(
             select(func.count(WikiPageIssue.id)).where(
@@ -252,9 +320,11 @@ class WikiQueryService:
     ) -> WikiGraphResponse:
         edge_nodes = union_all(
             select(WikiLink.source_page_id.label("page_id")).where(
+                WikiLink.tenant_id == scope.tenant_id,
                 WikiLink.knowledge_base_id == scope.knowledge_base_id
             ),
             select(WikiLink.target_page_id.label("page_id")).where(
+                WikiLink.tenant_id == scope.tenant_id,
                 WikiLink.knowledge_base_id == scope.knowledge_base_id,
                 WikiLink.target_page_id.is_not(None),
             ),
@@ -317,16 +387,13 @@ class WikiQueryService:
         frontier = {center_row.id}
         collected_edges: set[tuple[UUID, UUID]] = set()
         for _ in range(max(1, min(hops, 3))):
+            remaining = limit - len(pages)
+            if remaining <= 0:
+                break
+            edge_limit = min(self.GRAPH_HARD_LIMIT * 4, max(remaining * 4, remaining))
             edge_rows = (
                 await self._session.execute(
-                    select(WikiLink.source_page_id, WikiLink.target_page_id).where(
-                        WikiLink.knowledge_base_id == scope.knowledge_base_id,
-                        WikiLink.target_page_id.is_not(None),
-                        or_(
-                            WikiLink.source_page_id.in_(frontier),
-                            WikiLink.target_page_id.in_(frontier),
-                        ),
-                    )
+                    build_ego_edge_statement(scope, frontier, limit=edge_limit)
                 )
             ).all()
             candidate_ids = {
@@ -338,13 +405,24 @@ class WikiQueryService:
             if not candidate_ids:
                 break
             visited_ids = set(pages)
+            new_candidate_ids = candidate_ids - visited_ids
+            if not new_candidate_ids:
+                collected_edges.update(
+                    (row.source_page_id, row.target_page_id)
+                    for row in edge_rows
+                    if row.source_page_id in visited_ids
+                    and row.target_page_id in visited_ids
+                )
+                break
             candidate_statement = select(
                 WikiPage.id, WikiPage.slug, WikiPage.title, WikiPage.page_type
-            ).where(*_active_page_scope(scope), WikiPage.id.in_(candidate_ids))
+            ).where(*_active_page_scope(scope), WikiPage.id.in_(new_candidate_ids))
             if types:
                 candidate_statement = candidate_statement.where(WikiPage.page_type.in_(types))
+            candidate_statement = candidate_statement.order_by(WikiPage.slug).limit(remaining)
             candidate_rows = (await self._session.execute(candidate_statement)).all()
-            allowed_ids = {row.id for row in candidate_rows}
+            new_ids = {row.id for row in candidate_rows}
+            allowed_ids = visited_ids | new_ids
             pages.update({row.id: row for row in candidate_rows})
             valid_edges = {
                 (row.source_page_id, row.target_page_id)
@@ -352,11 +430,11 @@ class WikiQueryService:
                 if row.source_page_id in allowed_ids and row.target_page_id in allowed_ids
             }
             collected_edges.update(valid_edges)
-            next_frontier = allowed_ids - visited_ids
+            next_frontier = new_ids
             if not next_frontier:
                 break
             frontier = next_frontier
-            if len(pages) >= self.GRAPH_HARD_LIMIT:
+            if len(pages) >= limit:
                 break
 
         id_to_slug = {page_id: row.slug for page_id, row in pages.items()}
@@ -390,32 +468,77 @@ class WikiQueryService:
             edges=[WikiGraphEdgeResponse(source=edge.source, target=edge.target) for edge in graph.edges],
         )
 
-    async def lint(self, scope: WikiScope, *, issue_limit: int = 1000) -> WikiLintResponse:
+    async def lint(self, scope: WikiScope, *, issue_limit: int = 200) -> WikiLintResponse:
+        issue_limit = max(1, min(issue_limit, 200))
         total_pages = await self._count(
             select(func.count(WikiPage.id)).where(*_active_page_scope(scope))
         )
         total_links = await self._count(
             select(func.count(WikiLink.id))
             .join(WikiPage, WikiPage.id == WikiLink.source_page_id)
-            .where(*_active_page_scope(scope))
+            .where(*_active_page_scope(scope), WikiLink.tenant_id == scope.tenant_id)
         )
-        broken_statement = (
-            select(WikiPage.slug, WikiLink.target_slug)
-            .join(WikiLink, WikiLink.source_page_id == WikiPage.id)
-            .where(*_active_page_scope(scope), WikiLink.target_page_id.is_(None))
-            .order_by(WikiPage.slug, WikiLink.target_slug)
+        broken_count = await self._count(
+            select(func.count(WikiLink.id))
+            .join(WikiPage, WikiLink.source_page_id == WikiPage.id)
+            .where(
+                *_active_page_scope(scope),
+                WikiLink.tenant_id == scope.tenant_id,
+                WikiLink.target_page_id.is_(None),
+            )
         )
-        broken_rows = (await self._session.execute(broken_statement)).all()
-        empty_statement = select(WikiPage.slug).where(
-            *_active_page_scope(scope), func.length(func.trim(WikiPage.content)) == 0
+        empty_count = await self._count(
+            select(func.count(WikiPage.id)).where(
+                *_active_page_scope(scope), func.length(func.trim(WikiPage.content)) == 0
+            )
         )
-        empty_slugs = list((await self._session.execute(empty_statement)).scalars())
-        outgoing = exists(select(WikiLink.id).where(WikiLink.source_page_id == WikiPage.id))
-        incoming = exists(select(WikiLink.id).where(WikiLink.target_page_id == WikiPage.id))
-        orphan_statement = select(WikiPage.slug).where(
-            *_active_page_scope(scope), ~outgoing, ~incoming
+        outgoing = exists(
+            select(WikiLink.id).where(
+                WikiLink.tenant_id == scope.tenant_id,
+                WikiLink.source_page_id == WikiPage.id,
+            )
         )
-        orphan_slugs = list((await self._session.execute(orphan_statement)).scalars())
+        incoming = exists(
+            select(WikiLink.id).where(
+                WikiLink.tenant_id == scope.tenant_id,
+                WikiLink.target_page_id == WikiPage.id,
+            )
+        )
+        orphan_count = await self._count(
+            select(func.count(WikiPage.id)).where(
+                *_active_page_scope(scope), ~outgoing, ~incoming
+            )
+        )
+
+        broken_rows = (
+            await self._session.execute(
+                build_broken_link_statement(scope, limit=issue_limit)
+            )
+        ).all()
+        remaining = issue_limit - len(broken_rows)
+        empty_slugs = (
+            list(
+                (
+                    await self._session.execute(
+                        build_empty_page_statement(scope, limit=remaining)
+                    )
+                ).scalars()
+            )
+            if remaining > 0
+            else []
+        )
+        remaining -= len(empty_slugs)
+        orphan_slugs = (
+            list(
+                (
+                    await self._session.execute(
+                        build_orphan_page_statement(scope, limit=remaining)
+                    )
+                ).scalars()
+            )
+            if remaining > 0
+            else []
+        )
 
         issues = [
             WikiLintItem(
@@ -446,9 +569,9 @@ class WikiQueryService:
             for slug in orphan_slugs
         )
         counts = {
-            "orphan_page": len(orphan_slugs),
-            "broken_link": len(broken_rows),
-            "empty_content": len(empty_slugs),
+            "orphan_page": orphan_count,
+            "broken_link": broken_count,
+            "empty_content": empty_count,
         }
         return WikiLintResponse(
             health_score=calculate_health_score(
@@ -458,7 +581,7 @@ class WikiQueryService:
                 counts["empty_content"],
                 total_links,
             ),
-            issues=issues[:issue_limit],
+            issues=issues,
             counts=counts,
         )
 
@@ -580,6 +703,7 @@ class WikiQueryService:
             await self._session.execute(
                 select(WikiLink.source_page_id, WikiLink.target_page_id)
                 .where(
+                    WikiLink.tenant_id == scope.tenant_id,
                     WikiLink.knowledge_base_id == scope.knowledge_base_id,
                     WikiLink.source_page_id.in_(page_ids),
                     WikiLink.target_page_id.in_(page_ids),

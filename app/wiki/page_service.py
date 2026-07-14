@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -17,10 +18,17 @@ from app.schemas.wiki.pages import (
     WikiPageResponse,
     WikiPageUpdateRequest,
 )
-from app.wiki.domain import extract_wiki_links, normalize_category_path, normalize_slug
+from app.wiki.domain import (
+    WikiSlugError,
+    extract_wiki_links,
+    normalize_category_path,
+    normalize_slug,
+)
 from app.wiki.errors import WikiConflictError, WikiNotFoundError, WikiPermissionError, WikiValidationError
 from app.wiki.models import WikiPage
 from app.wiki.scope import WikiScope
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -76,7 +84,7 @@ class WikiPageService:
         self, scope: WikiScope, request: WikiPageCreateRequest
     ) -> WikiPageResponse:
         self._require_write(scope)
-        slug = normalize_slug(request.slug)
+        slug = self._slug(request.slug)
         if await self._store.find_page(scope, slug, include_inactive=True) is not None:
             raise WikiConflictError("SLUG_CONFLICT", f"页面 slug {slug!r} 已存在")
 
@@ -89,13 +97,13 @@ class WikiPageService:
             tenant_id=scope.tenant_id,
             knowledge_base_id=scope.knowledge_base_id,
             slug=slug,
-            title=request.title.strip(),
+            title=self._title(request.title),
             page_type=request.page_type.value,
             status=request.status.value,
             content=request.content,
             summary=request.summary,
             aliases=list(dict.fromkeys(alias.strip() for alias in request.aliases if alias.strip())),
-            parent_slug=normalize_slug(request.parent_slug) if request.parent_slug else None,
+            parent_slug=self._slug(request.parent_slug) if request.parent_slug else None,
             folder_id=request.folder_id,
             category_path=category_path,
             wiki_path=self._wiki_path(category_path, slug),
@@ -113,7 +121,7 @@ class WikiPageService:
         return await self._response(scope, page)
 
     async def get_page(self, scope: WikiScope, slug: str) -> WikiPageResponse:
-        page = await self._store.find_page(scope, normalize_slug(slug))
+        page = await self._store.find_page(scope, self._slug(slug))
         if page is None:
             raise WikiNotFoundError("PAGE_NOT_FOUND", "Wiki 页面不存在")
         return await self._response(scope, page)
@@ -125,10 +133,17 @@ class WikiPageService:
         request: WikiPageUpdateRequest,
     ) -> WikiPageResponse:
         self._require_write(scope)
-        normalized_slug = normalize_slug(slug)
+        normalized_slug = self._slug(slug)
         current = await self._store.find_page(scope, normalized_slug, include_inactive=True)
         if current is None:
             raise WikiNotFoundError("PAGE_NOT_FOUND", "Wiki 页面不存在")
+        if request.version is None:
+            logger.warning(
+                "Wiki 页面更新未提交 version，暂按当前版本兼容: tenant_id=%s kb_id=%s slug=%s",
+                scope.tenant_id,
+                scope.knowledge_base_id,
+                normalized_slug,
+            )
 
         changes = self._update_changes(current, request)
         increment_version = any(
@@ -148,13 +163,13 @@ class WikiPageService:
 
     async def delete_page(self, scope: WikiScope, slug: str) -> None:
         self._require_write(scope)
-        await self._store.soft_delete_page(scope, normalize_slug(slug))
+        await self._store.soft_delete_page(scope, self._slug(slug))
 
     async def move_page(
         self, scope: WikiScope, request: WikiPageMoveRequest
     ) -> WikiPageResponse:
         self._require_write(scope)
-        slug = normalize_slug(request.slug)
+        slug = self._slug(request.slug)
         current = await self._store.find_page(scope, slug, include_inactive=True)
         if current is None:
             raise WikiNotFoundError("PAGE_NOT_FOUND", "Wiki 页面不存在")
@@ -194,6 +209,20 @@ class WikiPageService:
         return "/" + "/".join([*category_path, slug])
 
     @staticmethod
+    def _slug(value: str) -> str:
+        try:
+            return normalize_slug(value)
+        except WikiSlugError as exc:
+            raise WikiValidationError("INVALID_SLUG", f"Wiki slug 无效: {exc}") from exc
+
+    @staticmethod
+    def _title(value: str) -> str:
+        title = value.strip()
+        if not title:
+            raise WikiValidationError("INVALID_PAGE_TITLE", "Wiki 页面标题不能为空")
+        return title
+
+    @staticmethod
     def _update_changes(
         current: WikiPage, request: WikiPageUpdateRequest
     ) -> dict[str, object]:
@@ -202,7 +231,9 @@ class WikiPageService:
             value = getattr(request, field)
             if field in {"title", "page_type", "status"} and value is None:
                 raise WikiValidationError("INVALID_PAGE_UPDATE", f"字段 {field} 不能清空")
-            if field in {"content", "summary"} and value is None:
+            if field == "title":
+                value = WikiPageService._title(value)
+            elif field in {"content", "summary"} and value is None:
                 value = ""
             elif field == "aliases":
                 value = [] if value is None else list(dict.fromkeys(item.strip() for item in value if item.strip()))
@@ -214,7 +245,7 @@ class WikiPageService:
             elif field in {"page_type", "status"}:
                 value = value.value
             elif field == "parent_slug" and value:
-                value = normalize_slug(value)
+                value = WikiPageService._slug(value)
             values[field] = value
         return values
 

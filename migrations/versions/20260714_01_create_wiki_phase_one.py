@@ -118,6 +118,7 @@ def upgrade() -> None:
     op.create_table(
         "wiki_links",
         sa.Column("id", sa.BigInteger(), sa.Identity(), nullable=False),
+        sa.Column("tenant_id", sa.BigInteger(), nullable=False),
         sa.Column("knowledge_base_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("source_page_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("target_slug", sa.String(length=255), nullable=False),
@@ -128,7 +129,11 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("source_page_id", "target_slug", name="uq_wiki_links_source_target"),
     )
-    op.create_index("ix_wiki_links_scope_target", "wiki_links", ["knowledge_base_id", "target_slug"])
+    op.create_index(
+        "ix_wiki_links_scope_target",
+        "wiki_links",
+        ["tenant_id", "knowledge_base_id", "target_slug"],
+    )
     op.create_index("ix_wiki_links_target_page", "wiki_links", ["target_page_id"])
 
     op.create_table(

@@ -69,6 +69,17 @@ class SqlAlchemyFolderStore:
     async def insert_folder(
         self, scope: WikiScope, folder: WikiFolder
     ) -> WikiFolder:
+        if folder.parent_id is not None:
+            parent_result = await self._session.execute(
+                build_folder_lookup_statement(scope, folder.parent_id, for_update=True)
+            )
+            parent = parent_result.scalar_one_or_none()
+            if parent is None:
+                raise WikiNotFoundError("FOLDER_NOT_FOUND", "父目录不存在或已删除")
+            folder.path = f"{parent.path}/{folder.name}"
+            folder.depth = parent.depth + 1
+            if folder.depth > 3:
+                raise WikiValidationError("FOLDER_DEPTH_EXCEEDED", "Wiki 目录最多允许 3 层")
         self._session.add(folder)
         self._append_log(scope, "folder_created", f"创建目录 {folder.path}")
         try:

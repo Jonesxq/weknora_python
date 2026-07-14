@@ -12,6 +12,7 @@ from app.schemas.wiki.pages import (
     WikiPageUpdateRequest,
 )
 from app.wiki.errors import WikiConflictError, WikiNotFoundError, WikiPermissionError, WikiVersionConflictError
+from app.wiki.errors import WikiValidationError
 from app.wiki.models import WikiPage
 from app.wiki.page_service import PageListResult, WikiPageService
 from app.wiki.scope import WikiScope
@@ -248,3 +249,57 @@ async def test_move_page_derives_cache_without_incrementing_version(scope: WikiS
     assert moved.category_path == ["产品", "后端"]
     assert moved.wiki_path == "/产品/后端/entity/acme"
     assert moved.version == 1
+
+
+@pytest.mark.asyncio
+async def test_invalid_slug_is_mapped_to_domain_validation_error(scope: WikiScope) -> None:
+    service = WikiPageService(MemoryPageStore())
+
+    with pytest.raises(WikiValidationError, match="slug"):
+        await service.create_page(
+            scope,
+            WikiPageCreateRequest(slug="../bad", title="Bad", page_type="entity"),
+        )
+    with pytest.raises(WikiValidationError, match="slug"):
+        await service.get_page(scope, "../bad")
+
+
+@pytest.mark.asyncio
+async def test_create_and_update_reject_blank_title(scope: WikiScope) -> None:
+    service = WikiPageService(MemoryPageStore())
+
+    with pytest.raises(WikiValidationError, match="标题"):
+        await service.create_page(
+            scope,
+            WikiPageCreateRequest(slug="entity/acme", title="   ", page_type="entity"),
+        )
+
+    created = await service.create_page(
+        scope,
+        WikiPageCreateRequest(slug="entity/good", title="Good", page_type="entity"),
+    )
+    with pytest.raises(WikiValidationError, match="标题"):
+        await service.update_page(
+            scope,
+            created.slug,
+            WikiPageUpdateRequest(version=1, title="   "),
+        )
+
+
+@pytest.mark.asyncio
+async def test_missing_update_version_records_compatibility_warning(
+    scope: WikiScope, caplog: pytest.LogCaptureFixture
+) -> None:
+    service = WikiPageService(MemoryPageStore())
+    created = await service.create_page(
+        scope,
+        WikiPageCreateRequest(slug="entity/acme", title="Acme", page_type="entity"),
+    )
+
+    await service.update_page(
+        scope,
+        created.slug,
+        WikiPageUpdateRequest(summary="兼容旧客户端"),
+    )
+
+    assert "未提交 version" in caplog.text
