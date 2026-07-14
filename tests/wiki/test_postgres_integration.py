@@ -12,6 +12,7 @@ from app.infrastructure.database.base import Base
 from app.schemas.wiki.pages import WikiPageCreateRequest, WikiPageUpdateRequest
 from app.wiki.errors import WikiNotFoundError, WikiVersionConflictError
 from app.wiki.page_service import WikiPageService
+from app.wiki.query_service import WikiQueryService
 from app.wiki.scope import WikiScope
 from app.wiki.sql_page_store import SqlAlchemyPageStore
 
@@ -90,6 +91,48 @@ async def test_page_store_enforces_scope_links_and_optimistic_version(
             source.slug,
             WikiPageUpdateRequest(version=1, summary="并发旧写入"),
         )
+
+    neighbor_slugs: list[str] = []
+    for index in range(30):
+        neighbor = await service.create_page(
+            scope,
+            WikiPageCreateRequest(
+                slug=f"concept/neighbor-{index:02d}",
+                title=f"Neighbor {index:02d}",
+                page_type="concept",
+                summary="Knowledge Graph neighbor",
+            ),
+        )
+        neighbor_slugs.append(neighbor.slug)
+    updated = await service.update_page(
+        scope,
+        source.slug,
+        WikiPageUpdateRequest(
+            version=2,
+            content=" ".join(f"[[{slug}]]" for slug in neighbor_slugs),
+        ),
+    )
+    assert updated.version == 3
+    await postgres_session.commit()
+
+    queries = WikiQueryService(postgres_session)
+    search = await queries.search(scope, "Knowledge Graph", limit=10)
+    assert search.total >= 30
+    assert search.results
+
+    graph = await queries.get_graph(
+        scope,
+        mode="ego",
+        center=source.slug,
+        hops=1,
+        limit=10,
+        types={"entity", "concept"},
+    )
+    assert len(graph.nodes) == 10
+    assert graph.nodes[0].slug == source.slug
+    assert [node.slug for node in graph.nodes[1:]] == sorted(
+        node.slug for node in graph.nodes[1:]
+    )
 
     other_tenant = WikiScope(
         tenant_id=8,

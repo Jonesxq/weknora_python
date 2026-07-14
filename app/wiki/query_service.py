@@ -6,9 +6,19 @@ import base64
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import case, exists, func, literal, or_, select, union_all, update
+from sqlalchemy import (
+    case,
+    exists,
+    func,
+    literal,
+    literal_column,
+    or_,
+    select,
+    union_all,
+    update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import load_only
+from sqlalchemy.orm import aliased, load_only
 
 from app.schemas.wiki.queries import (
     WikiGraphEdgeResponse,
@@ -31,7 +41,6 @@ from app.schemas.wiki.queries import (
 from app.wiki.domain import calculate_health_score, extract_wiki_links, normalize_slug
 from app.wiki.enums import WikiPageType
 from app.wiki.errors import WikiNotFoundError, WikiPermissionError, WikiValidationError
-from app.wiki.graph import GraphPage, WikiGraphEdge, build_ego_graph
 from app.wiki.models import WikiFolder, WikiLink, WikiLogEntry, WikiPage, WikiPageIssue
 from app.wiki.scope import WikiScope
 from app.wiki.sql_page_store import SqlAlchemyPageStore
@@ -43,11 +52,12 @@ def build_search_statement(scope: WikiScope, query: str, *, limit: int):
     normalized = query.strip().casefold()
     contains_pattern = f"%{normalized}%"
     prefix_pattern = f"{normalized}%"
+    regconfig = literal_column("'simple'::regconfig")
     vector = func.to_tsvector(
-        literal("simple"),
+        regconfig,
         WikiPage.title + literal(" ") + WikiPage.summary + literal(" ") + WikiPage.content,
     )
-    ts_query = func.plainto_tsquery(literal("simple"), query.strip())
+    ts_query = func.plainto_tsquery(regconfig, query.strip())
     title_similarity = func.similarity(func.lower(WikiPage.title), normalized)
     rank = (
         title_similarity * 4
@@ -82,11 +92,53 @@ def build_search_statement(scope: WikiScope, query: str, *, limit: int):
     )
 
 
-def build_ego_edge_statement(scope: WikiScope, frontier: set[UUID], *, limit: int):
-    """构建有稳定顺序和硬上限的单跳边查询。"""
-
+def _graph_degree_cte(scope: WikiScope):
+    edge_nodes = union_all(
+        select(WikiLink.source_page_id.label("page_id")).where(
+            WikiLink.tenant_id == scope.tenant_id,
+            WikiLink.knowledge_base_id == scope.knowledge_base_id,
+        ),
+        select(WikiLink.target_page_id.label("page_id")).where(
+            WikiLink.tenant_id == scope.tenant_id,
+            WikiLink.knowledge_base_id == scope.knowledge_base_id,
+            WikiLink.target_page_id.is_not(None),
+        ),
+    ).cte("edge_nodes")
     return (
-        select(WikiLink.source_page_id, WikiLink.target_page_id)
+        select(edge_nodes.c.page_id, func.count().label("link_count"))
+        .group_by(edge_nodes.c.page_id)
+        .cte("degree")
+    )
+
+
+def build_ego_neighbor_statement(
+    scope: WikiScope,
+    *,
+    frontier: set[UUID],
+    visited: set[UUID],
+    limit: int,
+    types: set[str] | None,
+):
+    """为一层 BFS 返回去重、稳定排序且受预算限制的邻居。"""
+
+    neighbor = aliased(WikiPage, name="neighbor")
+    degree = _graph_degree_cte(scope)
+    neighbor_id = case(
+        (WikiLink.source_page_id.in_(frontier), WikiLink.target_page_id),
+        else_=WikiLink.source_page_id,
+    )
+    link_count = func.coalesce(degree.c.link_count, 0).label("link_count")
+    statement = (
+        select(
+            neighbor.id,
+            neighbor.slug,
+            neighbor.title,
+            neighbor.page_type,
+            link_count,
+        )
+        .select_from(WikiLink)
+        .join(neighbor, neighbor.id == neighbor_id)
+        .outerjoin(degree, degree.c.page_id == neighbor.id)
         .where(
             WikiLink.tenant_id == scope.tenant_id,
             WikiLink.knowledge_base_id == scope.knowledge_base_id,
@@ -95,10 +147,19 @@ def build_ego_edge_statement(scope: WikiScope, frontier: set[UUID], *, limit: in
                 WikiLink.source_page_id.in_(frontier),
                 WikiLink.target_page_id.in_(frontier),
             ),
+            neighbor.tenant_id == scope.tenant_id,
+            neighbor.knowledge_base_id == scope.knowledge_base_id,
+            neighbor.deleted_at.is_(None),
+            neighbor.status == "published",
+            neighbor.id.not_in(visited),
         )
-        .order_by(WikiLink.source_page_id, WikiLink.target_page_id)
+        .distinct()
+        .order_by(link_count.desc(), neighbor.slug.asc())
         .limit(limit)
     )
+    if types:
+        statement = statement.where(neighbor.page_type.in_(types))
+    return statement
 
 
 def build_broken_link_statement(scope: WikiScope, *, limit: int):
@@ -149,6 +210,7 @@ class WikiQueryService:
     """面向现有前端的只读查询和确定性维护操作。"""
 
     GRAPH_HARD_LIMIT = 2000
+    GRAPH_EDGE_HARD_LIMIT = 10000
     _INDEX_TYPES = (
         WikiPageType.SUMMARY,
         WikiPageType.ENTITY,
@@ -318,22 +380,7 @@ class WikiQueryService:
     async def _overview_graph(
         self, scope: WikiScope, limit: int, types: set[str] | None
     ) -> WikiGraphResponse:
-        edge_nodes = union_all(
-            select(WikiLink.source_page_id.label("page_id")).where(
-                WikiLink.tenant_id == scope.tenant_id,
-                WikiLink.knowledge_base_id == scope.knowledge_base_id
-            ),
-            select(WikiLink.target_page_id.label("page_id")).where(
-                WikiLink.tenant_id == scope.tenant_id,
-                WikiLink.knowledge_base_id == scope.knowledge_base_id,
-                WikiLink.target_page_id.is_not(None),
-            ),
-        ).cte("edge_nodes")
-        degree = (
-            select(edge_nodes.c.page_id, func.count().label("link_count"))
-            .group_by(edge_nodes.c.page_id)
-            .cte("degree")
-        )
+        degree = _graph_degree_cte(scope)
         statement = (
             select(
                 WikiPage.id,
@@ -374,9 +421,18 @@ class WikiQueryService:
         limit: int,
         types: set[str] | None,
     ) -> WikiGraphResponse:
-        page_statement = select(
-            WikiPage.id, WikiPage.slug, WikiPage.title, WikiPage.page_type
-        ).where(*_active_page_scope(scope), WikiPage.slug == center)
+        degree = _graph_degree_cte(scope)
+        page_statement = (
+            select(
+                WikiPage.id,
+                WikiPage.slug,
+                WikiPage.title,
+                WikiPage.page_type,
+                func.coalesce(degree.c.link_count, 0).label("link_count"),
+            )
+            .outerjoin(degree, degree.c.page_id == WikiPage.id)
+            .where(*_active_page_scope(scope), WikiPage.slug == center)
+        )
         if types:
             page_statement = page_statement.where(WikiPage.page_type.in_(types))
         center_row = (await self._session.execute(page_statement)).first()
@@ -385,87 +441,46 @@ class WikiQueryService:
 
         pages = {center_row.id: center_row}
         frontier = {center_row.id}
-        collected_edges: set[tuple[UUID, UUID]] = set()
         for _ in range(max(1, min(hops, 3))):
             remaining = limit - len(pages)
             if remaining <= 0:
                 break
-            edge_limit = min(self.GRAPH_HARD_LIMIT * 4, max(remaining * 4, remaining))
-            edge_rows = (
+            neighbor_rows = (
                 await self._session.execute(
-                    build_ego_edge_statement(scope, frontier, limit=edge_limit)
+                    build_ego_neighbor_statement(
+                        scope,
+                        frontier=frontier,
+                        visited=set(pages),
+                        limit=remaining,
+                        types=types,
+                    )
                 )
             ).all()
-            candidate_ids = {
-                page_id
-                for row in edge_rows
-                for page_id in (row.source_page_id, row.target_page_id)
-                if page_id is not None
-            }
-            if not candidate_ids:
+            if not neighbor_rows:
                 break
-            visited_ids = set(pages)
-            new_candidate_ids = candidate_ids - visited_ids
-            if not new_candidate_ids:
-                collected_edges.update(
-                    (row.source_page_id, row.target_page_id)
-                    for row in edge_rows
-                    if row.source_page_id in visited_ids
-                    and row.target_page_id in visited_ids
-                )
-                break
-            candidate_statement = select(
-                WikiPage.id, WikiPage.slug, WikiPage.title, WikiPage.page_type
-            ).where(*_active_page_scope(scope), WikiPage.id.in_(new_candidate_ids))
-            if types:
-                candidate_statement = candidate_statement.where(WikiPage.page_type.in_(types))
-            candidate_statement = candidate_statement.order_by(WikiPage.slug).limit(remaining)
-            candidate_rows = (await self._session.execute(candidate_statement)).all()
-            new_ids = {row.id for row in candidate_rows}
-            allowed_ids = visited_ids | new_ids
-            pages.update({row.id: row for row in candidate_rows})
-            valid_edges = {
-                (row.source_page_id, row.target_page_id)
-                for row in edge_rows
-                if row.source_page_id in allowed_ids and row.target_page_id in allowed_ids
-            }
-            collected_edges.update(valid_edges)
-            next_frontier = new_ids
-            if not next_frontier:
-                break
-            frontier = next_frontier
+            pages.update({row.id: row for row in neighbor_rows})
+            frontier = {row.id for row in neighbor_rows}
             if len(pages) >= limit:
                 break
 
         id_to_slug = {page_id: row.slug for page_id, row in pages.items()}
-        graph = build_ego_graph(
-            [
-                GraphPage(slug=row.slug, title=row.title, page_type=row.page_type)
-                for row in pages.values()
-            ],
-            [
-                WikiGraphEdge(source=id_to_slug[source], target=id_to_slug[target])
-                for source, target in collected_edges
-                if source in id_to_slug and target in id_to_slug
-            ],
-            center=center,
-            hops=hops,
-            limit=limit,
-            allowed_types=types,
+        edges = await self._edges_between(scope, set(pages), id_to_slug)
+        ordered_pages = sorted(
+            pages.values(), key=lambda row: (-int(row.link_count), row.slug)
         )
         return WikiGraphResponse(
             mode="ego",
             center=center,
             nodes=[
                 WikiGraphNode(
-                    slug=node.slug,
-                    title=node.title,
-                    page_type=node.page_type,
-                    link_count=node.link_count,
+                    slug=row.slug,
+                    title=row.title,
+                    page_type=row.page_type,
+                    link_count=int(row.link_count),
                 )
-                for node in graph.nodes
+                for row in ordered_pages
             ],
-            edges=[WikiGraphEdgeResponse(source=edge.source, target=edge.target) for edge in graph.edges],
+            edges=edges,
         )
 
     async def lint(self, scope: WikiScope, *, issue_limit: int = 200) -> WikiLintResponse:
@@ -709,15 +724,17 @@ class WikiQueryService:
                     WikiLink.target_page_id.in_(page_ids),
                 )
                 .order_by(WikiLink.source_page_id, WikiLink.target_page_id)
+                .limit(self.GRAPH_EDGE_HARD_LIMIT)
             )
         ).all()
-        return [
+        edges = [
             WikiGraphEdgeResponse(
                 source=id_to_slug[row.source_page_id],
                 target=id_to_slug[row.target_page_id],
             )
             for row in rows
         ]
+        return sorted(edges, key=lambda edge: (edge.source, edge.target))
 
     async def _count(self, statement) -> int:
         return int((await self._session.execute(statement)).scalar_one())
