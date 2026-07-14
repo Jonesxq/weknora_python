@@ -17,6 +17,9 @@ htmlcov/
 # 本地环境变量，可能包含密码或密钥
 .env
 
+# 本地隔离开发工作区
+.worktrees/
+
 # Python 构建产物
 build/
 dist/
