@@ -1,0 +1,84 @@
+{
+  "knowledge_bases": [
+    {
+      "tenant_id": 1,
+      "knowledge_base_id": "11111111-1111-1111-1111-111111111111",
+      "config": {
+        "wiki_enabled": true,
+        "synthesis_model_id": "fake-synthesis",
+        "summary_model_id": "fake-summary",
+        "extraction_granularity": "standard",
+        "max_pages_per_ingest": 0
+      }
+    }
+  ],
+  "knowledge": [
+    {
+      "id": "knowledge-1",
+      "tenant_id": 1,
+      "knowledge_base_id": "11111111-1111-1111-1111-111111111111",
+      "title": "Acme Retrieval Guide",
+      "op_version": "version-1",
+      "status": "ready",
+      "chunks": [
+        {
+          "id": "chunk-1",
+          "chunk_index": 0,
+          "start_at": 0,
+          "text": "Acme uses retrieval to find relevant documents.",
+          "ocr_text": "",
+          "image_caption": ""
+        },
+        {
+          "id": "chunk-2",
+          "chunk_index": 1,
+          "start_at": 52,
+          "text": "Retrieved context supports grounded answers.",
+          "ocr_text": "retrieval pipeline",
+          "image_caption": "A diagram of document retrieval."
+        }
+      ]
+    }
+  ],
+  "model_responses": {
+    "extract_candidates": {
+      "entities": [
+        {
+          "name": "Acme",
+          "slug": "entity/acme",
+          "page_type": "entity",
+          "aliases": ["Acme Inc."],
+          "description": "A fictional example organization.",
+          "details": "Acme uses retrieval in its document workflow."
+        }
+      ],
+      "concepts": [
+        {
+          "name": "Retrieval",
+          "slug": "concept/retrieval",
+          "page_type": "concept",
+          "aliases": ["Information retrieval"],
+          "description": "Finding relevant source material.",
+          "details": "Retrieval supplies context for grounded answers."
+        }
+      ]
+    },
+    "summaries": {
+      "Acme Retrieval Guide": {
+        "headline": "Acme Retrieval Guide",
+        "markdown": "Acme uses retrieval to ground answers in relevant documents."
+      }
+    },
+    "merges": {
+      "entity/acme": {
+        "headline": "Acme",
+        "markdown": "Acme is a fictional organization that uses document retrieval."
+      },
+      "concept/retrieval": {
+        "headline": "Retrieval",
+        "markdown": "Retrieval finds relevant source material for grounded answers."
+      }
+    }
+  },
+  "transient_failures": {}
+}
