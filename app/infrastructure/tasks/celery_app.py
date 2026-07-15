@@ -7,6 +7,27 @@ from dataclasses import dataclass
 
 from celery import Celery
 
+DEFAULT_CELERY_BROKER_URL = "redis://127.0.0.1:6379/0"
+DEFAULT_CELERY_RESULT_BACKEND = "redis://127.0.0.1:6379/1"
+_TRUE_VALUES = {"true", "1", "yes", "on"}
+_FALSE_VALUES = {"false", "0", "no", "off"}
+
+
+def _read_non_empty(name: str, default: str) -> str:
+    value = os.getenv(name, default).strip()
+    if not value:
+        raise ValueError(f"{name} 不能为空")
+    return value
+
+
+def _read_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name, str(default)).strip().casefold()
+    if value in _TRUE_VALUES:
+        return True
+    if value in _FALSE_VALUES:
+        return False
+    raise ValueError(f"{name} 必须是 true/1/yes/on 或 false/0/no/off")
+
 
 @dataclass(frozen=True, slots=True)
 class CelerySettings:
@@ -21,10 +42,11 @@ class CelerySettings:
         """从环境变量读取 Celery 配置。"""
 
         return cls(
-            broker_url=os.getenv("GRAPH_CELERY_BROKER_URL", "redis://127.0.0.1:6379/0"),
-            result_backend=os.getenv("GRAPH_CELERY_RESULT_BACKEND", "redis://127.0.0.1:6379/1"),
-            task_always_eager=os.getenv("GRAPH_CELERY_TASK_ALWAYS_EAGER", "false").casefold()
-            == "true",
+            broker_url=_read_non_empty("GRAPH_CELERY_BROKER_URL", DEFAULT_CELERY_BROKER_URL),
+            result_backend=_read_non_empty(
+                "GRAPH_CELERY_RESULT_BACKEND", DEFAULT_CELERY_RESULT_BACKEND
+            ),
+            task_always_eager=_read_bool("GRAPH_CELERY_TASK_ALWAYS_EAGER", False),
         )
 
 
