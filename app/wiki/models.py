@@ -302,7 +302,13 @@ class TaskOutbox(Base):
 
     __tablename__ = "task_outbox"
     __table_args__ = (
-        UniqueConstraint("dedup_key", name="uq_task_outbox_dedup_key"),
+        UniqueConstraint(
+            "tenant_id",
+            "knowledge_base_id",
+            "event_type",
+            "dedup_key",
+            name="uq_task_outbox_scope_event_dedup",
+        ),
         Index("ix_task_outbox_delivery", "sent_at", "available_at", "claimed_at"),
         Index("ix_task_outbox_scope", "tenant_id", "knowledge_base_id", "sent_at"),
     )
@@ -311,7 +317,7 @@ class TaskOutbox(Base):
     tenant_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     knowledge_base_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    dedup_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    dedup_key: Mapped[str] = mapped_column(String(64), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     available_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

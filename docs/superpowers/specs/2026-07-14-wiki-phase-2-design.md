@@ -114,11 +114,13 @@ tests/
 - `id`：UUID 主键。
 - `tenant_id`、`knowledge_base_id`。
 - `event_type`：阶段二使用 `wiki.batch.trigger`。
-- `dedup_key`：同一 pending-op 版本的唯一事件键。
+- `dedup_key`：由事件的 canonical tuple 计算得到的 64 字符 SHA-256 十六进制摘要。
 - `payload`：Celery 任务参数。
 - `available_at`：默认延迟 30 秒投递。
 - `claimed_at`、`claim_token`：dispatcher 领取状态。
 - `attempts`、`sent_at`、`created_at`。
+
+唯一键为 `(tenant_id, knowledge_base_id, event_type, dedup_key)`。数据库直接隔离租户、知识库和事件类型，不依赖调用方把 scope 拼入字符串。
 
 dispatcher 使用 `FOR UPDATE SKIP LOCKED` 分页领取；只有 Celery 发送成功后才写 `sent_at`。
 

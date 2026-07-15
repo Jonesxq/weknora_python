@@ -81,7 +81,7 @@ def upgrade() -> None:
         sa.Column("tenant_id", sa.BigInteger(), nullable=False),
         sa.Column("knowledge_base_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("event_type", sa.String(length=64), nullable=False),
-        sa.Column("dedup_key", sa.String(length=512), nullable=False),
+        sa.Column("dedup_key", sa.String(length=64), nullable=False),
         sa.Column("payload", postgresql.JSONB(astext_type=sa.Text()), server_default=JSON_OBJECT, nullable=False),
         sa.Column("available_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.Column("claimed_at", sa.DateTime(timezone=True), nullable=True),
@@ -90,7 +90,13 @@ def upgrade() -> None:
         sa.Column("sent_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("dedup_key", name="uq_task_outbox_dedup_key"),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "knowledge_base_id",
+            "event_type",
+            "dedup_key",
+            name="uq_task_outbox_scope_event_dedup",
+        ),
     )
     op.create_index(
         "ix_task_outbox_delivery",
