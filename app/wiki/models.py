@@ -1,4 +1,4 @@
-"""Wiki 阶段一 PostgreSQL 持久化模型。"""
+"""Wiki PostgreSQL 持久化模型。"""
 
 from __future__ import annotations
 
@@ -222,6 +222,104 @@ class WikiLogEntry(Base):
     message: Mapped[str] = mapped_column(Text, nullable=False)
     pages_affected: Mapped[list[dict[str, str]]] = mapped_column(JSONB, nullable=False, default=list)
     actor_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class WikiPendingOp(Base):
+    """等待进入异步摄取队列的 Wiki 操作。"""
+
+    __tablename__ = "wiki_pending_ops"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "knowledge_base_id",
+            "knowledge_id",
+            "op",
+            "op_version",
+            name="uq_wiki_pending_ops_version",
+        ),
+        Index(
+            "ix_wiki_pending_ops_scope_claim",
+            "tenant_id",
+            "knowledge_base_id",
+            "claimed_at",
+            "enqueued_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    tenant_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    knowledge_base_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    knowledge_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    op: Mapped[str] = mapped_column(String(32), nullable=False, default="ingest")
+    op_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    fail_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    enqueued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+
+class WikiFinalizationMarker(Base):
+    """Wiki 摄取尝试的收尾子任务登记标记。"""
+
+    __tablename__ = "wiki_finalization_markers"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "knowledge_base_id",
+            "knowledge_id",
+            "attempt",
+            "subtask_name",
+            name="uq_wiki_finalization_markers_attempt",
+        ),
+        Index(
+            "ix_wiki_finalization_markers_scope",
+            "tenant_id",
+            "knowledge_base_id",
+            "released_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    tenant_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    knowledge_base_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    knowledge_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    attempt: Mapped[str] = mapped_column(String(255), nullable=False)
+    subtask_name: Mapped[str] = mapped_column(String(64), nullable=False, default="wiki")
+    registered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class TaskOutbox(Base):
+    """等待可靠投递的异步任务事件。"""
+
+    __tablename__ = "task_outbox"
+    __table_args__ = (
+        UniqueConstraint("dedup_key", name="uq_task_outbox_dedup_key"),
+        Index("ix_task_outbox_delivery", "sent_at", "available_at", "claimed_at"),
+        Index("ix_task_outbox_scope", "tenant_id", "knowledge_base_id", "sent_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    tenant_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    knowledge_base_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    dedup_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
