@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 import os
 import re
 from typing import Literal, Self
@@ -231,6 +232,24 @@ class ReducedPage(BaseModel):
 class BatchResult(BaseModel):
     completed_op_ids: list[UUID] = Field(default_factory=list)
     failed_op_ids: list[UUID] = Field(default_factory=list)
+
+    @classmethod
+    def from_ids(
+        cls,
+        pending_op_ids: Iterable[UUID],
+        failed_op_ids: Iterable[UUID],
+    ) -> Self:
+        pending = list(dict.fromkeys(pending_op_ids))
+        failed = list(dict.fromkeys(failed_op_ids))
+        pending_set = set(pending)
+        unknown_failed = [op_id for op_id in failed if op_id not in pending_set]
+        if unknown_failed:
+            raise ValueError("failed_op_ids 必须是 pending_op_ids 的子集")
+        failed_set = set(failed)
+        return cls(
+            completed_op_ids=[op_id for op_id in pending if op_id not in failed_set],
+            failed_op_ids=failed,
+        )
 
     @property
     def completed_ops(self) -> int:

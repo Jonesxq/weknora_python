@@ -244,6 +244,35 @@ def test_batch_result_exposes_read_only_counts() -> None:
         result.completed_ops = 99
 
 
+def test_batch_result_from_ids_classifies_pending_ids_stably() -> None:
+    pending_a, pending_b, pending_c = uuid4(), uuid4(), uuid4()
+
+    result = BatchResult.from_ids(
+        [pending_a, pending_b, pending_c],
+        [pending_b],
+    )
+
+    assert result.completed_op_ids == [pending_a, pending_c]
+    assert result.failed_op_ids == [pending_b]
+    assert result.completed_ops == 2
+    assert result.failed_ops == 1
+
+
+def test_batch_result_from_ids_deduplicates_and_rejects_unknown_failures() -> None:
+    pending_a, pending_b, pending_c, unknown = uuid4(), uuid4(), uuid4(), uuid4()
+
+    result = BatchResult.from_ids(
+        [pending_a, pending_b, pending_a, pending_c],
+        [pending_b, pending_b],
+    )
+
+    assert result.completed_op_ids == [pending_a, pending_c]
+    assert result.failed_op_ids == [pending_b]
+
+    with pytest.raises(ValueError, match="pending"):
+        BatchResult.from_ids([pending_a, pending_b], [pending_b, unknown])
+
+
 def test_page_contribution_uses_independent_list_defaults() -> None:
     first = PageContribution(
         pending_op_id=uuid4(),
