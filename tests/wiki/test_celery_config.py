@@ -21,5 +21,7 @@ def test_celery_app_uses_json_and_utc() -> None:
     app = create_celery_app(CelerySettings("memory://", "cache+memory://", True))
 
     assert app.conf.task_serializer == "json"
+    assert app.conf.result_serializer == "json"
     assert app.conf.accept_content == ["json"]
     assert app.conf.enable_utc is True
+    assert app.conf.timezone == "UTC"
