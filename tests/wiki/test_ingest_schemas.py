@@ -294,3 +294,42 @@ def test_page_contribution_uses_independent_list_defaults() -> None:
     assert second.aliases == []
     assert second.source_refs == []
     assert second.chunk_refs == []
+
+
+@pytest.mark.parametrize("slug", ["entity//acme", "entity/acme/", "entity/acme//detail"])
+def test_slug_rejects_empty_path_segments(slug: str) -> None:
+    with pytest.raises(ValidationError):
+        TopicCandidate(name="Acme", slug=slug, page_type="entity")
+
+
+def test_finalization_request_rejects_cross_scope_knowledge() -> None:
+    knowledge = SourceKnowledge(
+        id="knowledge-1",
+        tenant_id=2,
+        knowledge_base_id=KB_ID,
+        title="Document One",
+        op_version="version-1",
+    )
+    with pytest.raises(ValueError, match="租户"):
+        FinalizationRequest.from_knowledge(
+            WikiScope(tenant_id=1, knowledge_base_id=KB_ID, actor_id="worker"),
+            knowledge,
+        )
+
+
+def test_batch_result_rejects_duplicate_or_overlapping_ids() -> None:
+    op_id = uuid4()
+    with pytest.raises(ValidationError):
+        BatchResult(completed_op_ids=[op_id, op_id])
+    with pytest.raises(ValidationError):
+        BatchResult(completed_op_ids=[op_id], failed_op_ids=[op_id])
+
+
+def test_identity_fields_strip_and_reject_blank_values() -> None:
+    assert SourceChunk(id=" chunk-1 ").id == "chunk-1"
+    with pytest.raises(ValidationError):
+        SourceChunk(id="   ")
+    with pytest.raises(ValidationError):
+        SourceChunk(id="chunk-1", chunk_index=-1)
+    with pytest.raises(ValidationError):
+        SourceChunk(id="chunk-1", start_at=-1)

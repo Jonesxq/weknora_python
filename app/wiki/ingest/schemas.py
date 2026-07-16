@@ -8,7 +8,7 @@ import re
 from typing import Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.wiki.scope import WikiScope
 
@@ -17,13 +17,21 @@ ExtractionGranularity = Literal["focused", "standard", "exhaustive"]
 TopicPageType = Literal["entity", "concept"]
 IngestPageType = Literal["summary", "entity", "concept"]
 
-_SLUG_PATTERN = re.compile(r"[a-z0-9][a-z0-9/_-]*\Z")
+_SLUG_PATTERN = re.compile(
+    r"^(summary|entity|concept)/[a-z0-9][a-z0-9_-]*(?:/[a-z0-9][a-z0-9_-]*)*$"
+)
+
+
+class _StrictModel(BaseModel):
+    """所有摄取 DTO 的共同边界：拒绝未知字段并允许测试时安全修改副本。"""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
 
 def _normalize_slug(value: str, allowed_prefixes: tuple[str, ...]) -> str:
     slug = value.strip().casefold()
-    if not _SLUG_PATTERN.fullmatch(slug):
-        raise ValueError("slug 只能包含小写 ASCII 字母、数字、斜杠、下划线和连字符")
+    if len(slug) > 255 or not _SLUG_PATTERN.fullmatch(slug):
+        raise ValueError("slug 必须是合法的分层路径，且长度不能超过 255")
     if not any(slug.startswith(f"{prefix}/") for prefix in allowed_prefixes):
         raise ValueError(f"slug 必须使用以下前缀之一: {', '.join(allowed_prefixes)}")
     return slug
@@ -40,7 +48,7 @@ def _stable_clean_strings(values: list[str]) -> list[str]:
     return result
 
 
-class WikiIngestConfig(BaseModel):
+class WikiIngestConfig(_StrictModel):
     wiki_enabled: bool = True
     synthesis_model_id: str | None = None
     summary_model_id: str | None = None
@@ -48,7 +56,7 @@ class WikiIngestConfig(BaseModel):
     max_pages_per_ingest: int = Field(default=0, ge=0)
 
 
-class WikiWorkerOptions(BaseModel):
+class WikiWorkerOptions(_StrictModel):
     batch_size: int = Field(default=5, ge=1, le=100)
     map_parallel: int = Field(default=10, ge=1, le=100)
     reduce_parallel: int = Field(default=10, ge=1, le=100)
@@ -76,29 +84,45 @@ class WikiWorkerOptions(BaseModel):
         )
 
 
-class SourceChunk(BaseModel):
-    id: str = Field(min_length=1)
-    chunk_index: int = 0
-    start_at: int = 0
+class SourceChunk(_StrictModel):
+    id: str
+    chunk_index: int = Field(default=0, ge=0)
+    start_at: int = Field(default=0, ge=0)
     text: str = ""
     ocr_text: str = ""
     image_caption: str = ""
 
+    @field_validator("id")
+    @classmethod
+    def normalize_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("chunk id 不能为空")
+        return value
 
-class SourceKnowledge(BaseModel):
-    id: str = Field(min_length=1)
+
+class SourceKnowledge(_StrictModel):
+    id: str
     tenant_id: int
     knowledge_base_id: UUID
-    title: str = Field(min_length=1)
-    op_version: str = Field(min_length=1)
+    title: str
+    op_version: str
     status: Literal["ready", "deleting", "cancelled", "deleted"] = "ready"
 
     @property
     def is_active(self) -> bool:
         return self.status == "ready"
 
+    @field_validator("id", "title", "op_version")
+    @classmethod
+    def normalize_identity(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("知识条目标识、标题和版本不能为空")
+        return value
 
-class TopicCandidate(BaseModel):
+
+class TopicCandidate(_StrictModel):
     name: str
     slug: str
     page_type: TopicPageType
@@ -131,7 +155,7 @@ class TopicCandidate(BaseModel):
         return self
 
 
-class CandidateExtraction(BaseModel):
+class CandidateExtraction(_StrictModel):
     entities: list[TopicCandidate] = Field(default_factory=list)
     concepts: list[TopicCandidate] = Field(default_factory=list)
 
@@ -144,7 +168,7 @@ class CandidateExtraction(BaseModel):
         return self
 
 
-class _ModelTextOutput(BaseModel):
+class _ModelTextOutput(_StrictModel):
     headline: str
     markdown: str
 
@@ -161,7 +185,7 @@ class DocumentSummary(_ModelTextOutput):
     pass
 
 
-class PageContribution(BaseModel):
+class PageContribution(_StrictModel):
     pending_op_id: UUID
     knowledge_id: str
     title: str
@@ -171,8 +195,16 @@ class PageContribution(BaseModel):
     source_refs: list[str] = Field(default_factory=list)
     chunk_refs: list[str] = Field(default_factory=list)
 
+    @field_validator("knowledge_id", "title")
+    @classmethod
+    def normalize_identity(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("贡献来源标识和标题不能为空")
+        return value
 
-class PageMergeRequest(BaseModel):
+
+class PageMergeRequest(_StrictModel):
     slug: str
     title: str
     page_type: TopicPageType
@@ -181,12 +213,31 @@ class PageMergeRequest(BaseModel):
     existing_summary: str = ""
     contributions: list[PageContribution] = Field(min_length=1)
 
+    @field_validator("slug")
+    @classmethod
+    def normalize_slug(cls, value: str) -> str:
+        return _normalize_slug(value, ("entity", "concept"))
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("页面标题不能为空")
+        return value
+
+    @model_validator(mode="after")
+    def validate_page_type_prefix(self) -> Self:
+        if not self.slug.startswith(f"{self.page_type}/"):
+            raise ValueError("slug 前缀必须与 page_type 一致")
+        return self
+
 
 class PageMergeOutput(_ModelTextOutput):
     pass
 
 
-class SlugUpdate(BaseModel):
+class SlugUpdate(_StrictModel):
     pending_op_id: UUID
     knowledge_id: str
     slug: str
@@ -209,15 +260,23 @@ class SlugUpdate(BaseModel):
             raise ValueError("slug 前缀必须与 page_type 一致")
         return self
 
+    @field_validator("knowledge_id", "title")
+    @classmethod
+    def normalize_identity(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("知识标识和标题不能为空")
+        return value
 
-class MapDocumentResult(BaseModel):
+
+class MapDocumentResult(_StrictModel):
     pending_op_id: UUID
     knowledge_id: str
     updates: list[SlugUpdate] = Field(default_factory=list)
     skipped_reason: str | None = None
 
 
-class ReducedPage(BaseModel):
+class ReducedPage(_StrictModel):
     slug: str
     title: str
     page_type: IngestPageType
@@ -228,10 +287,39 @@ class ReducedPage(BaseModel):
     chunk_refs: list[str] = Field(default_factory=list)
     contributor_op_ids: list[UUID] = Field(default_factory=list)
 
+    @field_validator("slug")
+    @classmethod
+    def normalize_slug(cls, value: str) -> str:
+        return _normalize_slug(value, ("summary", "entity", "concept"))
 
-class BatchResult(BaseModel):
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("页面标题不能为空")
+        return value
+
+    @model_validator(mode="after")
+    def validate_page_type_prefix(self) -> Self:
+        if not self.slug.startswith(f"{self.page_type}/"):
+            raise ValueError("slug 前缀必须与 page_type 一致")
+        return self
+
+
+class BatchResult(_StrictModel):
     completed_op_ids: list[UUID] = Field(default_factory=list)
     failed_op_ids: list[UUID] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_ids(self) -> Self:
+        if len(self.completed_op_ids) != len(set(self.completed_op_ids)):
+            raise ValueError("completed_op_ids 不能重复")
+        if len(self.failed_op_ids) != len(set(self.failed_op_ids)):
+            raise ValueError("failed_op_ids 不能重复")
+        if set(self.completed_op_ids) & set(self.failed_op_ids):
+            raise ValueError("completed_op_ids 与 failed_op_ids 不能重叠")
+        return self
 
     @classmethod
     def from_ids(
@@ -260,7 +348,7 @@ class BatchResult(BaseModel):
         return len(self.failed_op_ids)
 
 
-class FinalizationRequest(BaseModel):
+class FinalizationRequest(_StrictModel):
     tenant_id: int
     knowledge_base_id: UUID
     knowledge_id: str
@@ -269,6 +357,10 @@ class FinalizationRequest(BaseModel):
 
     @classmethod
     def from_knowledge(cls, scope: WikiScope, knowledge: SourceKnowledge) -> Self:
+        if knowledge.tenant_id != scope.tenant_id:
+            raise ValueError("知识条目租户与 WikiScope 不一致")
+        if knowledge.knowledge_base_id != scope.knowledge_base_id:
+            raise ValueError("知识条目知识库与 WikiScope 不一致")
         return cls(
             tenant_id=scope.tenant_id,
             knowledge_base_id=scope.knowledge_base_id,
@@ -277,7 +369,7 @@ class FinalizationRequest(BaseModel):
         )
 
 
-class EnqueueResult(BaseModel):
+class EnqueueResult(_StrictModel):
     pending_op_id: UUID | None = None
     skipped_reason: str | None = None
     deduplicated: bool = False

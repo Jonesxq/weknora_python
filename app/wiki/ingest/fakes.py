@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from app.wiki.ingest.ports import PermanentModelError, TransientModelError
 from app.wiki.ingest.schemas import (
@@ -17,11 +17,12 @@ from app.wiki.ingest.schemas import (
     SourceChunk,
     SourceKnowledge,
     WikiIngestConfig,
+    _StrictModel,
 )
 from app.wiki.scope import WikiScope
 
 
-class _KnowledgeBaseFixture(BaseModel):
+class _KnowledgeBaseFixture(_StrictModel):
     tenant_id: int
     knowledge_base_id: UUID
     config: WikiIngestConfig
@@ -31,8 +32,9 @@ class _KnowledgeFixture(SourceKnowledge):
     chunks: list[SourceChunk] = Field(default_factory=list)
 
 
-class _ModelResponses(BaseModel):
-    extract_candidates: CandidateExtraction
+class _ModelResponses(_StrictModel):
+    # 新格式按 knowledge_id 索引；保留单个 CandidateExtraction 以兼容旧 fixture。
+    extract_candidates: CandidateExtraction | dict[str, CandidateExtraction]
     summaries: dict[str, DocumentSummary] = Field(min_length=1)
     merges: dict[str, PageMergeOutput] = Field(min_length=1)
 
@@ -40,11 +42,46 @@ class _ModelResponses(BaseModel):
 FailureCount = Annotated[int, Field(ge=0)]
 
 
-class FakeDataset(BaseModel):
+class FakeDataset(_StrictModel):
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
     knowledge_bases: list[_KnowledgeBaseFixture] = Field(min_length=1)
     knowledge: list[_KnowledgeFixture] = Field(min_length=1)
     model_responses: _ModelResponses
     transient_failures: dict[str, FailureCount] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_identity_and_scope(self) -> "FakeDataset":
+        kb_keys = [(item.tenant_id, item.knowledge_base_id) for item in self.knowledge_bases]
+        if len(kb_keys) != len(set(kb_keys)):
+            raise ValueError("knowledge_bases 不能包含重复的租户和知识库")
+        knowledge_keys = [
+            (item.tenant_id, item.knowledge_base_id, item.id) for item in self.knowledge
+        ]
+        if len(knowledge_keys) != len(set(knowledge_keys)):
+            raise ValueError("knowledge 不能包含重复的租户、知识库和知识条目标识")
+        known_kbs = set(kb_keys)
+        for item in self.knowledge:
+            if (item.tenant_id, item.knowledge_base_id) not in known_kbs:
+                raise ValueError("knowledge 必须属于已声明的 knowledge_base")
+        knowledge_ids = {item.id for item in self.knowledge}
+        knowledge_titles = {item.title for item in self.knowledge}
+        candidate_responses = self.model_responses.extract_candidates
+        if isinstance(candidate_responses, dict):
+            unknown_candidate_ids = set(candidate_responses) - knowledge_ids
+            if unknown_candidate_ids:
+                raise ValueError("extract_candidates 响应包含未知 knowledge_id")
+        for key in self.transient_failures:
+            if key == "extract_candidates":
+                continue
+            prefix, _, suffix = key.partition(":")
+            if prefix == "extract_candidates" and suffix not in knowledge_ids:
+                raise ValueError("extract_candidates 瞬时失败键包含未知 knowledge_id")
+            if prefix == "summarize" and suffix not in knowledge_ids | knowledge_titles:
+                raise ValueError("summarize 瞬时失败键包含未知 knowledge_id")
+            if prefix == "merge" and suffix not in self.model_responses.merges:
+                raise ValueError("merge 瞬时失败键包含未知 slug")
+        return self
 
     @field_validator("transient_failures")
     @classmethod
@@ -53,9 +90,16 @@ class FakeDataset(BaseModel):
             if key == "extract_candidates":
                 continue
             prefix, separator, suffix = key.partition(":")
-            if separator and suffix and prefix in {"summarize", "merge"}:
-                continue
-            raise ValueError(f"不支持的 transient failure key: {key}")
+            if not separator or not suffix or prefix not in {
+                "extract_candidates",
+                "summarize",
+                "merge",
+            }:
+                raise ValueError(f"不支持的 transient failure key: {key}")
+            if prefix == "merge" and not (
+                suffix.startswith("entity/") or suffix.startswith("concept/")
+            ):
+                raise ValueError(f"merge transient failure key 必须使用页面 slug: {key}")
         return value
 
 
@@ -114,27 +158,66 @@ class FakeKnowledgeSource:
 class FakeChatModel:
     def __init__(self, dataset: FakeDataset) -> None:
         self._responses = dataset.model_responses.model_copy(deep=True)
+        self.responses = {
+            "extract_candidates": self._responses.extract_candidates,
+            "summaries": self._responses.summaries,
+            "merges": self._responses.merges,
+        }
         self._remaining_failures = dict(dataset.transient_failures)
         self.calls: list[str] = []
         self.merge_requests: list[PageMergeRequest] = []
 
-    def _record_call(self, key: str) -> None:
+    def _record_call(self, key: str, *fallback_keys: str) -> None:
         self.calls.append(key)
-        remaining = self._remaining_failures.get(key, 0)
+        failure_key = next(
+            (candidate for candidate in (key, *fallback_keys) if candidate in self._remaining_failures),
+            key,
+        )
+        remaining = self._remaining_failures.get(failure_key, 0)
         if remaining > 0:
-            self._remaining_failures[key] = remaining - 1
-            raise TransientModelError(f"模型调用瞬时失败: {key}")
+            self._remaining_failures[failure_key] = remaining - 1
+            raise TransientModelError(f"模型调用瞬时失败: {failure_key}")
 
     async def extract_candidates(
-        self, text: str, config: WikiIngestConfig
+        self,
+        knowledge_id: str,
+        text: str | WikiIngestConfig,
+        config: WikiIngestConfig | None = None,
     ) -> CandidateExtraction:
-        self._record_call("extract_candidates")
-        return self._responses.extract_candidates.model_copy(deep=True)
+        # 兼容旧的 extract_candidates(text, config) 调用；新调用必须携带 knowledge_id。
+        legacy = config is None and isinstance(text, WikiIngestConfig)
+        if legacy:
+            config = text
+            text = knowledge_id
+            knowledge_id = ""
+        key = f"extract_candidates:{knowledge_id}" if knowledge_id else "extract_candidates"
+        self._record_call(key, "extract_candidates")
+        responses = self._responses.extract_candidates
+        if isinstance(responses, CandidateExtraction):
+            return responses.model_copy(deep=True)
+        response = responses.get(knowledge_id)
+        if response is None:
+            raise PermanentModelError(f"缺少模型响应: {key}")
+        return response.model_copy(deep=True)
 
-    async def summarize(self, title: str, text: str) -> DocumentSummary:
-        key = f"summarize:{title}"
-        self._record_call(key)
-        response = self._responses.summaries.get(title)
+    async def summarize(
+        self,
+        knowledge_id: str,
+        title: str,
+        text: str | None = None,
+    ) -> DocumentSummary:
+        # 兼容旧的 summarize(title, text) 调用；新调用为 summarize(id, title, text)。
+        legacy = text is None
+        if legacy:
+            text = title
+            title = knowledge_id
+            knowledge_id = ""
+        key = f"summarize:{knowledge_id}" if knowledge_id else f"summarize:{title}"
+        fallback = f"summarize:{title}" if knowledge_id else "summarize"
+        self._record_call(key, fallback)
+        response = self._responses.summaries.get(knowledge_id) if knowledge_id else None
+        if response is None:
+            response = self._responses.summaries.get(title)
         if response is None:
             raise PermanentModelError(f"缺少模型响应: {key}")
         return response.model_copy(deep=True)

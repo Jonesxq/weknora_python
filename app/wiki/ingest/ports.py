@@ -45,10 +45,12 @@ class KnowledgeSourcePort(Protocol):
 @runtime_checkable
 class ChatModelPort(Protocol):
     async def extract_candidates(
-        self, text: str, config: WikiIngestConfig
+        self, knowledge_id: str, text: str, config: WikiIngestConfig
     ) -> CandidateExtraction: ...
 
-    async def summarize(self, title: str, text: str) -> DocumentSummary: ...
+    async def summarize(
+        self, knowledge_id: str, title: str, text: str
+    ) -> DocumentSummary: ...
 
     async def merge_page(self, request: PageMergeRequest) -> PageMergeOutput: ...
 

@@ -42,29 +42,31 @@
   ],
   "model_responses": {
     "extract_candidates": {
-      "entities": [
-        {
-          "name": "Acme",
-          "slug": "entity/acme",
-          "page_type": "entity",
-          "aliases": ["Acme Inc."],
-          "description": "A fictional example organization.",
-          "details": "Acme uses retrieval in its document workflow."
-        }
-      ],
-      "concepts": [
-        {
-          "name": "Retrieval",
-          "slug": "concept/retrieval",
-          "page_type": "concept",
-          "aliases": ["Information retrieval"],
-          "description": "Finding relevant source material.",
-          "details": "Retrieval supplies context for grounded answers."
-        }
-      ]
+      "knowledge-1": {
+        "entities": [
+          {
+            "name": "Acme",
+            "slug": "entity/acme",
+            "page_type": "entity",
+            "aliases": ["Acme Inc."],
+            "description": "A fictional example organization.",
+            "details": "Acme uses retrieval in its document workflow."
+          }
+        ],
+        "concepts": [
+          {
+            "name": "Retrieval",
+            "slug": "concept/retrieval",
+            "page_type": "concept",
+            "aliases": ["Information retrieval"],
+            "description": "Finding relevant source material.",
+            "details": "Retrieval supplies context for grounded answers."
+          }
+        ]
+      }
     },
     "summaries": {
-      "Acme Retrieval Guide": {
+      "knowledge-1": {
         "headline": "Acme Retrieval Guide",
         "markdown": "Acme uses retrieval to ground answers in relevant documents."
       }

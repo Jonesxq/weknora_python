@@ -221,3 +221,78 @@ def test_example_fixture_loads() -> None:
 
     assert isinstance(source, FakeKnowledgeSource)
     assert isinstance(model, FakeChatModel)
+
+
+def test_fixture_rejects_unknown_fields_and_duplicate_identities(tmp_path: Path) -> None:
+    fixture = tmp_path / "wiki.json"
+    data = json.loads(json.dumps(FIXTURE))
+    data["unknown"] = True
+    write_fixture(fixture, data)
+    with pytest.raises(ValidationError):
+        load_fake_adapters(fixture)
+
+    data = json.loads(json.dumps(FIXTURE))
+    data["knowledge"].append(json.loads(json.dumps(data["knowledge"][0])))
+    write_fixture(fixture, data)
+    with pytest.raises(ValidationError, match="重复"):
+        load_fake_adapters(fixture)
+
+
+def test_fixture_rejects_knowledge_from_undeclared_kb(tmp_path: Path) -> None:
+    fixture = tmp_path / "wiki.json"
+    data = json.loads(json.dumps(FIXTURE))
+    data["knowledge"][0]["knowledge_base_id"] = str(OTHER_KB_ID)
+    write_fixture(fixture, data)
+
+    with pytest.raises(ValidationError, match="已声明"):
+        load_fake_adapters(fixture)
+
+
+def test_fixture_rejects_transient_failure_for_unknown_identity(tmp_path: Path) -> None:
+    fixture = tmp_path / "wiki.json"
+    data = json.loads(json.dumps(FIXTURE))
+    data["transient_failures"] = {"summarize:missing": 1}
+    write_fixture(fixture, data)
+
+    with pytest.raises(ValidationError, match="未知"):
+        load_fake_adapters(fixture)
+
+
+def test_fake_model_indexes_duplicate_titles_by_knowledge_id(tmp_path: Path) -> None:
+    fixture = tmp_path / "wiki.json"
+    data = json.loads(json.dumps(FIXTURE))
+    second = json.loads(json.dumps(data["knowledge"][0]))
+    second["id"] = "knowledge-2"
+    data["knowledge"].append(second)
+    extraction = data["model_responses"].pop("extract_candidates")
+    data["model_responses"]["extract_candidates"] = {
+        "knowledge-1": extraction,
+        "knowledge-2": {"entities": [], "concepts": []},
+    }
+    data["model_responses"]["summaries"] = {
+        "knowledge-1": {"headline": "First", "markdown": "First body"},
+        "knowledge-2": {"headline": "Second", "markdown": "Second body"},
+    }
+    data["transient_failures"] = {}
+    write_fixture(fixture, data)
+    _, model = load_fake_adapters(fixture)
+
+    first = asyncio.run(model.summarize("knowledge-1", "Document One", "Body"))
+    second_result = asyncio.run(model.summarize("knowledge-2", "Document One", "Body"))
+    first_candidates = asyncio.run(
+        model.extract_candidates("knowledge-1", "Body", WikiIngestConfig())
+    )
+    second_candidates = asyncio.run(
+        model.extract_candidates("knowledge-2", "Body", WikiIngestConfig())
+    )
+
+    assert first.headline == "First"
+    assert second_result.headline == "Second"
+    assert len(first_candidates.entities) == 1
+    assert second_candidates.entities == []
+    assert model.calls == [
+        "summarize:knowledge-1",
+        "summarize:knowledge-2",
+        "extract_candidates:knowledge-1",
+        "extract_candidates:knowledge-2",
+    ]
