@@ -275,6 +275,14 @@ class MapDocumentResult(_StrictModel):
     updates: list[SlugUpdate] = Field(default_factory=list)
     skipped_reason: str | None = None
 
+    @field_validator("knowledge_id")
+    @classmethod
+    def normalize_knowledge_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("知识标识不能为空")
+        return value
+
 
 class ReducedPage(_StrictModel):
     slug: str
@@ -354,6 +362,14 @@ class FinalizationRequest(_StrictModel):
     knowledge_id: str
     attempt: str
     subtask_name: str = "wiki"
+
+    @field_validator("knowledge_id", "attempt", "subtask_name")
+    @classmethod
+    def normalize_identity(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("finalization 标识不能为空")
+        return value
 
     @classmethod
     def from_knowledge(cls, scope: WikiScope, knowledge: SourceKnowledge) -> Self:

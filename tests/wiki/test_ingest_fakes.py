@@ -57,13 +57,21 @@ FIXTURE = {
     ],
     "model_responses": {
         "extract_candidates": {
-            "entities": [{"name": "Acme", "slug": "entity/acme", "page_type": "entity"}],
-            "concepts": [
-                {"name": "Retrieval", "slug": "concept/retrieval", "page_type": "concept"}
-            ],
+            "knowledge-1": {
+                "entities": [
+                    {"name": "Acme", "slug": "entity/acme", "page_type": "entity"}
+                ],
+                "concepts": [
+                    {
+                        "name": "Retrieval",
+                        "slug": "concept/retrieval",
+                        "page_type": "concept",
+                    }
+                ],
+            }
         },
         "summaries": {
-            "Document One": {"headline": "Document One", "markdown": "Summary body"}
+            "knowledge-1": {"headline": "Document One", "markdown": "Summary body"}
         },
         "merges": {
             "entity/acme": {"headline": "Acme", "markdown": "Merged Acme"},
@@ -71,8 +79,8 @@ FIXTURE = {
         },
     },
     "transient_failures": {
-        "extract_candidates": 2,
-        "summarize:Document One": 1,
+        "extract_candidates:knowledge-1": 2,
+        "summarize:knowledge-1": 1,
         "merge:entity/acme": 1,
     },
 }
@@ -167,13 +175,13 @@ def test_fake_model_uses_exact_transient_failure_counts(tmp_path: Path) -> None:
     config = WikiIngestConfig()
 
     for _ in range(2):
-        with pytest.raises(TransientModelError, match="extract_candidates"):
-            asyncio.run(model.extract_candidates("Body", config))
-    extraction = asyncio.run(model.extract_candidates("Body", config))
+        with pytest.raises(TransientModelError, match="extract_candidates:knowledge-1"):
+            asyncio.run(model.extract_candidates("knowledge-1", "Body", config))
+    extraction = asyncio.run(model.extract_candidates("knowledge-1", "Body", config))
 
-    with pytest.raises(TransientModelError, match="summarize:Document One"):
-        asyncio.run(model.summarize("Document One", "Body"))
-    summary = asyncio.run(model.summarize("Document One", "Body"))
+    with pytest.raises(TransientModelError, match="summarize:knowledge-1"):
+        asyncio.run(model.summarize("knowledge-1", "Document One", "Body"))
+    summary = asyncio.run(model.summarize("knowledge-1", "Document One", "Body"))
 
     request = merge_request()
     with pytest.raises(TransientModelError, match="merge:entity/acme"):
@@ -183,8 +191,8 @@ def test_fake_model_uses_exact_transient_failure_counts(tmp_path: Path) -> None:
     assert extraction.entities[0].slug == "entity/acme"
     assert summary.headline == "Document One"
     assert merged.markdown == "Merged Acme"
-    assert model.calls.count("extract_candidates") == 3
-    assert model.calls.count("summarize:Document One") == 2
+    assert model.calls.count("extract_candidates:knowledge-1") == 3
+    assert model.calls.count("summarize:knowledge-1") == 2
     assert model.calls.count("merge:entity/acme") == 2
     assert len(model.merge_requests) == 2
     assert model.merge_requests[0] is not request
@@ -197,8 +205,8 @@ def test_fake_model_raises_permanent_error_for_missing_response(tmp_path: Path) 
     write_fixture(fixture, data)
     _, model = load_fake_adapters(fixture)
 
-    with pytest.raises(PermanentModelError, match="summarize:Missing Document"):
-        asyncio.run(model.summarize("Missing Document", "Body"))
+    with pytest.raises(PermanentModelError, match="summarize:missing"):
+        asyncio.run(model.summarize("missing", "Missing Document", "Body"))
 
     with pytest.raises(PermanentModelError, match="merge:concept/missing"):
         asyncio.run(model.merge_page(merge_request("concept/missing")))
@@ -207,7 +215,7 @@ def test_fake_model_raises_permanent_error_for_missing_response(tmp_path: Path) 
 def test_load_fake_adapters_does_not_swallow_fixture_validation(tmp_path: Path) -> None:
     fixture = tmp_path / "wiki.json"
     data = json.loads(json.dumps(FIXTURE))
-    data["transient_failures"] = {"extract_candidates": -1}
+    data["transient_failures"] = {"extract_candidates:knowledge-1": -1}
     write_fixture(fixture, data)
 
     with pytest.raises(ValidationError):
@@ -258,13 +266,33 @@ def test_fixture_rejects_transient_failure_for_unknown_identity(tmp_path: Path) 
         load_fake_adapters(fixture)
 
 
+def test_fixture_rejects_legacy_or_unknown_model_response_keys(tmp_path: Path) -> None:
+    fixture = tmp_path / "wiki.json"
+    data = json.loads(json.dumps(FIXTURE))
+    data["model_responses"]["extract_candidates"] = {
+        "entities": [],
+        "concepts": [],
+    }
+    write_fixture(fixture, data)
+    with pytest.raises(ValidationError):
+        load_fake_adapters(fixture)
+
+    data = json.loads(json.dumps(FIXTURE))
+    data["model_responses"]["summaries"] = {
+        "Document One": {"headline": "Legacy", "markdown": "Legacy body"}
+    }
+    write_fixture(fixture, data)
+    with pytest.raises(ValidationError, match="未知"):
+        load_fake_adapters(fixture)
+
+
 def test_fake_model_indexes_duplicate_titles_by_knowledge_id(tmp_path: Path) -> None:
     fixture = tmp_path / "wiki.json"
     data = json.loads(json.dumps(FIXTURE))
     second = json.loads(json.dumps(data["knowledge"][0]))
     second["id"] = "knowledge-2"
     data["knowledge"].append(second)
-    extraction = data["model_responses"].pop("extract_candidates")
+    extraction = data["model_responses"].pop("extract_candidates")["knowledge-1"]
     data["model_responses"]["extract_candidates"] = {
         "knowledge-1": extraction,
         "knowledge-2": {"entities": [], "concepts": []},

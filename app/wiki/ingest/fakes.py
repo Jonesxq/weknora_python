@@ -33,8 +33,7 @@ class _KnowledgeFixture(SourceKnowledge):
 
 
 class _ModelResponses(_StrictModel):
-    # 新格式按 knowledge_id 索引；保留单个 CandidateExtraction 以兼容旧 fixture。
-    extract_candidates: CandidateExtraction | dict[str, CandidateExtraction]
+    extract_candidates: dict[str, CandidateExtraction] = Field(min_length=1)
     summaries: dict[str, DocumentSummary] = Field(min_length=1)
     merges: dict[str, PageMergeOutput] = Field(min_length=1)
 
@@ -65,19 +64,18 @@ class FakeDataset(_StrictModel):
             if (item.tenant_id, item.knowledge_base_id) not in known_kbs:
                 raise ValueError("knowledge 必须属于已声明的 knowledge_base")
         knowledge_ids = {item.id for item in self.knowledge}
-        knowledge_titles = {item.title for item in self.knowledge}
         candidate_responses = self.model_responses.extract_candidates
-        if isinstance(candidate_responses, dict):
-            unknown_candidate_ids = set(candidate_responses) - knowledge_ids
-            if unknown_candidate_ids:
-                raise ValueError("extract_candidates 响应包含未知 knowledge_id")
+        unknown_candidate_ids = set(candidate_responses) - knowledge_ids
+        if unknown_candidate_ids:
+            raise ValueError("extract_candidates 响应包含未知 knowledge_id")
+        unknown_summary_ids = set(self.model_responses.summaries) - knowledge_ids
+        if unknown_summary_ids:
+            raise ValueError("summaries 响应包含未知 knowledge_id")
         for key in self.transient_failures:
-            if key == "extract_candidates":
-                continue
             prefix, _, suffix = key.partition(":")
             if prefix == "extract_candidates" and suffix not in knowledge_ids:
                 raise ValueError("extract_candidates 瞬时失败键包含未知 knowledge_id")
-            if prefix == "summarize" and suffix not in knowledge_ids | knowledge_titles:
+            if prefix == "summarize" and suffix not in knowledge_ids:
                 raise ValueError("summarize 瞬时失败键包含未知 knowledge_id")
             if prefix == "merge" and suffix not in self.model_responses.merges:
                 raise ValueError("merge 瞬时失败键包含未知 slug")
@@ -87,8 +85,6 @@ class FakeDataset(_StrictModel):
     @classmethod
     def validate_failure_keys(cls, value: dict[str, int]) -> dict[str, int]:
         for key in value:
-            if key == "extract_candidates":
-                continue
             prefix, separator, suffix = key.partition(":")
             if not separator or not suffix or prefix not in {
                 "extract_candidates",
@@ -167,35 +163,22 @@ class FakeChatModel:
         self.calls: list[str] = []
         self.merge_requests: list[PageMergeRequest] = []
 
-    def _record_call(self, key: str, *fallback_keys: str) -> None:
+    def _record_call(self, key: str) -> None:
         self.calls.append(key)
-        failure_key = next(
-            (candidate for candidate in (key, *fallback_keys) if candidate in self._remaining_failures),
-            key,
-        )
-        remaining = self._remaining_failures.get(failure_key, 0)
+        remaining = self._remaining_failures.get(key, 0)
         if remaining > 0:
-            self._remaining_failures[failure_key] = remaining - 1
-            raise TransientModelError(f"模型调用瞬时失败: {failure_key}")
+            self._remaining_failures[key] = remaining - 1
+            raise TransientModelError(f"模型调用瞬时失败: {key}")
 
     async def extract_candidates(
         self,
         knowledge_id: str,
-        text: str | WikiIngestConfig,
-        config: WikiIngestConfig | None = None,
+        text: str,
+        config: WikiIngestConfig,
     ) -> CandidateExtraction:
-        # 兼容旧的 extract_candidates(text, config) 调用；新调用必须携带 knowledge_id。
-        legacy = config is None and isinstance(text, WikiIngestConfig)
-        if legacy:
-            config = text
-            text = knowledge_id
-            knowledge_id = ""
-        key = f"extract_candidates:{knowledge_id}" if knowledge_id else "extract_candidates"
-        self._record_call(key, "extract_candidates")
-        responses = self._responses.extract_candidates
-        if isinstance(responses, CandidateExtraction):
-            return responses.model_copy(deep=True)
-        response = responses.get(knowledge_id)
+        key = f"extract_candidates:{knowledge_id}"
+        self._record_call(key)
+        response = self._responses.extract_candidates.get(knowledge_id)
         if response is None:
             raise PermanentModelError(f"缺少模型响应: {key}")
         return response.model_copy(deep=True)
@@ -204,20 +187,11 @@ class FakeChatModel:
         self,
         knowledge_id: str,
         title: str,
-        text: str | None = None,
+        text: str,
     ) -> DocumentSummary:
-        # 兼容旧的 summarize(title, text) 调用；新调用为 summarize(id, title, text)。
-        legacy = text is None
-        if legacy:
-            text = title
-            title = knowledge_id
-            knowledge_id = ""
-        key = f"summarize:{knowledge_id}" if knowledge_id else f"summarize:{title}"
-        fallback = f"summarize:{title}" if knowledge_id else "summarize"
-        self._record_call(key, fallback)
-        response = self._responses.summaries.get(knowledge_id) if knowledge_id else None
-        if response is None:
-            response = self._responses.summaries.get(title)
+        key = f"summarize:{knowledge_id}"
+        self._record_call(key)
+        response = self._responses.summaries.get(knowledge_id)
         if response is None:
             raise PermanentModelError(f"缺少模型响应: {key}")
         return response.model_copy(deep=True)

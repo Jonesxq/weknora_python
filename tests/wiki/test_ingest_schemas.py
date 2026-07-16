@@ -10,6 +10,7 @@ from app.wiki.ingest.schemas import (
     CandidateExtraction,
     DocumentSummary,
     FinalizationRequest,
+    MapDocumentResult,
     PageContribution,
     PageMergeOutput,
     PageMergeRequest,
@@ -333,3 +334,15 @@ def test_identity_fields_strip_and_reject_blank_values() -> None:
         SourceChunk(id="chunk-1", chunk_index=-1)
     with pytest.raises(ValidationError):
         SourceChunk(id="chunk-1", start_at=-1)
+    with pytest.raises(ValidationError):
+        MapDocumentResult(
+            pending_op_id=uuid4(),
+            knowledge_id="   ",
+        )
+    with pytest.raises(ValidationError):
+        FinalizationRequest(
+            tenant_id=1,
+            knowledge_base_id=KB_ID,
+            knowledge_id="knowledge-1",
+            attempt="   ",
+        )
