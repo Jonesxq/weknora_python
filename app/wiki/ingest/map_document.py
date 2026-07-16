@@ -20,7 +20,13 @@ from app.wiki.ingest.schemas import (
 from app.wiki.scope import WikiScope
 
 
-_MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+_MARKDOWN_IMAGE_PATTERN = re.compile(
+    r"!\[[^\]]*\](?:\([^)]*\)|\[[^\]]*\])"
+)
+_MARKDOWN_REFERENCE_DEFINITION_PATTERN = re.compile(
+    r"^\s*\[[^\]\r\n]+\]:[^\r\n]*$", re.MULTILINE
+)
+_KNOWLEDGE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 
 def rebuild_source_content(
@@ -46,7 +52,15 @@ def has_meaningful_text(content: str) -> bool:
     """图片标记和空白之外至少有十个字符时才值得调用模型。"""
 
     without_images = _MARKDOWN_IMAGE_PATTERN.sub("", content)
+    without_images = _MARKDOWN_REFERENCE_DEFINITION_PATTERN.sub("", without_images)
     return len("".join(without_images.split())) >= 10
+
+
+def _has_canonical_summary_identity(knowledge_id: str) -> bool:
+    return bool(
+        _KNOWLEDGE_ID_PATTERN.fullmatch(knowledge_id)
+        and len(f"summary/{knowledge_id}") <= 255
+    )
 
 
 def _fallback_pending_op_id(
@@ -138,6 +152,22 @@ async def map_document(
             "knowledge_not_found",
             pending_op_id=pending_op_id,
         )
+    if knowledge.id != knowledge_id:
+        return _skipped_result(
+            scope,
+            knowledge_id,
+            "source_identity_mismatch",
+            pending_op_id=pending_op_id,
+            op_version=knowledge.op_version,
+        )
+    if not _has_canonical_summary_identity(knowledge_id):
+        return _skipped_result(
+            scope,
+            knowledge_id,
+            "invalid_knowledge_id",
+            pending_op_id=pending_op_id,
+            op_version=knowledge.op_version,
+        )
     if (
         knowledge.tenant_id != scope.tenant_id
         or knowledge.knowledge_base_id != scope.knowledge_base_id
@@ -186,10 +216,23 @@ async def map_document(
         if options.max_pages_per_ingest > 0:
             config.max_pages_per_ingest = options.max_pages_per_ingest
 
-    extraction, document_summary = await asyncio.gather(
+    extraction_task = asyncio.create_task(
         model.extract_candidates(knowledge_id, content, config),
-        model.summarize(knowledge_id, knowledge.title, content),
+        name=f"wiki-map-extract:{knowledge_id}",
     )
+    summary_task = asyncio.create_task(
+        model.summarize(knowledge_id, knowledge.title, content),
+        name=f"wiki-map-summarize:{knowledge_id}",
+    )
+    model_tasks = (extraction_task, summary_task)
+    try:
+        extraction, document_summary = await asyncio.gather(*model_tasks)
+    except BaseException:
+        for task in model_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*model_tasks, return_exceptions=True)
+        raise
 
     effective_pending_op_id = pending_op_id or _fallback_pending_op_id(
         scope, knowledge_id, knowledge.op_version
