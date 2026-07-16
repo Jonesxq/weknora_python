@@ -246,6 +246,26 @@ def test_fixture_rejects_unknown_fields_and_duplicate_identities(tmp_path: Path)
         load_fake_adapters(fixture)
 
 
+def test_fixture_rejects_same_knowledge_id_across_scopes(tmp_path: Path) -> None:
+    fixture = tmp_path / "wiki.json"
+    data = json.loads(json.dumps(FIXTURE))
+    data["knowledge_bases"].append(
+        {
+            "tenant_id": 2,
+            "knowledge_base_id": str(OTHER_KB_ID),
+            "config": {"wiki_enabled": True},
+        }
+    )
+    duplicate = json.loads(json.dumps(data["knowledge"][0]))
+    duplicate["tenant_id"] = 2
+    duplicate["knowledge_base_id"] = str(OTHER_KB_ID)
+    data["knowledge"].append(duplicate)
+    write_fixture(fixture, data)
+
+    with pytest.raises(ValidationError, match="全局唯一"):
+        load_fake_adapters(fixture)
+
+
 def test_fixture_rejects_knowledge_from_undeclared_kb(tmp_path: Path) -> None:
     fixture = tmp_path / "wiki.json"
     data = json.loads(json.dumps(FIXTURE))
@@ -283,6 +303,19 @@ def test_fixture_rejects_legacy_or_unknown_model_response_keys(tmp_path: Path) -
     }
     write_fixture(fixture, data)
     with pytest.raises(ValidationError, match="未知"):
+        load_fake_adapters(fixture)
+
+
+@pytest.mark.parametrize("slug", ["ENTITY/ACME", "entity//acme", "entity/acme/"])
+def test_fixture_rejects_noncanonical_merge_slug(tmp_path: Path, slug: str) -> None:
+    fixture = tmp_path / "wiki.json"
+    data = json.loads(json.dumps(FIXTURE))
+    response = data["model_responses"]["merges"].pop("entity/acme")
+    data["model_responses"]["merges"][slug] = response
+    data["transient_failures"].pop("merge:entity/acme")
+    write_fixture(fixture, data)
+
+    with pytest.raises(ValidationError):
         load_fake_adapters(fixture)
 
 

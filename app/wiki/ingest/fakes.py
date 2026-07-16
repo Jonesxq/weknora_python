@@ -18,6 +18,7 @@ from app.wiki.ingest.schemas import (
     SourceKnowledge,
     WikiIngestConfig,
     _StrictModel,
+    _normalize_slug,
 )
 from app.wiki.scope import WikiScope
 
@@ -59,6 +60,9 @@ class FakeDataset(_StrictModel):
         ]
         if len(knowledge_keys) != len(set(knowledge_keys)):
             raise ValueError("knowledge 不能包含重复的租户、知识库和知识条目标识")
+        knowledge_ids_in_order = [item.id for item in self.knowledge]
+        if len(knowledge_ids_in_order) != len(set(knowledge_ids_in_order)):
+            raise ValueError("fake 模型响应要求 knowledge_id 在 fixture 中全局唯一")
         known_kbs = set(kb_keys)
         for item in self.knowledge:
             if (item.tenant_id, item.knowledge_base_id) not in known_kbs:
@@ -71,6 +75,10 @@ class FakeDataset(_StrictModel):
         unknown_summary_ids = set(self.model_responses.summaries) - knowledge_ids
         if unknown_summary_ids:
             raise ValueError("summaries 响应包含未知 knowledge_id")
+        for slug in self.model_responses.merges:
+            normalized_slug = _normalize_slug(slug, ("entity", "concept"))
+            if normalized_slug != slug:
+                raise ValueError("merges 响应键必须是已规范化的小写页面 slug")
         for key in self.transient_failures:
             prefix, _, suffix = key.partition(":")
             if prefix == "extract_candidates" and suffix not in knowledge_ids:
