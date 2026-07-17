@@ -394,6 +394,8 @@ class CitationBatchOutput(_StrictModel):
             if normalized_slug in result:
                 raise ValueError("citation refs 的 slug 不能重复")
             cleaned = _strict_clean_strings(aliases, "citation ref alias")
+            if not cleaned:
+                raise ValueError("citation refs 不能包含空 alias 列表")
             for alias in cleaned:
                 if not re.fullmatch(r"c\d{3}", alias):
                     raise ValueError("citation ref alias 必须是 c 加三位数字")

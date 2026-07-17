@@ -418,7 +418,7 @@ def test_citation_dtos_normalize_and_reject_hidden_chunk_ids() -> None:
             knowledge_id="knowledge-1", batch_index=0, candidates=[candidate],
             chunks=[CitationBatchChunk(alias="c001", text="A"), CitationBatchChunk(alias="c001", text="B")],
         )
-    for aliases in ([" "], [" c001 ", "c001"]):
+    for aliases in ([], [" "], [" c001 ", "c001"]):
         with pytest.raises(ValidationError):
             CitationBatchOutput(refs_by_slug={"entity/acme": aliases})
 
