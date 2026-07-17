@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import inspect
+import logging
 import os
 import threading
 from collections.abc import Callable, Coroutine
+from concurrent.futures import CancelledError as FutureCancelledError
 from typing import Any, NoReturn, TypeVar
 from uuid import UUID
 
@@ -17,6 +20,7 @@ from app.wiki.scope import WikiScope
 
 
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 
 class ProcessEventLoopRunner:
@@ -51,6 +55,9 @@ class ProcessEventLoopRunner:
             raise
         try:
             return future.result()
+        except FutureCancelledError as exc:
+            future.cancel()
+            raise asyncio.CancelledError from exc
         except BaseException:
             future.cancel()
             raise
@@ -150,9 +157,25 @@ def build_runtime() -> NoReturn:
 
 async def _run_batch_on_worker_loop(scope: WikiScope) -> BatchResult:
     runtime: Any = build_runtime()
-    result = await runtime.worker.run_batch(scope)
-    if not isinstance(result, BatchResult):
-        raise TypeError("Wiki Worker 必须返回 BatchResult")
+    close_runtime = getattr(runtime, "aclose", None)
+    if not inspect.iscoroutinefunction(close_runtime):
+        raise TypeError("Wiki runtime 必须实现 async aclose()")
+    try:
+        result = await runtime.worker.run_batch(scope)
+        if not isinstance(result, BatchResult):
+            raise TypeError("Wiki Worker 必须返回 BatchResult")
+    except BaseException:
+        try:
+            await close_runtime()
+        except asyncio.CancelledError:
+            raise
+        except Exception as close_error:
+            logger.error(
+                "Wiki runtime 关闭失败",
+                extra={"wiki_runtime_error_type": type(close_error).__name__},
+            )
+        raise
+    await close_runtime()
     return result
 
 

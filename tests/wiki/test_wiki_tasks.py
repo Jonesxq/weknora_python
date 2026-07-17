@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
+import threading
 from uuid import UUID
 
 import pytest
@@ -145,21 +145,33 @@ def test_runtime_placeholder_fails_fast_until_task_ten_assembly() -> None:
         wiki_tasks.close_batch_runner()
 
 
-def test_run_batch_sync_reuses_one_loop_and_closes_background_thread(
+def test_run_batch_sync_reuses_loop_but_creates_and_closes_runtime_per_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     wiki_tasks.close_batch_runner()
     build_loops = []
     worker_loops = []
+    close_loops = []
+    runtimes = []
 
-    class Worker:
+    class Runtime:
+        def __init__(self) -> None:
+            self.worker = self
+            self.close_count = 0
+
         async def run_batch(self, _scope):
             worker_loops.append(asyncio.get_running_loop())
             return BatchResult()
 
+        async def aclose(self) -> None:
+            self.close_count += 1
+            close_loops.append(asyncio.get_running_loop())
+
     def build_runtime():
         build_loops.append(asyncio.get_running_loop())
-        return SimpleNamespace(worker=Worker())
+        runtime = Runtime()
+        runtimes.append(runtime)
+        return runtime
 
     monkeypatch.setattr(wiki_tasks, "build_runtime", build_runtime)
     scope = wiki_tasks._build_scope(7, str(KB_ID))
@@ -172,10 +184,147 @@ def test_run_batch_sync_reuses_one_loop_and_closes_background_thread(
         assert thread is not None and thread.is_alive()
         assert build_loops == [worker_loops[0], worker_loops[0]]
         assert worker_loops == [worker_loops[0], worker_loops[0]]
+        assert close_loops == [worker_loops[0], worker_loops[0]]
+        assert len(runtimes) == 2
+        assert runtimes[0] is not runtimes[1]
+        assert [runtime.close_count for runtime in runtimes] == [1, 1]
     finally:
         wiki_tasks.close_batch_runner()
 
     assert thread is not None and not thread.is_alive()
+
+
+def test_worker_error_closes_runtime_without_being_masked(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    wiki_tasks.close_batch_runner()
+    worker_error = RuntimeError("worker failed")
+
+    class Runtime:
+        worker = None
+
+        def __init__(self) -> None:
+            self.worker = self
+            self.close_count = 0
+
+        async def run_batch(self, _scope):
+            raise worker_error
+
+        async def aclose(self) -> None:
+            self.close_count += 1
+            raise OSError("close failed")
+
+    runtime = Runtime()
+    monkeypatch.setattr(wiki_tasks, "build_runtime", lambda: runtime)
+
+    try:
+        with pytest.raises(RuntimeError, match="worker failed") as raised:
+            wiki_tasks.run_batch_sync(wiki_tasks._build_scope(7, str(KB_ID)))
+    finally:
+        wiki_tasks.close_batch_runner()
+
+    assert raised.value is worker_error
+    assert runtime.close_count == 1
+    assert "close failed" not in caplog.text
+    assert caplog.records[-1].wiki_runtime_error_type == "OSError"
+
+
+def test_successful_worker_propagates_runtime_close_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wiki_tasks.close_batch_runner()
+    close_error = OSError("close failed")
+
+    class Runtime:
+        worker = None
+
+        def __init__(self) -> None:
+            self.worker = self
+
+        async def run_batch(self, _scope):
+            return BatchResult()
+
+        async def aclose(self) -> None:
+            raise close_error
+
+    monkeypatch.setattr(wiki_tasks, "build_runtime", Runtime)
+
+    try:
+        with pytest.raises(OSError, match="close failed") as raised:
+            wiki_tasks.run_batch_sync(wiki_tasks._build_scope(7, str(KB_ID)))
+    finally:
+        wiki_tasks.close_batch_runner()
+
+    assert raised.value is close_error
+
+
+def test_runtime_without_async_close_fails_before_worker_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wiki_tasks.close_batch_runner()
+    worker_called = False
+
+    class Runtime:
+        worker = None
+
+        def __init__(self) -> None:
+            self.worker = self
+
+        async def run_batch(self, _scope):
+            nonlocal worker_called
+            worker_called = True
+            return BatchResult()
+
+    monkeypatch.setattr(wiki_tasks, "build_runtime", Runtime)
+
+    try:
+        with pytest.raises(TypeError, match="async aclose"):
+            wiki_tasks.run_batch_sync(wiki_tasks._build_scope(7, str(KB_ID)))
+    finally:
+        wiki_tasks.close_batch_runner()
+
+    assert worker_called is False
+
+
+def test_close_and_reopen_uses_new_loop_and_new_closed_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wiki_tasks.close_batch_runner()
+    worker_loops = []
+    runtimes = []
+
+    class Runtime:
+        def __init__(self) -> None:
+            self.worker = self
+            self.closed = False
+
+        async def run_batch(self, _scope):
+            worker_loops.append(asyncio.get_running_loop())
+            return BatchResult()
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    def build_runtime():
+        runtime = Runtime()
+        runtimes.append(runtime)
+        return runtime
+
+    monkeypatch.setattr(wiki_tasks, "build_runtime", build_runtime)
+    scope = wiki_tasks._build_scope(7, str(KB_ID))
+
+    try:
+        wiki_tasks.run_batch_sync(scope)
+        wiki_tasks.close_batch_runner()
+        wiki_tasks.run_batch_sync(scope)
+    finally:
+        wiki_tasks.close_batch_runner()
+
+    assert worker_loops[0] is not worker_loops[1]
+    assert len(runtimes) == 2
+    assert runtimes[0] is not runtimes[1]
+    assert all(runtime.closed for runtime in runtimes)
 
 
 def test_process_runner_rebuilds_loop_when_pid_changes() -> None:
@@ -195,3 +344,86 @@ def test_process_runner_rebuilds_loop_when_pid_changes() -> None:
         assert first_thread is not None and not first_thread.is_alive()
     finally:
         runner.close()
+
+
+def test_pid_change_runs_new_closed_runtime_on_new_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current_pid = [100]
+    runner = wiki_tasks.ProcessEventLoopRunner(pid_provider=lambda: current_pid[0])
+    loops = []
+    runtimes = []
+
+    class Runtime:
+        def __init__(self) -> None:
+            self.worker = self
+            self.closed = False
+
+        async def run_batch(self, _scope):
+            loops.append(asyncio.get_running_loop())
+            return BatchResult()
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    def build_runtime():
+        runtime = Runtime()
+        runtimes.append(runtime)
+        return runtime
+
+    monkeypatch.setattr(wiki_tasks, "build_runtime", build_runtime)
+    scope = wiki_tasks._build_scope(7, str(KB_ID))
+
+    try:
+        runner.run(lambda: wiki_tasks._run_batch_on_worker_loop(scope))
+        current_pid[0] = 101
+        runner.run(lambda: wiki_tasks._run_batch_on_worker_loop(scope))
+    finally:
+        runner.close()
+
+    assert loops[0] is not loops[1]
+    assert len(runtimes) == 2
+    assert all(runtime.closed for runtime in runtimes)
+
+
+def test_runner_close_cancels_active_batch_and_closes_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = wiki_tasks.ProcessEventLoopRunner()
+    worker_started = threading.Event()
+    runtime_closed = threading.Event()
+
+    class Runtime:
+        def __init__(self) -> None:
+            self.worker = self
+
+        async def run_batch(self, _scope):
+            worker_started.set()
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            runtime_closed.set()
+            raise OSError("cancel close failed")
+
+    monkeypatch.setattr(wiki_tasks, "build_runtime", Runtime)
+    scope = wiki_tasks._build_scope(7, str(KB_ID))
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            runner.run(lambda: wiki_tasks._run_batch_on_worker_loop(scope))
+        except BaseException as exc:
+            errors.append(exc)
+
+    caller = threading.Thread(target=run)
+    caller.start()
+    assert worker_started.wait(timeout=2)
+    runner.close()
+    caller.join(timeout=2)
+
+    assert not caller.is_alive()
+    assert runtime_closed.is_set()
+    assert len(errors) == 1
+    assert isinstance(errors[0], asyncio.CancelledError)
+    assert caplog.records[-1].wiki_runtime_error_type == "OSError"
