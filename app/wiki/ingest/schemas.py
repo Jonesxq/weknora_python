@@ -48,6 +48,15 @@ def _stable_clean_strings(values: list[str]) -> list[str]:
     return result
 
 
+def _strict_clean_strings(values: list[str], field_name: str) -> list[str]:
+    cleaned = [value.strip() for value in values]
+    if any(not value for value in cleaned):
+        raise ValueError(f"{field_name} 不能包含空值")
+    if len(cleaned) != len(set(cleaned)):
+        raise ValueError(f"{field_name} 不能包含重复值")
+    return cleaned
+
+
 class WikiIngestConfig(_StrictModel):
     wiki_enabled: bool = True
     synthesis_model_id: str | None = None
@@ -384,15 +393,10 @@ class CitationBatchOutput(_StrictModel):
             normalized_slug = _normalize_slug(slug, ("entity", "concept"))
             if normalized_slug in result:
                 raise ValueError("citation refs 的 slug 不能重复")
-            cleaned: list[str] = []
-            for alias in aliases:
-                alias = alias.strip()
+            cleaned = _strict_clean_strings(aliases, "citation ref alias")
+            for alias in cleaned:
                 if not re.fullmatch(r"c\d{3}", alias):
                     raise ValueError("citation ref alias 必须是 c 加三位数字")
-                if alias not in cleaned:
-                    cleaned.append(alias)
-            if not cleaned:
-                raise ValueError("citation refs 不能包含空 alias 列表")
             result[normalized_slug] = cleaned
         return result
 
@@ -419,7 +423,7 @@ class DedupPageCandidate(_StrictModel):
     @field_validator("aliases")
     @classmethod
     def normalize_aliases(cls, value: list[str]) -> list[str]:
-        return _stable_clean_strings(value)
+        return _strict_clean_strings(value, "dedup aliases")
 
     @model_validator(mode="after")
     def validate_page_type_prefix(self) -> Self:
@@ -511,7 +515,7 @@ class StoredContributionRecord(_StrictModel):
     @field_validator("aliases", "chunk_refs")
     @classmethod
     def normalize_arrays(cls, value: list[str]) -> list[str]:
-        return _stable_clean_strings(value)
+        return _strict_clean_strings(value, "贡献数组")
 
     @model_validator(mode="after")
     def validate_page_type_prefix(self) -> Self:

@@ -11,10 +11,13 @@ from pydantic import ValidationError
 from app.wiki.ingest.fakes import FakeChatModel, FakeKnowledgeSource, load_fake_adapters
 from app.wiki.ingest.ports import (
     ChatModelPort,
+    CitationModelPort,
     DedupModelPort,
     KnowledgeSourcePort,
     PermanentModelError,
     TransientModelError,
+    TombstonePort,
+    WikiIngestModelPort,
 )
 from app.wiki.ingest.schemas import (
     CitationBatchChunk,
@@ -137,7 +140,20 @@ def test_load_fake_adapters_validates_fixture_and_protocols(tmp_path: Path) -> N
     assert isinstance(model, FakeChatModel)
     assert isinstance(source, KnowledgeSourcePort)
     assert isinstance(model, ChatModelPort)
+    assert isinstance(model, CitationModelPort)
     assert isinstance(model, DedupModelPort)
+    assert isinstance(model, WikiIngestModelPort)
+
+
+def test_tombstone_port_is_runtime_checkable() -> None:
+    class MemoryTombstones:
+        async def mark_deleted(self, scope: WikiScope, knowledge_id: str) -> None:
+            return None
+
+        async def is_deleted(self, scope: WikiScope, knowledge_id: str) -> bool:
+            return False
+
+    assert isinstance(MemoryTombstones(), TombstonePort)
 
 
 def test_fake_source_is_strictly_scoped_and_returns_copies(tmp_path: Path) -> None:
@@ -401,6 +417,51 @@ def test_fake_model_returns_citations_and_dedup_decisions_as_copies(tmp_path: Pa
     assert decisions.decisions[0].canonical_slug == "entity/existing"
     assert model.citation_requests[0].chunks[0].text == "Body"
     assert asyncio.run(model.classify_chunks(citation_request)).refs_by_slug == {"entity/acme": ["c001"]}
+
+
+def test_fake_model_dedup_defaults_orders_calls_and_isolates_copies(tmp_path: Path) -> None:
+    fixture = tmp_path / "wiki.json"
+    data = json.loads(json.dumps(FIXTURE))
+    data["model_responses"]["deduplications"] = {
+        "entity/acme": {"candidate_slug": "entity/acme", "canonical_slug": "entity/existing"}
+    }
+    data["transient_failures"] = {}
+    write_fixture(fixture, data)
+    _, model = load_fake_adapters(fixture)
+    first = TopicCandidate(name="Acme", slug="entity/acme", page_type="entity", aliases=["Acme"])
+    second = TopicCandidate(name="Other", slug="entity/other", page_type="entity")
+    request = DedupRequest(candidates=[
+        DedupCandidateRequest(candidate=first, allowed_targets=[]),
+        DedupCandidateRequest(candidate=second, allowed_targets=[]),
+    ])
+
+    output = asyncio.run(model.resolve_duplicates(request))
+    output.decisions[0].canonical_slug = None
+    request.candidates[0].candidate.aliases.append("Mutated")
+    next_output = asyncio.run(model.resolve_duplicates(request))
+
+    assert [decision.canonical_slug for decision in next_output.decisions] == ["entity/existing", None]
+    assert model.calls == ["dedup:entity/acme", "dedup:entity/other", "dedup:entity/acme", "dedup:entity/other"]
+    assert model.dedup_requests[0].candidates[0].candidate.aliases == ["Acme"]
+
+
+def test_fake_model_dedup_retries_transient_failure(tmp_path: Path) -> None:
+    fixture = tmp_path / "wiki.json"
+    data = json.loads(json.dumps(FIXTURE))
+    data["model_responses"]["deduplications"] = {
+        "entity/acme": {"candidate_slug": "entity/acme", "canonical_slug": "entity/existing"}
+    }
+    data["transient_failures"] = {"dedup:entity/acme": 1}
+    write_fixture(fixture, data)
+    _, model = load_fake_adapters(fixture)
+    request = DedupRequest(candidates=[DedupCandidateRequest(
+        candidate=TopicCandidate(name="Acme", slug="entity/acme", page_type="entity"), allowed_targets=[]
+    )])
+
+    with pytest.raises(TransientModelError, match="dedup:entity/acme"):
+        asyncio.run(model.resolve_duplicates(request))
+    assert asyncio.run(model.resolve_duplicates(request)).decisions[0].canonical_slug == "entity/existing"
+    assert model.calls == ["dedup:entity/acme", "dedup:entity/acme"]
 
 
 def test_fake_model_citation_missing_and_transient_failure_are_distinct(tmp_path: Path) -> None:
