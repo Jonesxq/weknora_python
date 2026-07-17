@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -98,7 +99,8 @@ async def test_dispatcher_marks_whole_batch_sent_only_after_ordered_publish() ->
     assert publisher.events == events
     assert store.calls == [
         ("claim", 2, 60),
-        ("mark", [event.id for event in events], token),
+        ("mark", [events[0].id], token),
+        ("mark", [events[1].id], token),
     ]
 
 
@@ -113,25 +115,47 @@ async def test_dispatcher_empty_batch_returns_zero_without_confirmation() -> Non
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fail_at", [0, 1])
-async def test_dispatcher_releases_whole_batch_after_any_publish_failure(
-    fail_at: int,
-) -> None:
+async def test_dispatcher_isolates_bad_event_and_retries_only_that_event() -> None:
     token = uuid4()
-    events = [_event(claim_token=token), _event(claim_token=token)]
+    events = [
+        _event(claim_token=token),
+        _event(claim_token=token),
+        _event(claim_token=token),
+    ]
     store = MemoryOutboxStore(events)
+    failure = RuntimeError("broker unavailable")
 
-    with pytest.raises(RuntimeError, match="broker unavailable"):
-        await OutboxDispatcher(
-            store, RecordingPublisher(fail_at), batch_size=2
-        ).dispatch_once()
+    class FailSecondOncePublisher:
+        def __init__(self) -> None:
+            self.calls: list[UUID] = []
+            self.failed = False
 
-    assert store.calls[-1] == (
-        "release",
-        [event.id for event in events],
-        token,
-    )
-    assert all(call[0] != "mark" for call in store.calls)
+        async def publish(self, event: OutboxEventRecord) -> None:
+            self.calls.append(event.id)
+            if event.id == events[1].id and not self.failed:
+                self.failed = True
+                raise failure
+
+    publisher = FailSecondOncePublisher()
+
+    with pytest.raises(RuntimeError, match="broker unavailable") as raised:
+        await OutboxDispatcher(store, publisher, batch_size=3).dispatch_once()
+
+    assert raised.value is failure
+    assert publisher.calls == [event.id for event in events]
+    assert store.calls == [
+        ("claim", 3, 60),
+        ("mark", [events[0].id], token),
+        ("release", [events[1].id], token),
+        ("mark", [events[2].id], token),
+    ]
+
+    store.events = [events[1]]
+    assert await OutboxDispatcher(store, publisher).dispatch_once() == 1
+    assert publisher.calls.count(events[0].id) == 1
+    assert publisher.calls.count(events[1].id) == 2
+    assert publisher.calls.count(events[2].id) == 1
+    assert store.calls[-1] == ("mark", [events[1].id], token)
 
 
 @pytest.mark.asyncio
@@ -145,24 +169,44 @@ async def test_dispatcher_preserves_publish_error_when_release_also_fails(
     with pytest.raises(RuntimeError, match="broker unavailable"):
         await OutboxDispatcher(store, RecordingPublisher(0)).dispatch_once()
 
-    assert "database unavailable" in caplog.text
+    assert "database unavailable" not in caplog.text
     assert "do-not-log" not in caplog.text
+    assert "outbox_claim_token" not in caplog.text
+    assert str(token) not in caplog.text
+    assert all("outbox_claim_token" not in record.__dict__ for record in caplog.records)
+    assert caplog.records[-1].outbox_error_type == "OSError"
 
 
 @pytest.mark.asyncio
 async def test_dispatcher_releases_batch_and_propagates_publish_cancellation() -> None:
     token = uuid4()
-    event = _event(claim_token=token)
-    store = MemoryOutboxStore([event])
+    events = [
+        _event(claim_token=token),
+        _event(claim_token=token),
+        _event(claim_token=token),
+    ]
+    store = MemoryOutboxStore(events)
 
     class CancelledPublisher:
-        async def publish(self, _event: OutboxEventRecord) -> None:
-            raise asyncio.CancelledError
+        def __init__(self) -> None:
+            self.calls: list[UUID] = []
+
+        async def publish(self, event: OutboxEventRecord) -> None:
+            self.calls.append(event.id)
+            if event.id == events[1].id:
+                raise asyncio.CancelledError
+
+    publisher = CancelledPublisher()
 
     with pytest.raises(asyncio.CancelledError):
-        await OutboxDispatcher(store, CancelledPublisher()).dispatch_once()
+        await OutboxDispatcher(store, publisher).dispatch_once()
 
-    assert store.calls[-1] == ("release", [event.id], token)
+    assert publisher.calls == [events[0].id, events[1].id]
+    assert store.calls == [
+        ("claim", 100, 60),
+        ("mark", [events[0].id], token),
+        ("release", [events[1].id, events[2].id], token),
+    ]
 
 
 @pytest.mark.asyncio
@@ -209,6 +253,34 @@ async def test_dispatcher_does_not_release_when_mark_sent_fails() -> None:
     assert all(call[0] != "release" for call in store.calls)
 
 
+@pytest.mark.asyncio
+async def test_dispatcher_continues_after_mark_failure_without_releasing_published_event() -> None:
+    token = uuid4()
+    events = [
+        _event(claim_token=token),
+        _event(claim_token=token),
+        _event(claim_token=token),
+    ]
+    failure = RuntimeError("commit uncertain")
+
+    class OneMarkFailingStore(MemoryOutboxStore):
+        async def mark_outbox_sent(self, ids, claim_token):
+            await super().mark_outbox_sent(ids, claim_token)
+            if list(ids) == [events[1].id]:
+                raise failure
+
+    store = OneMarkFailingStore(events)
+    publisher = RecordingPublisher()
+
+    with pytest.raises(RuntimeError, match="commit uncertain") as raised:
+        await OutboxDispatcher(store, publisher).dispatch_once()
+
+    assert raised.value is failure
+    assert publisher.events == events
+    assert all(call[0] != "release" for call in store.calls)
+    assert store.calls[-1] == ("mark", [events[2].id], token)
+
+
 class RecordingTask:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -246,6 +318,51 @@ async def test_celery_publisher_uses_to_thread_task_id_and_scope_only(
                 "task_id": str(event.id),
             },
         )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_thread_publish_may_finish_after_dispatcher_releases_claim() -> None:
+    token = uuid4()
+    events = [_event(claim_token=token), _event(claim_token=token)]
+    store = MemoryOutboxStore(events)
+    started = threading.Event()
+    allow_finish = threading.Event()
+    finished = threading.Event()
+    task_calls: list[dict[str, object]] = []
+
+    class BlockingTask:
+        def apply_async(self, **kwargs):
+            task_calls.append(kwargs)
+            started.set()
+            allow_finish.wait(timeout=5)
+            finished.set()
+
+    dispatch = asyncio.create_task(
+        OutboxDispatcher(store, CeleryBatchPublisher(task=BlockingTask())).dispatch_once()
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+    dispatch.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await dispatch
+        assert store.calls[-1] == (
+            "release",
+            [events[0].id, events[1].id],
+            token,
+        )
+    finally:
+        allow_finish.set()
+
+    assert await asyncio.to_thread(finished.wait, 2)
+    assert task_calls == [
+        {
+            "kwargs": {
+                "tenant_id": 7,
+                "knowledge_base_id": str(KB_ID),
+            },
+            "task_id": str(events[0].id),
+        }
     ]
 
 
@@ -304,9 +421,9 @@ async def test_dispatch_loop_continues_after_error_and_sleeps_every_round() -> N
 
         async def dispatch_once(self) -> int:
             self.calls += 1
-            if self.calls == 1:
+            if self.calls <= 2:
                 raise RuntimeError("temporary")
-            if self.calls == 3:
+            if self.calls == 4:
                 raise asyncio.CancelledError
             return 0
 
@@ -317,10 +434,38 @@ async def test_dispatch_loop_continues_after_error_and_sleeps_every_round() -> N
 
     dispatcher = Dispatcher()
     with pytest.raises(asyncio.CancelledError):
-        await run_dispatcher_loop(dispatcher, poll_seconds=0.25, sleep=fake_sleep)
+        await run_dispatcher_loop(
+            dispatcher,
+            poll_seconds=0.25,
+            max_backoff_seconds=1,
+            sleep=fake_sleep,
+        )
 
-    assert dispatcher.calls == 3
-    assert sleeps == [0.25, 0.25]
+    assert dispatcher.calls == 4
+    assert sleeps == [0.25, 0.5, 0.25]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("poll_seconds", [0, -1, float("nan"), float("inf"), True])
+async def test_dispatch_loop_rejects_invalid_direct_poll_interval(
+    poll_seconds: object,
+) -> None:
+    class Dispatcher:
+        async def dispatch_once(self) -> int:
+            pytest.fail("非法间隔不应启动循环")
+
+    with pytest.raises(ValueError, match="poll_seconds"):
+        await run_dispatcher_loop(  # type: ignore[arg-type]
+            Dispatcher(), poll_seconds=poll_seconds
+        )
+
+
+@pytest.mark.parametrize("batch_size", [True, 1.5, "2"])
+def test_dispatcher_rejects_non_integer_batch_size(batch_size: object) -> None:
+    with pytest.raises(ValueError, match="batch_size"):
+        OutboxDispatcher(  # type: ignore[arg-type]
+            MemoryOutboxStore([]), RecordingPublisher(), batch_size=batch_size
+        )
 
 
 @pytest.mark.parametrize(

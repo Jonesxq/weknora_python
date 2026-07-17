@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -134,7 +136,62 @@ def test_wiki_batch_task_configuration_is_reliable() -> None:
 
 
 def test_runtime_placeholder_fails_fast_until_task_ten_assembly() -> None:
-    with pytest.raises(RuntimeError, match="任务 10"):
-        wiki_tasks.run_batch_sync(
-            wiki_tasks._build_scope(7, str(KB_ID))
-        )
+    try:
+        with pytest.raises(RuntimeError, match="任务 10"):
+            wiki_tasks.run_batch_sync(
+                wiki_tasks._build_scope(7, str(KB_ID))
+            )
+    finally:
+        wiki_tasks.close_batch_runner()
+
+
+def test_run_batch_sync_reuses_one_loop_and_closes_background_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wiki_tasks.close_batch_runner()
+    build_loops = []
+    worker_loops = []
+
+    class Worker:
+        async def run_batch(self, _scope):
+            worker_loops.append(asyncio.get_running_loop())
+            return BatchResult()
+
+    def build_runtime():
+        build_loops.append(asyncio.get_running_loop())
+        return SimpleNamespace(worker=Worker())
+
+    monkeypatch.setattr(wiki_tasks, "build_runtime", build_runtime)
+    scope = wiki_tasks._build_scope(7, str(KB_ID))
+
+    try:
+        wiki_tasks.run_batch_sync(scope)
+        thread = wiki_tasks._batch_runner.thread
+        wiki_tasks.run_batch_sync(scope)
+
+        assert thread is not None and thread.is_alive()
+        assert build_loops == [worker_loops[0], worker_loops[0]]
+        assert worker_loops == [worker_loops[0], worker_loops[0]]
+    finally:
+        wiki_tasks.close_batch_runner()
+
+    assert thread is not None and not thread.is_alive()
+
+
+def test_process_runner_rebuilds_loop_when_pid_changes() -> None:
+    current_pid = [100]
+    runner = wiki_tasks.ProcessEventLoopRunner(pid_provider=lambda: current_pid[0])
+
+    async def current_loop():
+        return asyncio.get_running_loop()
+
+    try:
+        first_loop = runner.run(current_loop)
+        first_thread = runner.thread
+        current_pid[0] = 101
+        second_loop = runner.run(current_loop)
+
+        assert second_loop is not first_loop
+        assert first_thread is not None and not first_thread.is_alive()
+    finally:
+        runner.close()

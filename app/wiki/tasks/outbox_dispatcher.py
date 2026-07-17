@@ -9,7 +9,8 @@ import os
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Protocol
+from types import TracebackType
+from typing import Protocol
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -54,7 +55,7 @@ class CeleryTask(Protocol):
 
 
 class OutboxDispatcher:
-    """按 claim 批次串行发布，成功后再统一确认。"""
+    """按 claim 批次串行发布，每个事件成功后立即确认。"""
 
     def __init__(
         self,
@@ -63,7 +64,7 @@ class OutboxDispatcher:
         batch_size: int = 100,
         claim_timeout: timedelta | int = 60,
     ) -> None:
-        if isinstance(batch_size, bool) or batch_size <= 0:
+        if type(batch_size) is not int or batch_size <= 0:
             raise ValueError("batch_size 必须是正整数")
         if isinstance(claim_timeout, timedelta):
             valid_timeout = claim_timeout.total_seconds() > 0
@@ -90,27 +91,70 @@ class OutboxDispatcher:
         if len(event_ids) != len(set(event_ids)):
             raise InvariantError("Outbox 批次事件 ID 不能重复")
 
-        try:
-            for event in events:
-                await self.publisher.publish(event)
-        except BaseException:
+        first_error: tuple[Exception, TracebackType | None] | None = None
+        confirmed = 0
+        for index, event in enumerate(events):
             try:
-                await self.store.release_outbox(event_ids, token)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception(
-                    "Outbox 发布失败后的 claim 释放失败",
+                await self.publisher.publish(event)
+            except Exception as exc:
+                first_error = first_error or (exc, exc.__traceback__)
+                logger.error(
+                    "Outbox 事件发布失败",
                     extra={
-                        "outbox_event_ids": [str(event_id) for event_id in event_ids],
-                        "outbox_claim_token": str(token),
+                        "outbox_event_ids": [str(event.id)],
+                        "outbox_error_type": type(exc).__name__,
                     },
                 )
-            raise
+                await self._release_without_masking([event.id], token)
+                continue
+            except BaseException:
+                await self._release_without_masking(
+                    [remaining.id for remaining in events[index:]], token
+                )
+                raise
 
-        # 确认失败时不能释放：broker 可能已接收，保留 claim 供 stale 重投。
-        await self.store.mark_outbox_sent(event_ids, token)
-        return len(events)
+            try:
+                await self.store.mark_outbox_sent([event.id], token)
+            except Exception as exc:
+                # broker 已可能接收，不能释放；由 stale claim 触发至少一次重投。
+                first_error = first_error or (exc, exc.__traceback__)
+                logger.error(
+                    "Outbox 事件确认失败",
+                    extra={
+                        "outbox_event_ids": [str(event.id)],
+                        "outbox_error_type": type(exc).__name__,
+                    },
+                )
+                continue
+            except BaseException:
+                await self._release_without_masking(
+                    [remaining.id for remaining in events[index + 1 :]], token
+                )
+                raise
+            confirmed += 1
+
+        if first_error is not None:
+            error, traceback = first_error
+            raise error.with_traceback(traceback)
+        return confirmed
+
+    async def _release_without_masking(
+        self, event_ids: Sequence[UUID], claim_token: UUID
+    ) -> None:
+        if not event_ids:
+            return
+        try:
+            await self.store.release_outbox(event_ids, claim_token)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                "Outbox claim 释放失败",
+                extra={
+                    "outbox_event_ids": [str(event_id) for event_id in event_ids],
+                    "outbox_error_type": type(exc).__name__,
+                },
+            )
 
 
 class CeleryBatchPublisher:
@@ -196,11 +240,11 @@ class OutboxDispatcherSettings:
         if type(self.batch_size) is not int or not 1 <= self.batch_size <= 1000:
             raise ValueError("batch_size 必须在 1 到 1000 之间")
         if (
-            isinstance(self.poll_seconds, bool)
+            type(self.poll_seconds) not in {int, float}
             or not math.isfinite(self.poll_seconds)
-            or not 0.01 <= self.poll_seconds <= 300
+            or not 0.01 <= self.poll_seconds <= 60
         ):
-            raise ValueError("poll_seconds 必须在 0.01 到 300 之间")
+            raise ValueError("poll_seconds 必须在 0.01 到 60 之间")
         if (
             type(self.claim_timeout_seconds) is not int
             or not 1 <= self.claim_timeout_seconds <= 86400
@@ -217,7 +261,7 @@ class OutboxDispatcherSettings:
                 "GRAPH_WIKI_OUTBOX_POLL_SECONDS",
                 1.0,
                 minimum=0.01,
-                maximum=300,
+                maximum=60,
             ),
             claim_timeout_seconds=_read_int(
                 "GRAPH_WIKI_OUTBOX_CLAIM_TIMEOUT_SECONDS",
@@ -263,13 +307,28 @@ async def run_dispatcher_loop(
     dispatcher: OutboxDispatcher,
     *,
     poll_seconds: float,
+    max_backoff_seconds: float = 60,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> None:
     """持续投递；普通轮次故障被记录并在下一轮重试。"""
 
+    if (
+        type(poll_seconds) not in {int, float}
+        or not math.isfinite(poll_seconds)
+        or poll_seconds <= 0
+    ):
+        raise ValueError("poll_seconds 必须是有限正数")
+    if (
+        type(max_backoff_seconds) not in {int, float}
+        or not math.isfinite(max_backoff_seconds)
+        or max_backoff_seconds < poll_seconds
+    ):
+        raise ValueError("max_backoff_seconds 必须是不小于 poll_seconds 的有限正数")
+    consecutive_failures = 0
     while True:
         try:
             dispatched = await dispatcher.dispatch_once()
+            consecutive_failures = 0
             logger.info(
                 "Outbox dispatcher 完成一轮投递",
                 extra={"outbox_dispatched_count": dispatched},
@@ -277,9 +336,17 @@ async def run_dispatcher_loop(
         except asyncio.CancelledError:
             logger.info("Outbox dispatcher 收到取消信号，正在退出")
             raise
-        except Exception:
-            logger.exception("Outbox dispatcher 本轮投递失败")
-        await sleep(poll_seconds)
+        except Exception as exc:
+            consecutive_failures += 1
+            logger.error(
+                "Outbox dispatcher 本轮投递失败",
+                extra={"outbox_error_type": type(exc).__name__},
+            )
+        delay = min(
+            poll_seconds * (2 ** min(max(consecutive_failures - 1, 0), 63)),
+            max_backoff_seconds,
+        )
+        await sleep(delay)
 
 
 async def _run_main(
