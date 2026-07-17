@@ -7,6 +7,13 @@ from collections.abc import Awaitable, Callable, Sequence
 from typing import TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
 from app.wiki.ingest.errors import WikiBatchBusy
 from app.wiki.ingest.map_document import map_document
 from app.wiki.ingest.ports import (
@@ -34,6 +41,18 @@ from app.wiki.tasks.locks import LockLease, LockOwnershipLost, WikiLockManager
 
 _T = TypeVar("_T")
 _RetryWait = Callable[[int], Awaitable[None]]
+
+
+async def _gather_with_cleanup(*operations: Awaitable[_T]) -> list[_T]:
+    tasks = [asyncio.create_task(operation) for operation in operations]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 class WikiLockLost(RuntimeError):
@@ -171,7 +190,7 @@ class WikiIngestWorker:
                 except Exception:
                     return None
 
-        outcomes = await asyncio.gather(*(run(record) for record in records))
+        outcomes = await _gather_with_cleanup(*(run(record) for record in records))
         results: list[MapDocumentResult] = []
         failed_ids: set[UUID] = set()
         for record, outcome in zip(records, outcomes, strict=True):
@@ -217,7 +236,7 @@ class WikiIngestWorker:
                         }
                     return page, set()
 
-            outcomes = await asyncio.gather(
+            outcomes = await _gather_with_cleanup(
                 *(run(slug, slug_updates) for slug, slug_updates in grouped.items())
             )
             newly_failed: set[UUID] = set()
@@ -254,11 +273,16 @@ class WikiIngestWorker:
         return invalid_ids
 
     async def _retry_model(self, operation: Callable[[], Awaitable[_T]]) -> _T:
-        for attempt in range(3):
-            try:
+        async def retry_sleep(seconds: int | float) -> None:
+            await self._retry_wait(int(seconds))
+
+        async for attempt in AsyncRetrying(
+            sleep=retry_sleep,
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=2, max=4),
+            retry=retry_if_exception_type(TransientModelError),
+            reraise=True,
+        ):
+            with attempt:
                 return await operation()
-            except TransientModelError:
-                if attempt == 2:
-                    raise
-                await self._retry_wait(2 ** (attempt + 1))
         raise AssertionError("unreachable")

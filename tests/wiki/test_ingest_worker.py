@@ -584,6 +584,46 @@ async def test_map_parallelism_is_bounded() -> None:
 
 
 @pytest.mark.asyncio
+async def test_map_child_cancellation_cleans_up_sibling_before_propagating() -> None:
+    dataset = fake_dataset()
+
+    class CancellingSource(FakeKnowledgeSource):
+        def __init__(self) -> None:
+            super().__init__(dataset)
+            self.started: set[str] = set()
+            self.both_started = asyncio.Event()
+            self.release_sibling = asyncio.Event()
+            self.sibling_cleaned = asyncio.Event()
+
+        async def get_knowledge(self, scope: WikiScope, knowledge_id: str):
+            self.started.add(knowledge_id)
+            if len(self.started) == 2:
+                self.both_started.set()
+            await self.both_started.wait()
+            if knowledge_id == "doc-a":
+                await asyncio.sleep(0)
+                raise asyncio.CancelledError
+            try:
+                await self.release_sibling.wait()
+                return await super().get_knowledge(scope, knowledge_id)
+            finally:
+                self.sibling_cleaned.set()
+
+    source = CancellingSource()
+    store = WorkerStore([pending_op(OP_A, "doc-a"), pending_op(OP_B, "doc-b")])
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await worker(store, source, FakeChatModel(dataset)).run_batch(SCOPE)
+
+        assert source.sibling_cleaned.is_set()
+        assert store.apply_calls == []
+        assert store.release_calls == []
+    finally:
+        source.release_sibling.set()
+        await asyncio.wait_for(source.sibling_cleaned.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
 async def test_reduce_parallelism_is_bounded() -> None:
     dataset = fake_dataset(
         ("doc-a",), concepts_by_knowledge={"doc-a": ("concept/alpha",)}
@@ -631,6 +671,53 @@ async def test_reduce_parallelism_is_bounded() -> None:
             await asyncio.gather(task, return_exceptions=True)
 
     assert result.completed_op_ids == [OP_A]
+
+
+@pytest.mark.asyncio
+async def test_reduce_child_cancellation_cleans_up_sibling_before_propagating() -> None:
+    dataset = fake_dataset(
+        ("doc-a",), concepts_by_knowledge={"doc-a": ("concept/alpha",)}
+    )
+
+    class CancellingModel(FakeChatModel):
+        def __init__(self) -> None:
+            super().__init__(dataset)
+            self.started: set[str] = set()
+            self.both_started = asyncio.Event()
+            self.release_sibling = asyncio.Event()
+            self.sibling_cleaned = asyncio.Event()
+
+        async def merge_page(self, request):
+            self.started.add(request.slug)
+            if len(self.started) == 2:
+                self.both_started.set()
+            await self.both_started.wait()
+            if request.slug == "entity/shared":
+                await asyncio.sleep(0)
+                raise asyncio.CancelledError
+            try:
+                await self.release_sibling.wait()
+                return await super().merge_page(request)
+            finally:
+                self.sibling_cleaned.set()
+
+    model = CancellingModel()
+    store = WorkerStore([pending_op(OP_A, "doc-a")])
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await worker(
+                store,
+                FakeKnowledgeSource(dataset),
+                model,
+                options=WikiWorkerOptions(reduce_parallel=2),
+            ).run_batch(SCOPE)
+
+        assert model.sibling_cleaned.is_set()
+        assert store.apply_calls == []
+        assert store.release_calls == []
+    finally:
+        model.release_sibling.set()
+        await asyncio.wait_for(model.sibling_cleaned.wait(), timeout=1)
 
 
 @pytest.mark.asyncio
