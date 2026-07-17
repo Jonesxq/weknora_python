@@ -49,17 +49,23 @@ def test_phase_three_upgrade_generates_expected_offline_sql() -> None:
     assert "CREATE TABLE wiki_dead_letters" in sql
     assert "CONSTRAINT uq_wiki_page_contributions_version UNIQUE" in sql
     assert "CONSTRAINT uq_wiki_dead_letters_pending_op UNIQUE (pending_op_id)" in sql
-    assert "state VARCHAR(32) DEFAULT 'active' NOT NULL" in sql
-    assert "content TEXT DEFAULT '' NOT NULL" in sql
-    assert "summary TEXT DEFAULT '' NOT NULL" in sql
-    assert "aliases JSONB DEFAULT '[]'::jsonb NOT NULL" in sql
-    assert "chunk_refs JSONB DEFAULT '[]'::jsonb NOT NULL" in sql
-    assert "payload JSONB DEFAULT '{}'::jsonb NOT NULL" in sql
-    assert "fail_count INTEGER NOT NULL" in sql
-    dead_letters_sql = sql[sql.index("CREATE TABLE wiki_dead_letters") :]
-    assert "fail_count INTEGER DEFAULT 0 NOT NULL" not in dead_letters_sql.split(";", maxsplit=1)[0]
-    assert "last_error_code VARCHAR(128) NOT NULL" in sql
-    assert "last_error_summary VARCHAR(2000) NOT NULL" in sql
+    contributions_sql = _create_table_sql(sql, "wiki_page_contributions")
+    dead_letters_sql = _create_table_sql(sql, "wiki_dead_letters")
+
+    assert "state VARCHAR(32) DEFAULT 'active' NOT NULL" in contributions_sql
+    assert "content TEXT DEFAULT '' NOT NULL" in contributions_sql
+    assert "summary TEXT DEFAULT '' NOT NULL" in contributions_sql
+    assert "aliases JSONB DEFAULT '[]'::jsonb NOT NULL" in contributions_sql
+    assert "chunk_refs JSONB DEFAULT '[]'::jsonb NOT NULL" in contributions_sql
+    assert (
+        "CONSTRAINT uq_wiki_page_contributions_version UNIQUE "
+        "(tenant_id, knowledge_base_id, slug, knowledge_id, op_version)"
+    ) in contributions_sql
+    assert "payload JSONB DEFAULT '{}'::jsonb NOT NULL" in dead_letters_sql
+    assert "fail_count INTEGER NOT NULL" in dead_letters_sql
+    assert "fail_count INTEGER DEFAULT 0 NOT NULL" not in dead_letters_sql
+    assert "last_error_code VARCHAR(128) NOT NULL" in dead_letters_sql
+    assert "last_error_summary VARCHAR(2000) NOT NULL" in dead_letters_sql
     assert "CREATE UNIQUE INDEX uq_wiki_page_contributions_active_source" in sql
     assert "(tenant_id, knowledge_base_id, slug, knowledge_id) WHERE state = 'active'" in sql
     assert "WHERE state = 'active'" in sql
@@ -132,3 +138,9 @@ def test_phase_two_upgrade_generates_expected_offline_sql() -> None:
     assert "CREATE INDEX ix_wiki_finalization_markers_scope" in sql
     assert "CREATE INDEX ix_task_outbox_delivery" in sql
     assert "CREATE INDEX ix_task_outbox_scope" in sql
+
+
+def _create_table_sql(sql: str, table_name: str) -> str:
+    start = sql.index(f"CREATE TABLE {table_name}")
+    end = sql.index(";", start)
+    return sql[start:end]
