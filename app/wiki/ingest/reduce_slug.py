@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Sequence
 from typing import NoReturn
 from uuid import UUID
@@ -16,8 +17,10 @@ from app.wiki.ingest.schemas import (
 )
 
 
-_PAGE_TYPES = {"summary", "entity", "concept"}
 _TOPIC_TYPES = {"entity", "concept"}
+_SLUG_PATTERN = re.compile(
+    r"^(summary|entity|concept)/[a-z0-9][a-z0-9_-]*(?:/[a-z0-9][a-z0-9_-]*)*$"
+)
 
 
 def _reject(code: str, message: str) -> NoReturn:
@@ -49,9 +52,12 @@ def _validate_inputs(
     if not updates:
         _reject("WIKI_REDUCE_EMPTY", "同一 slug 的 updates 不能为空")
 
-    prefix, separator, _ = slug.partition("/")
-    if not separator or prefix not in _PAGE_TYPES:
-        _reject("WIKI_REDUCE_INVALID_SLUG", "slug 必须包含合法的页面类型前缀")
+    if len(slug) > 255 or not _SLUG_PATTERN.fullmatch(slug):
+        _reject(
+            "WIKI_REDUCE_INVALID_SLUG",
+            "slug 必须是 canonical 小写分层路径，且长度不能超过 255",
+        )
+    prefix = slug.partition("/")[0]
 
     for update in updates:
         if update.slug != slug:
@@ -129,6 +135,11 @@ async def reduce_slug(
             _reject(
                 "WIKI_REDUCE_SUMMARY_COUNT",
                 "summary 页面每次必须恰好一个 update",
+            )
+        if slug != f"summary/{updates[0].knowledge_id}":
+            _reject(
+                "WIKI_REDUCE_SUMMARY_IDENTITY_MISMATCH",
+                "summary slug 必须与 update knowledge_id 完全一致",
             )
         return _reduce_summary(updates[0])
 

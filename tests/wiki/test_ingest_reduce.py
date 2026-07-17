@@ -106,6 +106,42 @@ async def test_reduce_summary_replaces_page_without_model_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reduce_summary_replaces_existing_page_without_inheriting_metadata() -> None:
+    model = RecordingModel()
+    update = SlugUpdate(
+        pending_op_id=OP_A,
+        knowledge_id="knowledge-a",
+        slug="summary/knowledge-a",
+        title="新摘要",
+        page_type="summary",
+        content="新正文",
+        summary="新摘要说明",
+    )
+    old = ReducedPage(
+        slug="summary/knowledge-a",
+        title="旧摘要",
+        page_type="summary",
+        content="旧正文",
+        summary="旧摘要说明",
+        aliases=["旧别名"],
+        source_refs=["knowledge-old"],
+        chunk_refs=["chunk-old"],
+        contributor_op_ids=[OP_B],
+    )
+
+    page = await reduce_slug(update.slug, [update], old, model)
+
+    assert page.title == "新摘要"
+    assert page.content == "新正文"
+    assert page.summary == "新摘要说明"
+    assert page.aliases == []
+    assert page.source_refs == ["knowledge-a"]
+    assert page.chunk_refs == []
+    assert page.contributor_op_ids == [OP_A]
+    assert model.merge_requests == []
+
+
+@pytest.mark.asyncio
 async def test_reduce_topic_merges_two_contributions_once() -> None:
     model = RecordingModel()
     updates = [
@@ -140,6 +176,37 @@ async def test_reduce_topic_merges_two_contributions_once() -> None:
         "knowledge-a",
         "knowledge-b",
     ]
+    first, second = request.contributions
+    assert (
+        first.title,
+        first.content,
+        first.summary,
+        first.aliases,
+        first.source_refs,
+        first.chunk_refs,
+    ) == (
+        "Acme",
+        "本次贡献正文",
+        "本次贡献摘要",
+        ["Acme Inc.", "共同别名"],
+        ["knowledge-a"],
+        ["chunk-a"],
+    )
+    assert (
+        second.title,
+        second.content,
+        second.summary,
+        second.aliases,
+        second.source_refs,
+        second.chunk_refs,
+    ) == (
+        "ACME",
+        "第二份正文",
+        "第二份摘要",
+        ["共同别名", "ACME Corp."],
+        ["knowledge-b"],
+        ["chunk-b"],
+    )
     assert page.title == "合并后的 Acme"
     assert page.content == "合并后的正文"
     assert page.summary == "本次贡献摘要\n\n第二份摘要"
@@ -209,6 +276,39 @@ async def test_reduce_rejects_empty_or_mismatched_updates(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "slug",
+    [
+        "",
+        "entity/",
+        "entity//acme",
+        "entity/acme/",
+        "Entity/acme",
+        "entity/acme.name",
+        f"entity/{'a' * 249}",
+    ],
+)
+async def test_reduce_rejects_noncanonical_or_oversized_slug(slug: str) -> None:
+    prefix = slug.partition("/")[0]
+    page_type = prefix if prefix in {"summary", "entity", "concept"} else "entity"
+    invalid = SlugUpdate.model_construct(
+        pending_op_id=OP_A,
+        knowledge_id="knowledge-a",
+        slug=slug,
+        title="非法页面",
+        page_type=page_type,
+        content="正文",
+        summary="摘要",
+        aliases=[],
+        source_refs=[],
+        chunk_refs=[],
+    )
+
+    with pytest.raises(WikiValidationError, match="slug"):
+        await reduce_slug(slug, [invalid], None, RecordingModel())
+
+
+@pytest.mark.asyncio
 async def test_reduce_rejects_prefix_type_mismatch_even_for_constructed_input() -> None:
     invalid = SlugUpdate.model_construct(
         pending_op_id=OP_A,
@@ -251,6 +351,20 @@ async def test_reduce_rejects_multiple_summary_updates() -> None:
 
     with pytest.raises(WikiValidationError, match="恰好一个"):
         await reduce_slug(first.slug, [first, second], None, RecordingModel())
+
+
+@pytest.mark.asyncio
+async def test_reduce_rejects_summary_slug_for_different_knowledge() -> None:
+    update = SlugUpdate(
+        pending_op_id=OP_A,
+        knowledge_id="knowledge-a",
+        slug="summary/knowledge-b",
+        title="错误摘要",
+        page_type="summary",
+    )
+
+    with pytest.raises(WikiValidationError, match="knowledge_id"):
+        await reduce_slug(update.slug, [update], None, RecordingModel())
 
 
 @pytest.mark.asyncio
