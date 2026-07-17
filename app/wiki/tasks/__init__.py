@@ -2,6 +2,7 @@
 
 from app.wiki.tasks.locks import (
     LockLease,
+    LockOwnershipLost,
     MemoryWikiLockManager,
     RedisWikiLockManager,
     WikiLockManager,
@@ -10,6 +11,7 @@ from app.wiki.tasks.locks import (
 
 __all__ = [
     "LockLease",
+    "LockOwnershipLost",
     "MemoryWikiLockManager",
     "RedisWikiLockManager",
     "WikiLockManager",

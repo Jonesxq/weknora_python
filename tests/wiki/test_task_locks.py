@@ -14,6 +14,7 @@ from app.wiki.tasks.locks import (
     RELEASE_SCRIPT,
     RENEW_SCRIPT,
     LockLease,
+    LockOwnershipLost,
     MemoryWikiLockManager,
     RedisWikiLockManager,
     build_lock_manager_from_env,
@@ -35,6 +36,10 @@ class FakeRedis:
         self.allow_set = True
         self.set_error: Exception | None = None
         self.eval_errors: dict[str, Exception] = {}
+        self.eval_after_effect_errors: dict[str, Exception] = {}
+        self.eval_waiter: asyncio.Event | None = None
+        self.exists_error: Exception | None = None
+        self.aclose_count = 0
 
     async def set(
         self,
@@ -56,6 +61,8 @@ class FakeRedis:
         self.eval_calls.append((script, numkeys, args))
         if script in self.eval_errors:
             raise self.eval_errors[script]
+        if self.eval_waiter is not None:
+            await self.eval_waiter.wait()
         key, token = str(args[0]), str(args[1])
         if self.values.get(key) != token:
             return 0
@@ -63,16 +70,58 @@ class FakeRedis:
             return 1
         if script == RELEASE_SCRIPT:
             del self.values[key]
+            if script in self.eval_after_effect_errors:
+                raise self.eval_after_effect_errors.pop(script)
             return 1
         raise AssertionError("收到未知 Lua 脚本")
 
     async def exists(self, key: str) -> int:
         self.exists_calls.append(key)
+        if self.exists_error is not None:
+            raise self.exists_error
         return int(key in self.values)
 
     async def delete(self, key: str) -> int:
         self.delete_calls.append(key)
         return int(self.values.pop(key, None) is not None)
+
+    async def aclose(self) -> None:
+        self.aclose_count += 1
+
+
+class LoopBoundFakeRedis(FakeRedis):
+    """模拟 redis.asyncio 客户端不能跨事件循环复用。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.loop = asyncio.get_running_loop()
+
+    def _assert_loop(self) -> None:
+        if asyncio.get_running_loop() is not self.loop:
+            raise RuntimeError("Redis client used from a different event loop")
+
+    async def set(
+        self,
+        name: str,
+        value: str,
+        *,
+        nx: bool,
+        ex: int,
+    ) -> bool:
+        self._assert_loop()
+        return await super().set(name, value, nx=nx, ex=ex)
+
+    async def eval(self, script: str, numkeys: int, *args: object) -> int:
+        self._assert_loop()
+        return await super().eval(script, numkeys, *args)
+
+    async def exists(self, key: str) -> int:
+        self._assert_loop()
+        return await super().exists(key)
+
+    async def aclose(self) -> None:
+        self._assert_loop()
+        await super().aclose()
 
 
 class ManualClock:
@@ -114,6 +163,8 @@ async def test_redis_lock_uses_random_token_and_exact_commands() -> None:
     assert first.key == f"wiki:active:{KB_ID}"
     assert len(first.token) == 32
     assert redis.set_calls == [(first.key, first.token, True, 60)]
+    await first.assert_owned()
+    assert first.lost is False
     assert await first.renew() is True
     assert redis.eval_calls[-1] == (
         RENEW_SCRIPT,
@@ -160,6 +211,43 @@ async def test_old_redis_owner_cannot_renew_or_release_new_owner() -> None:
 
 
 @pytest.mark.asyncio
+async def test_assert_owned_wraps_redis_error_and_marks_lease_lost() -> None:
+    redis = FakeRedis()
+    lease = await RedisWikiLockManager(redis).acquire(KB_ID)
+    assert lease is not None
+    redis.eval_errors[RENEW_SCRIPT] = ConnectionError("renew failed")
+
+    with pytest.raises(LockOwnershipLost) as error:
+        await lease.assert_owned()
+
+    assert isinstance(error.value.__cause__, ConnectionError)
+    assert lease.lost is True
+    assert lease.token not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_assert_owned_has_finite_operation_timeout() -> None:
+    redis = FakeRedis()
+    manager = RedisWikiLockManager(
+        redis,
+        ttl_seconds=1,
+        renew_interval_seconds=0.1,
+        operation_timeout_seconds=0.01,
+    )
+    lease = await manager.acquire(KB_ID)
+    assert lease is not None
+    redis.eval_waiter = asyncio.Event()
+
+    with pytest.raises(LockOwnershipLost) as error:
+        await lease.assert_owned()
+
+    assert isinstance(error.value.__cause__, TimeoutError)
+    assert lease.lost is True
+    redis.eval_waiter = None
+    assert await lease.release() is True
+
+
+@pytest.mark.asyncio
 async def test_redis_is_active_uses_exists() -> None:
     redis = FakeRedis()
     manager = RedisWikiLockManager(redis)
@@ -175,7 +263,10 @@ async def test_redis_is_active_uses_exists() -> None:
 async def test_keep_alive_marks_lease_lost_when_renew_returns_false() -> None:
     redis = FakeRedis()
     manager = RedisWikiLockManager(
-        redis, ttl_seconds=1, renew_interval_seconds=0.01
+        redis,
+        ttl_seconds=1,
+        renew_interval_seconds=0.01,
+        operation_timeout_seconds=0.1,
     )
     lease = await manager.acquire(KB_ID)
     assert lease is not None
@@ -191,29 +282,185 @@ async def test_keep_alive_marks_lease_lost_when_renew_returns_false() -> None:
 
 
 @pytest.mark.asyncio
-async def test_keep_alive_marks_lease_lost_and_stops_on_redis_error() -> None:
+async def test_keep_alive_marks_lease_lost_and_stops_on_redis_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     redis = FakeRedis()
     manager = RedisWikiLockManager(
-        redis, ttl_seconds=1, renew_interval_seconds=0.01
+        redis,
+        ttl_seconds=1,
+        renew_interval_seconds=0.01,
+        operation_timeout_seconds=0.1,
     )
     lease = await manager.acquire(KB_ID)
     assert lease is not None
     redis.eval_errors[RENEW_SCRIPT] = ConnectionError("renew failed")
 
-    async with lease:
-        await wait_until(lambda: lease.lost)
+    with caplog.at_level(logging.WARNING):
+        async with lease:
+            await wait_until(lambda: lease.lost)
 
     renew_count = sum(call[0] == RENEW_SCRIPT for call in redis.eval_calls)
     await asyncio.sleep(0.03)
     assert sum(call[0] == RENEW_SCRIPT for call in redis.eval_calls) == renew_count
     assert sum(call[0] == RELEASE_SCRIPT for call in redis.eval_calls) == 1
+    assert "所有权确认失败" in caplog.text
+    assert lease.token not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_release_can_retry_after_command_error() -> None:
+    redis = FakeRedis()
+    lease = await RedisWikiLockManager(redis).acquire(KB_ID)
+    assert lease is not None
+    redis.eval_errors[RELEASE_SCRIPT] = ConnectionError("release failed")
+
+    with pytest.raises(ConnectionError, match="release failed"):
+        await lease.release()
+
+    assert lease.key in redis.values
+    del redis.eval_errors[RELEASE_SCRIPT]
+    assert await lease.release() is True
+    assert await lease.release() is False
+
+
+@pytest.mark.asyncio
+async def test_release_response_loss_can_retry_to_definitive_false() -> None:
+    redis = FakeRedis()
+    redis.eval_after_effect_errors[RELEASE_SCRIPT] = ConnectionError(
+        "response lost"
+    )
+    manager = RedisWikiLockManager(client_factory=lambda: redis)
+    lease = await manager.acquire(KB_ID)
+    assert lease is not None
+
+    with pytest.raises(ConnectionError, match="response lost"):
+        await lease.release()
+
+    assert lease.key not in redis.values
+    assert redis.aclose_count == 0
+    assert await lease.release() is False
+    assert redis.aclose_count == 1
+    assert await lease.release() is False
+    assert sum(call[0] == RELEASE_SCRIPT for call in redis.eval_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_release_retains_retry_ability() -> None:
+    started = asyncio.Event()
+    blocker = asyncio.Event()
+    attempts = 0
+
+    async def renew() -> bool:
+        return True
+
+    async def release() -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            started.set()
+            await blocker.wait()
+        return True
+
+    lease = LockLease(
+        key=f"wiki:active:{KB_ID}",
+        token="not-logged",
+        renew_interval_seconds=20,
+        operation_timeout_seconds=5,
+        renew_operation=renew,
+        release_operation=release,
+    )
+    task = asyncio.create_task(lease.release())
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert await lease.release() is True
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_context_preserves_business_error_when_release_cleanup_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    redis = FakeRedis()
+    lease = await RedisWikiLockManager(redis).acquire(KB_ID)
+    assert lease is not None
+    redis.eval_errors[RELEASE_SCRIPT] = ConnectionError("cleanup failed")
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(ValueError, match="business failed"):
+            async with lease:
+                raise ValueError("business failed")
+
+    assert "释放清理失败" in caplog.text
+    assert lease.token not in caplog.text
+    del redis.eval_errors[RELEASE_SCRIPT]
+    assert await lease.release() is True
+
+
+@pytest.mark.asyncio
+async def test_context_propagates_release_error_on_normal_exit() -> None:
+    redis = FakeRedis()
+    lease = await RedisWikiLockManager(redis).acquire(KB_ID)
+    assert lease is not None
+    redis.eval_errors[RELEASE_SCRIPT] = ConnectionError("cleanup failed")
+
+    with pytest.raises(ConnectionError, match="cleanup failed"):
+        async with lease:
+            pass
+
+    del redis.eval_errors[RELEASE_SCRIPT]
+    assert await lease.release() is True
+
+
+@pytest.mark.asyncio
+async def test_context_preserves_cancellation_when_release_cleanup_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    redis = FakeRedis()
+    manager = RedisWikiLockManager(
+        redis,
+        ttl_seconds=1,
+        renew_interval_seconds=0.01,
+        operation_timeout_seconds=0.1,
+    )
+    lease = await manager.acquire(KB_ID)
+    assert lease is not None
+    entered = asyncio.Event()
+
+    async def hold_lock() -> None:
+        async with lease:
+            entered.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(hold_lock())
+    await entered.wait()
+    redis.eval_errors[RELEASE_SCRIPT] = ConnectionError("cleanup failed")
+    with caplog.at_level(logging.WARNING):
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    renew_count = sum(call[0] == RENEW_SCRIPT for call in redis.eval_calls)
+    await asyncio.sleep(0.03)
+    assert sum(call[0] == RENEW_SCRIPT for call in redis.eval_calls) == renew_count
+    assert "释放清理失败" in caplog.text
+    assert lease.token not in caplog.text
+    del redis.eval_errors[RELEASE_SCRIPT]
+    assert await lease.release() is True
 
 
 @pytest.mark.asyncio
 async def test_async_context_cancellation_stops_guard_and_releases_once() -> None:
     redis = FakeRedis()
     manager = RedisWikiLockManager(
-        redis, ttl_seconds=1, renew_interval_seconds=0.01
+        redis,
+        ttl_seconds=1,
+        renew_interval_seconds=0.01,
+        operation_timeout_seconds=0.1,
     )
     lease = await manager.acquire(KB_ID)
     assert lease is not None
@@ -270,7 +517,8 @@ async def test_memory_lock_expires_and_old_lease_cannot_touch_new_owner() -> Non
 
     assert replacement is not None
     assert replacement.token != old.token
-    assert await old.renew() is False
+    with pytest.raises(LockOwnershipLost):
+        await old.assert_owned()
     assert old.lost is True
     assert await old.release() is False
     assert await manager.is_active(KB_ID) is True
@@ -287,19 +535,32 @@ async def test_memory_lock_expires_and_old_lease_cannot_touch_new_owner() -> Non
     ],
 )
 @pytest.mark.parametrize(
-    ("ttl_seconds", "renew_interval_seconds"),
-    [(0, 1), (-1, 1), (60, 0), (60, -1), (20, 20), (20, 21)],
+    ("ttl_seconds", "renew_interval_seconds", "operation_timeout_seconds"),
+    [
+        (0, 1, 1),
+        (-1, 1, 1),
+        (60, 0, 1),
+        (60, -1, 1),
+        (20, 20, 1),
+        (20, 21, 1),
+        (60, 20, 0),
+        (60, 20, -1),
+        (20, 5, 20),
+        (20, 5, 21),
+    ],
 )
 def test_lock_managers_reject_invalid_timing(
     manager_type: type[Any],
     kwargs: dict[str, object],
     ttl_seconds: int,
     renew_interval_seconds: int,
+    operation_timeout_seconds: int,
 ) -> None:
     with pytest.raises(ValueError):
         manager_type(
             ttl_seconds=ttl_seconds,
             renew_interval_seconds=renew_interval_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
             **kwargs,
         )
 
@@ -307,12 +568,14 @@ def test_lock_managers_reject_invalid_timing(
 def test_environment_factory_defaults_to_cached_redis_manager(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_redis = FakeRedis()
-    urls: list[str] = []
+    clients: list[FakeRedis] = []
+    calls: list[tuple[str, dict[str, object]]] = []
 
-    def fake_from_url(url: str) -> FakeRedis:
-        urls.append(url)
-        return fake_redis
+    def fake_from_url(url: str, **kwargs: object) -> FakeRedis:
+        calls.append((url, kwargs))
+        client = FakeRedis()
+        clients.append(client)
+        return client
 
     monkeypatch.delenv("GRAPH_WIKI_LOCK_MODE", raising=False)
     monkeypatch.delenv("GRAPH_REDIS_URL", raising=False)
@@ -323,7 +586,67 @@ def test_environment_factory_defaults_to_cached_redis_manager(
 
     assert isinstance(first, RedisWikiLockManager)
     assert second is first
-    assert urls == ["redis://127.0.0.1:6379/2"]
+    assert calls == []
+    assert asyncio.run(first.is_active(KB_ID)) is False
+    assert calls == [
+        (
+            "redis://127.0.0.1:6379/2",
+            {"socket_connect_timeout": 5.0, "socket_timeout": 5.0},
+        )
+    ]
+    assert clients[0].aclose_count == 1
+
+
+def test_cached_environment_manager_uses_fresh_client_per_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients: list[LoopBoundFakeRedis] = []
+
+    def fake_from_url(url: str, **kwargs: object) -> LoopBoundFakeRedis:
+        client = LoopBoundFakeRedis()
+        clients.append(client)
+        return client
+
+    monkeypatch.setenv("GRAPH_WIKI_LOCK_MODE", "redis")
+    monkeypatch.setattr(Redis, "from_url", fake_from_url)
+    manager = build_lock_manager_from_env()
+
+    async def acquire_and_release() -> None:
+        lease = await manager.acquire(KB_ID)
+        assert lease is not None
+        await lease.assert_owned()
+        assert await lease.release() is True
+
+    asyncio.run(acquire_and_release())
+    asyncio.run(acquire_and_release())
+
+    assert len(clients) == 2
+    assert clients[0] is not clients[1]
+    assert clients[0].loop is not clients[1].loop
+    assert [client.aclose_count for client in clients] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_owned_clients_close_after_conflict_error_and_is_active() -> None:
+    conflict = FakeRedis()
+    conflict.allow_set = False
+    manager = RedisWikiLockManager(client_factory=lambda: conflict)
+    assert await manager.acquire(KB_ID) is None
+    assert conflict.aclose_count == 1
+
+    failed_set = FakeRedis()
+    failed_set.set_error = ConnectionError("set failed")
+    manager = RedisWikiLockManager(client_factory=lambda: failed_set)
+    with pytest.raises(ConnectionError, match="set failed"):
+        await manager.acquire(KB_ID)
+    assert failed_set.aclose_count == 1
+
+    failed_exists = FakeRedis()
+    failed_exists.exists_error = ConnectionError("exists failed")
+    manager = RedisWikiLockManager(client_factory=lambda: failed_exists)
+    with pytest.raises(ConnectionError, match="exists failed"):
+        await manager.is_active(KB_ID)
+    assert failed_exists.aclose_count == 1
 
 
 def test_environment_factory_uses_explicit_memory_mode_and_warns(
@@ -363,13 +686,14 @@ def test_environment_factory_does_not_fall_back_when_redis_creation_fails(
 ) -> None:
     monkeypatch.setenv("GRAPH_WIKI_LOCK_MODE", "redis")
 
-    def fail_from_url(url: str) -> None:
+    def fail_from_url(url: str, **kwargs: object) -> None:
         raise ConnectionError(f"cannot connect to {url}")
 
     monkeypatch.setattr(Redis, "from_url", fail_from_url)
 
+    manager = build_lock_manager_from_env()
     with pytest.raises(ConnectionError, match="cannot connect"):
-        build_lock_manager_from_env()
+        asyncio.run(manager.is_active(KB_ID))
 
 
 @pytest.mark.asyncio
@@ -392,5 +716,7 @@ async def test_real_redis_lock_when_configured() -> None:
         assert await first.release() is True
         assert await manager.is_active(kb_id) is False
     finally:
-        await redis.delete(key)
-        await redis.aclose()
+        try:
+            await redis.delete(key)
+        finally:
+            await redis.aclose()
