@@ -54,13 +54,17 @@ def test_phase_three_upgrade_generates_expected_offline_sql() -> None:
     assert "chunk_refs JSONB DEFAULT '[]'::jsonb NOT NULL" in sql
     assert "payload JSONB DEFAULT '{}'::jsonb NOT NULL" in sql
     assert "fail_count INTEGER DEFAULT 0 NOT NULL" in sql
+    assert "last_error_code VARCHAR(128) NOT NULL" in sql
+    assert "last_error_summary VARCHAR(2000) NOT NULL" in sql
     assert "CREATE UNIQUE INDEX uq_wiki_page_contributions_active_source" in sql
     assert "WHERE state = 'active'" in sql
     assert "CREATE INDEX ix_wiki_page_contributions_slug_state" in sql
     assert "CREATE INDEX ix_wiki_page_contributions_source_state" in sql
     assert "CREATE INDEX ix_wiki_dead_letters_scope_dead_at" in sql
-    assert "CREATE INDEX ix_wiki_pages_dedup_names_trgm ON wiki_pages USING gist" in sql
-    assert "lower(title) || ' ' || lower(coalesce(aliases::text, '')) gist_trgm_ops" in sql
+    assert (
+        "CREATE INDEX ix_wiki_pages_dedup_names_trgm ON wiki_pages USING gist "
+        "((lower(title) || ' ' || lower(coalesce(aliases::text, ''))) gist_trgm_ops)"
+    ) in sql
     assert "deleted_at IS NULL AND status = 'published' AND page_type IN ('entity', 'concept')" in sql
 
 

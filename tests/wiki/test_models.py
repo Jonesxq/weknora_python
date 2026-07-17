@@ -305,7 +305,7 @@ def test_dead_letter_has_failure_record_contract() -> None:
         "last_error_code": 128,
         "last_error_summary": 2000,
     }
-    assert _nullable_columns(WikiDeadLetter) == {"last_error_code", "last_error_summary"}
+    assert _nullable_columns(WikiDeadLetter) == set()
     assert _unique_constraints(WikiDeadLetter) == {
         "uq_wiki_dead_letters_pending_op": ("pending_op_id",)
     }
@@ -322,10 +322,23 @@ def test_dead_letter_has_failure_record_contract() -> None:
     assert isinstance(columns.knowledge_base_id.type, postgresql.UUID)
     assert isinstance(columns.payload.type, postgresql.JSONB)
     assert isinstance(columns.fail_count.type, Integer)
+    assert isinstance(columns.dead_at.type, DateTime)
+    assert columns.dead_at.type.timezone is True
     assert columns.id.default.arg.__name__ == "_uuid"
     assert columns.payload.default.arg.__name__ == "dict"
     assert columns.fail_count.default.arg == 0
     assert str(columns.dead_at.server_default.arg) == "now()"
+
+
+def test_phase_three_timestamp_columns_are_timezone_aware() -> None:
+    for model, names in (
+        (WikiPageContribution, ("created_at", "updated_at")),
+        (WikiDeadLetter, ("dead_at",)),
+    ):
+        for name in names:
+            column_type = model.__table__.c[name].type
+            assert isinstance(column_type, DateTime)
+            assert column_type.timezone is True
 
 
 def _unique_constraints(model: type) -> dict[str, tuple[str, ...]]:

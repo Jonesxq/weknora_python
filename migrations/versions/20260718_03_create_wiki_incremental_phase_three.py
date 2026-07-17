@@ -77,8 +77,8 @@ def upgrade() -> None:
         sa.Column("op_version", sa.String(length=255), nullable=False),
         sa.Column("payload", postgresql.JSONB(astext_type=sa.Text()), server_default=JSON_OBJECT, nullable=False),
         sa.Column("fail_count", sa.Integer(), server_default=sa.text("0"), nullable=False),
-        sa.Column("last_error_code", sa.String(length=128), nullable=True),
-        sa.Column("last_error_summary", sa.String(length=2000), nullable=True),
+        sa.Column("last_error_code", sa.String(length=128), nullable=False),
+        sa.Column("last_error_summary", sa.String(length=2000), nullable=False),
         sa.Column("dead_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("pending_op_id", name="uq_wiki_dead_letters_pending_op"),
@@ -89,11 +89,14 @@ def upgrade() -> None:
         ["tenant_id", "knowledge_base_id", "dead_at"],
     )
 
-    op.execute(
-        "CREATE INDEX ix_wiki_pages_dedup_names_trgm ON wiki_pages USING gist "
-        "(lower(title) || ' ' || lower(coalesce(aliases::text, '')) gist_trgm_ops) "
-        "WHERE deleted_at IS NULL AND status = 'published' "
-        "AND page_type IN ('entity', 'concept')"
+    op.create_index(
+        "ix_wiki_pages_dedup_names_trgm",
+        "wiki_pages",
+        [sa.text("(lower(title) || ' ' || lower(coalesce(aliases::text, ''))) gist_trgm_ops")],
+        postgresql_using="gist",
+        postgresql_where=sa.text(
+            "deleted_at IS NULL AND status = 'published' AND page_type IN ('entity', 'concept')"
+        ),
     )
 
 
