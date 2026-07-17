@@ -12,6 +12,7 @@ from app.wiki.tasks import enqueue_fake, wiki_tasks
 
 
 KB_ID = UUID("11111111-1111-1111-1111-111111111111")
+OTHER_KB_ID = UUID("33333333-3333-3333-3333-333333333333")
 PENDING_OP_ID = UUID("22222222-2222-2222-2222-222222222222")
 
 
@@ -121,6 +122,43 @@ def test_fixture_mismatch_exits_before_runtime(
         enqueue_fake.main(_args(knowledge_id="missing"))
 
     assert raised.value.code == 2
+
+
+def test_duplicate_knowledge_id_reports_global_uniqueness_before_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = tmp_path / "wiki-fake.json"
+    _write_fake_fixture(fixture)
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    data["knowledge_bases"].append(
+        {
+            "tenant_id": 24,
+            "knowledge_base_id": str(OTHER_KB_ID),
+            "config": {
+                "wiki_enabled": True,
+                "synthesis_model_id": "fake-synthesis",
+            },
+        }
+    )
+    duplicate = dict(data["knowledge"][0])
+    duplicate["tenant_id"] = 24
+    duplicate["knowledge_base_id"] = str(OTHER_KB_ID)
+    data["knowledge"].append(duplicate)
+    fixture.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setenv("GRAPH_WIKI_FAKE_DATA_FILE", str(fixture))
+    monkeypatch.setattr(
+        wiki_tasks, "build_runtime", lambda: pytest.fail("不应启动 runtime")
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        enqueue_fake.main(_args())
+
+    assert raised.value.code == 2
+    stderr = capsys.readouterr().err
+    assert "knowledge_id" in stderr
+    assert "全局唯一" in stderr
 
 
 def test_success_uses_fixture_tenant_prints_public_json_and_closes_on_same_loop(

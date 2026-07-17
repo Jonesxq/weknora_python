@@ -54,8 +54,16 @@ def _fixture_tenant(
 ) -> int:
     try:
         dataset = FakeDataset.model_validate_json(fixture_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValidationError):
-        parser.error("GRAPH_WIKI_FAKE_DATA_FILE 指向的 fixture 无法读取或格式无效")
+    except (OSError, UnicodeError):
+        parser.error("GRAPH_WIKI_FAKE_DATA_FILE 指向的 fixture 无法读取")
+    except ValidationError as error:
+        reasons = []
+        for detail in error.errors(include_url=False):
+            message = str(detail.get("msg", "")).removeprefix("Value error, ").strip()
+            if message and message not in reasons:
+                reasons.append(message)
+        reason_text = "；".join(reasons) or "未知 schema 错误"
+        parser.error(f"GRAPH_WIKI_FAKE_DATA_FILE fixture 校验失败：{reason_text}")
 
     matches = [
         item
