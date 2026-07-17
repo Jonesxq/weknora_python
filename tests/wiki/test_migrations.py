@@ -50,22 +50,52 @@ def test_phase_three_upgrade_generates_expected_offline_sql() -> None:
     assert "CONSTRAINT uq_wiki_page_contributions_version UNIQUE" in sql
     assert "CONSTRAINT uq_wiki_dead_letters_pending_op UNIQUE (pending_op_id)" in sql
     assert "state VARCHAR(32) DEFAULT 'active' NOT NULL" in sql
+    assert "content TEXT DEFAULT '' NOT NULL" in sql
+    assert "summary TEXT DEFAULT '' NOT NULL" in sql
     assert "aliases JSONB DEFAULT '[]'::jsonb NOT NULL" in sql
     assert "chunk_refs JSONB DEFAULT '[]'::jsonb NOT NULL" in sql
     assert "payload JSONB DEFAULT '{}'::jsonb NOT NULL" in sql
-    assert "fail_count INTEGER DEFAULT 0 NOT NULL" in sql
+    assert "fail_count INTEGER NOT NULL" in sql
+    dead_letters_sql = sql[sql.index("CREATE TABLE wiki_dead_letters") :]
+    assert "fail_count INTEGER DEFAULT 0 NOT NULL" not in dead_letters_sql.split(";", maxsplit=1)[0]
     assert "last_error_code VARCHAR(128) NOT NULL" in sql
     assert "last_error_summary VARCHAR(2000) NOT NULL" in sql
     assert "CREATE UNIQUE INDEX uq_wiki_page_contributions_active_source" in sql
+    assert "(tenant_id, knowledge_base_id, slug, knowledge_id) WHERE state = 'active'" in sql
     assert "WHERE state = 'active'" in sql
-    assert "CREATE INDEX ix_wiki_page_contributions_slug_state" in sql
-    assert "CREATE INDEX ix_wiki_page_contributions_source_state" in sql
-    assert "CREATE INDEX ix_wiki_dead_letters_scope_dead_at" in sql
+    assert "CREATE INDEX ix_wiki_page_contributions_slug_state ON wiki_page_contributions (tenant_id, knowledge_base_id, slug, state)" in sql
+    assert "CREATE INDEX ix_wiki_page_contributions_source_state ON wiki_page_contributions (tenant_id, knowledge_base_id, knowledge_id, state)" in sql
+    assert "CREATE INDEX ix_wiki_dead_letters_scope_dead_at ON wiki_dead_letters (tenant_id, knowledge_base_id, dead_at)" in sql
     assert (
         "CREATE INDEX ix_wiki_pages_dedup_names_trgm ON wiki_pages USING gist "
         "((lower(title) || ' ' || lower(coalesce(aliases::text, ''))) gist_trgm_ops)"
     ) in sql
     assert "deleted_at IS NULL AND status = 'published' AND page_type IN ('entity', 'concept')" in sql
+
+
+def test_phase_three_downgrade_generates_expected_offline_sql() -> None:
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "downgrade", "20260718_03:20260714_02", "--sql"],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    sql = " ".join(result.stdout.split())
+
+    dedup_index = "DROP INDEX ix_wiki_pages_dedup_names_trgm"
+    dead_letters = "DROP TABLE wiki_dead_letters"
+    contributions = "DROP TABLE wiki_page_contributions"
+    assert dedup_index in sql
+    assert dead_letters in sql
+    assert contributions in sql
+    assert sql.index(dedup_index) < sql.index(dead_letters) < sql.index(contributions)
 
 
 def test_phase_two_upgrade_generates_expected_offline_sql() -> None:

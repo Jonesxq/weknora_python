@@ -98,6 +98,14 @@ class WikiPage(Base):
             postgresql_using="gin",
             postgresql_ops={"source_refs": "jsonb_path_ops"},
         ),
+        Index(
+            "ix_wiki_pages_dedup_names_trgm",
+            text("(lower(title) || ' ' || lower(coalesce(aliases::text, ''))) gist_trgm_ops"),
+            postgresql_using="gist",
+            postgresql_where=text(
+                "deleted_at IS NULL AND status = 'published' AND page_type IN ('entity', 'concept')"
+            ),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
@@ -311,8 +319,8 @@ class WikiPageContribution(Base):
     page_type: Mapped[str] = mapped_column(String(32), nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     title: Mapped[str] = mapped_column(String(512), nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
     aliases: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     chunk_refs: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(
@@ -345,7 +353,7 @@ class WikiDeadLetter(Base):
     op: Mapped[str] = mapped_column(String(32), nullable=False)
     op_version: Mapped[str] = mapped_column(String(255), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    fail_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    fail_count: Mapped[int] = mapped_column(Integer, nullable=False)
     last_error_code: Mapped[str] = mapped_column(String(128), nullable=False)
     last_error_summary: Mapped[str] = mapped_column(String(2000), nullable=False)
     dead_at: Mapped[datetime] = mapped_column(

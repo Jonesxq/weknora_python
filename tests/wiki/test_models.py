@@ -54,9 +54,21 @@ def test_orm_metadata_tracks_search_indexes_created_by_migration() -> None:
 
     assert "ix_wiki_pages_title_trgm" in index_names
     assert "ix_wiki_pages_search_fts" in index_names
+    assert "ix_wiki_pages_dedup_names_trgm" in index_names
 
     for index in WikiPage.__table__.indexes:
         str(CreateIndex(index).compile(dialect=postgresql.dialect()))
+
+
+def test_page_dedup_names_index_matches_phase_three_migration() -> None:
+    index = next(
+        index for index in WikiPage.__table__.indexes if index.name == "ix_wiki_pages_dedup_names_trgm"
+    )
+
+    sql = str(CreateIndex(index).compile(dialect=postgresql.dialect()))
+
+    assert "USING gist ((lower(title) || ' ' || lower(coalesce(aliases::text, ''))) gist_trgm_ops)" in sql
+    assert "WHERE deleted_at IS NULL AND status = 'published' AND page_type IN ('entity', 'concept')" in sql
 
 
 def test_phase_two_models_are_registered() -> None:
@@ -281,6 +293,8 @@ def test_page_contribution_has_idempotency_and_active_source_contract() -> None:
     assert columns.state.default.arg == "active"
     assert columns.content.default.arg == ""
     assert columns.summary.default.arg == ""
+    assert str(columns.content.server_default.arg) == "''"
+    assert str(columns.summary.server_default.arg) == "''"
     assert columns.aliases.default.arg.__name__ == "list"
     assert columns.chunk_refs.default.arg.__name__ == "list"
     assert str(columns.created_at.server_default.arg) == "now()"
@@ -326,7 +340,7 @@ def test_dead_letter_has_failure_record_contract() -> None:
     assert columns.dead_at.type.timezone is True
     assert columns.id.default.arg.__name__ == "_uuid"
     assert columns.payload.default.arg.__name__ == "dict"
-    assert columns.fail_count.default.arg == 0
+    assert columns.fail_count.default is None
     assert str(columns.dead_at.server_default.arg) == "now()"
 
 
