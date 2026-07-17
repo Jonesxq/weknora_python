@@ -10,17 +10,38 @@ import os
 import threading
 from collections.abc import Callable, Coroutine
 from concurrent.futures import CancelledError as FutureCancelledError
-from typing import Any, NoReturn, TypeVar
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, TypeVar
 from uuid import UUID
 
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+from app.infrastructure.database.config import DatabaseSettings
+from app.infrastructure.database.session import create_database_engine, create_session_factory
 from app.infrastructure.tasks.celery_app import celery_app
+from app.wiki.ingest.enqueue import WikiEnqueueService
 from app.wiki.ingest.errors import WikiBatchBusy
-from app.wiki.ingest.schemas import BatchResult
+from app.wiki.ingest.fakes import load_fake_adapters
+from app.wiki.ingest.schemas import BatchResult, WikiWorkerOptions
+from app.wiki.ingest.store import SqlAlchemyIngestStore, SqlFinalizationPort
+from app.wiki.ingest.worker import WikiIngestWorker
 from app.wiki.scope import WikiScope
+from app.wiki.tasks.locks import build_lock_manager_from_env
 
 
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class WikiTaskRuntime:
+    engine: AsyncEngine
+    worker: WikiIngestWorker
+    enqueue: WikiEnqueueService
+
+    async def aclose(self) -> None:
+        await self.engine.dispose()
 
 
 class ProcessEventLoopRunner:
@@ -149,10 +170,30 @@ def _build_scope(tenant_id: int, knowledge_base_id: str) -> WikiScope:
     )
 
 
-def build_runtime() -> NoReturn:
-    """任务 10 才会组装完整 Worker runtime。"""
+def build_runtime() -> WikiTaskRuntime:
+    """按批次创建不跨事件循环复用的 Wiki Worker runtime。"""
 
-    raise RuntimeError("Wiki Worker runtime 尚未组装，将在阶段二任务 10 实现")
+    fixture_value = os.getenv("GRAPH_WIKI_FAKE_DATA_FILE", "").strip()
+    if not fixture_value:
+        raise RuntimeError("GRAPH_WIKI_FAKE_DATA_FILE 必须配置为非空 fixture 路径")
+
+    database_settings = DatabaseSettings.from_env()
+    worker_options = WikiWorkerOptions.from_env()
+    locks = build_lock_manager_from_env()
+    source, model = load_fake_adapters(Path(fixture_value))
+
+    engine = create_database_engine(database_settings)
+    session_factory = create_session_factory(engine)
+    store = SqlAlchemyIngestStore(session_factory, SqlFinalizationPort())
+    worker = WikiIngestWorker(
+        store=store,
+        locks=locks,
+        source=source,
+        model=model,
+        options=worker_options,
+    )
+    enqueue = WikiEnqueueService(source, store)
+    return WikiTaskRuntime(engine=engine, worker=worker, enqueue=enqueue)
 
 
 async def _run_batch_on_worker_loop(scope: WikiScope) -> BatchResult:

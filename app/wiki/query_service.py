@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from datetime import UTC, datetime
+from typing import Protocol
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -41,9 +42,28 @@ from app.schemas.wiki.queries import (
 from app.wiki.domain import calculate_health_score, extract_wiki_links, normalize_slug
 from app.wiki.enums import WikiPageType
 from app.wiki.errors import WikiNotFoundError, WikiPermissionError, WikiValidationError
-from app.wiki.models import WikiFolder, WikiLink, WikiLogEntry, WikiPage, WikiPageIssue
+from app.wiki.models import (
+    WikiFolder,
+    WikiLink,
+    WikiLogEntry,
+    WikiPage,
+    WikiPageIssue,
+    WikiPendingOp,
+)
 from app.wiki.scope import WikiScope
 from app.wiki.sql_page_store import SqlAlchemyPageStore
+
+
+class ActivityProbe(Protocol):
+    async def is_active(self, knowledge_base_id: UUID) -> bool: ...
+
+
+class _InactiveActivityProbe:
+    async def is_active(self, knowledge_base_id: UUID) -> bool:
+        return False
+
+
+_INACTIVE_ACTIVITY_PROBE = _InactiveActivityProbe()
 
 
 def build_search_statement(scope: WikiScope, query: str, *, limit: int):
@@ -219,8 +239,13 @@ class WikiQueryService:
         WikiPageType.COMPARISON,
     )
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        activity_probe: ActivityProbe | None = None,
+    ) -> None:
         self._session = session
+        self._activity_probe = activity_probe or _INACTIVE_ACTIVITY_PROBE
 
     async def get_index(
         self,
@@ -351,13 +376,19 @@ class WikiQueryService:
                 WikiPageIssue.status == "pending",
             )
         )
+        pending_tasks = await self._count(
+            select(func.count(WikiPendingOp.id)).where(
+                WikiPendingOp.tenant_id == scope.tenant_id,
+                WikiPendingOp.knowledge_base_id == scope.knowledge_base_id,
+            )
+        )
         return WikiStatsResponse(
             page_count=page_count,
             folder_count=folder_count,
             link_count=link_count,
             issue_count=issue_count,
-            pending_tasks=0,
-            is_active=False,
+            pending_tasks=pending_tasks,
+            is_active=await self._activity_probe.is_active(scope.knowledge_base_id),
         )
 
     async def get_graph(

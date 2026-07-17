@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy.dialects import postgresql
 import pytest
 
 from app.wiki.errors import WikiValidationError
 from app.wiki.query_service import (
+    WikiQueryService,
     _decode_issue_cursor,
     build_broken_link_statement,
     build_ego_neighbor_statement,
@@ -15,6 +16,34 @@ from app.wiki.query_service import (
     build_search_statement,
 )
 from app.wiki.scope import WikiScope
+
+
+class _ScalarResult:
+    def __init__(self, value: int) -> None:
+        self._value = value
+
+    def scalar_one(self) -> int:
+        return self._value
+
+
+class _RecordingSession:
+    def __init__(self, values: list[int]) -> None:
+        self._values = iter(values)
+        self.statements = []
+
+    async def execute(self, statement):
+        self.statements.append(statement)
+        return _ScalarResult(next(self._values))
+
+
+class _RecordingActivityProbe:
+    def __init__(self, active: bool) -> None:
+        self._active = active
+        self.knowledge_base_ids: list[UUID] = []
+
+    async def is_active(self, knowledge_base_id: UUID) -> bool:
+        self.knowledge_base_ids.append(knowledge_base_id)
+        return self._active
 
 
 def test_search_sql_is_scoped_ranked_and_does_not_use_regex() -> None:
@@ -88,3 +117,45 @@ def test_lint_detail_queries_are_limited_to_one_batch() -> None:
             str(statement.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})).split()
         )
         assert "LIMIT 200" in sql
+
+
+@pytest.mark.asyncio
+async def test_stats_counts_pending_ops_in_scope_and_probes_activity() -> None:
+    scope = WikiScope(tenant_id=7, knowledge_base_id=uuid4(), actor_id="viewer")
+    session = _RecordingSession([3, 4, 5, 6, 2])
+    activity_probe = _RecordingActivityProbe(True)
+
+    stats = await WikiQueryService(session, activity_probe).get_stats(scope)
+
+    assert stats.model_dump() == {
+        "page_count": 3,
+        "folder_count": 4,
+        "link_count": 5,
+        "issue_count": 6,
+        "pending_tasks": 2,
+        "is_active": True,
+    }
+    assert activity_probe.knowledge_base_ids == [scope.knowledge_base_id]
+    pending_sql = " ".join(
+        str(
+            session.statements[-1].compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        ).split()
+    )
+    assert "FROM wiki_pending_ops" in pending_sql
+    assert "wiki_pending_ops.tenant_id = 7" in pending_sql
+    assert (
+        f"wiki_pending_ops.knowledge_base_id = '{scope.knowledge_base_id}'"
+        in pending_sql
+    )
+
+
+@pytest.mark.asyncio
+async def test_stats_defaults_to_inactive_probe() -> None:
+    scope = WikiScope(tenant_id=7, knowledge_base_id=uuid4(), actor_id="viewer")
+
+    stats = await WikiQueryService(_RecordingSession([0, 0, 0, 0, 0])).get_stats(scope)
+
+    assert stats.is_active is False

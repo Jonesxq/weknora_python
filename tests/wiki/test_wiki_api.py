@@ -32,7 +32,12 @@ def wiki_headers(role: str = "viewer", *, signature: str | None = None) -> dict[
 
 class FakeQueryService:
     async def get_stats(self, _scope):
-        return WikiStatsResponse(page_count=3, link_count=2)
+        return WikiStatsResponse(
+            page_count=3,
+            link_count=2,
+            pending_tasks=2,
+            is_active=True,
+        )
 
 
 @pytest.fixture
@@ -111,8 +116,8 @@ def test_stats_returns_frontend_polling_fields(client: TestClient) -> None:
         "folder_count": 0,
         "link_count": 2,
         "issue_count": 0,
-        "pending_tasks": 0,
-        "is_active": False,
+        "pending_tasks": 2,
+        "is_active": True,
     }
 
 

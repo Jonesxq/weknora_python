@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 import threading
 from uuid import UUID
 
@@ -13,6 +15,45 @@ from app.wiki.tasks import wiki_tasks
 
 
 KB_ID = UUID("11111111-1111-1111-1111-111111111111")
+
+
+def _write_fake_fixture(path: Path) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "knowledge_bases": [
+                    {
+                        "tenant_id": 7,
+                        "knowledge_base_id": str(KB_ID),
+                        "config": {
+                            "wiki_enabled": True,
+                            "synthesis_model_id": "fake-synthesis",
+                        },
+                    }
+                ],
+                "knowledge": [
+                    {
+                        "id": "knowledge-1",
+                        "tenant_id": 7,
+                        "knowledge_base_id": str(KB_ID),
+                        "title": "Document One",
+                        "op_version": "v1",
+                        "chunks": [{"id": "chunk-1", "text": "Source text"}],
+                    }
+                ],
+                "model_responses": {
+                    "extract_candidates": {"knowledge-1": {}},
+                    "summaries": {
+                        "knowledge-1": {"headline": "Document One", "markdown": "Summary"}
+                    },
+                    "merges": {
+                        "entity/example": {"headline": "Example", "markdown": "Body"}
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_wiki_batch_task_returns_json_batch_result_in_eager_execution(
@@ -135,14 +176,82 @@ def test_wiki_batch_task_configuration_is_reliable() -> None:
     assert wiki_tasks.wiki_batch_task.reject_on_worker_lost is True
 
 
-def test_runtime_placeholder_fails_fast_until_task_ten_assembly() -> None:
-    try:
-        with pytest.raises(RuntimeError, match="任务 10"):
-            wiki_tasks.run_batch_sync(
-                wiki_tasks._build_scope(7, str(KB_ID))
-            )
-    finally:
-        wiki_tasks.close_batch_runner()
+@pytest.mark.asyncio
+async def test_build_runtime_creates_independent_batch_resources_and_disposes_own_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / "wiki-fake.json"
+    _write_fake_fixture(fixture)
+    monkeypatch.setenv("GRAPH_WIKI_FAKE_DATA_FILE", str(fixture))
+    monkeypatch.setenv("GRAPH_WIKI_LOCK_MODE", "memory")
+    locks = object()
+    engines = []
+    session_factories = []
+
+    class Engine:
+        def __init__(self) -> None:
+            self.dispose_count = 0
+
+        async def dispose(self) -> None:
+            self.dispose_count += 1
+
+    def create_engine(_settings):
+        engine = Engine()
+        engines.append(engine)
+        return engine
+
+    def create_sessions(_engine):
+        factory = object()
+        session_factories.append(factory)
+        return factory
+
+    monkeypatch.setattr(wiki_tasks, "create_database_engine", create_engine, raising=False)
+    monkeypatch.setattr(wiki_tasks, "create_session_factory", create_sessions, raising=False)
+    monkeypatch.setattr(
+        wiki_tasks, "build_lock_manager_from_env", lambda: locks, raising=False
+    )
+
+    first = wiki_tasks.build_runtime()
+    second = wiki_tasks.build_runtime()
+
+    assert isinstance(first, wiki_tasks.WikiTaskRuntime)
+    assert isinstance(second, wiki_tasks.WikiTaskRuntime)
+    assert first is not second
+    assert first.engine is not second.engine
+    assert first.worker is not second.worker
+    assert first.enqueue is not second.enqueue
+    assert first.worker._store is first.enqueue.store
+    assert second.worker._store is second.enqueue.store
+    assert first.worker._store is not second.worker._store
+    assert first.worker._locks is second.worker._locks is locks
+    assert len(session_factories) == 2
+
+    await first.aclose()
+    assert engines[0].dispose_count == 1
+    assert engines[1].dispose_count == 0
+    await second.aclose()
+    assert engines[1].dispose_count == 1
+
+
+@pytest.mark.parametrize("fixture_value", [None, "", "   "])
+def test_build_runtime_requires_non_empty_fake_fixture_before_engine_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_value: str | None,
+) -> None:
+    if fixture_value is None:
+        monkeypatch.delenv("GRAPH_WIKI_FAKE_DATA_FILE", raising=False)
+    else:
+        monkeypatch.setenv("GRAPH_WIKI_FAKE_DATA_FILE", fixture_value)
+    monkeypatch.setattr(
+        wiki_tasks,
+        "create_database_engine",
+        lambda _settings: pytest.fail("fixture 缺失时不应创建数据库引擎"),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="GRAPH_WIKI_FAKE_DATA_FILE"):
+        wiki_tasks.build_runtime()
 
 
 def test_run_batch_sync_reuses_loop_but_creates_and_closes_runtime_per_batch(

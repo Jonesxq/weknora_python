@@ -18,10 +18,11 @@ from app.infrastructure.database.session import create_database_engine, create_s
 from app.wiki.errors import WikiError, WikiPermissionError, WikiValidationError
 from app.wiki.folder_service import WikiFolderService
 from app.wiki.page_service import WikiPageService
-from app.wiki.query_service import WikiQueryService
+from app.wiki.query_service import ActivityProbe, WikiQueryService
 from app.wiki.scope import WikiScope
 from app.wiki.sql_folder_store import SqlAlchemyFolderStore
 from app.wiki.sql_page_store import SqlAlchemyPageStore
+from app.wiki.tasks.locks import build_lock_manager_from_env
 
 
 @lru_cache(maxsize=1)
@@ -39,6 +40,11 @@ def get_database_engine() -> AsyncEngine:
 @lru_cache(maxsize=1)
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
     return create_session_factory(get_database_engine())
+
+
+@lru_cache(maxsize=1)
+def get_wiki_activity_probe() -> ActivityProbe:
+    return build_lock_manager_from_env()
 
 
 async def get_database_session() -> AsyncIterator[AsyncSession]:
@@ -62,11 +68,12 @@ class WikiServices:
 
 def get_wiki_services(
     session: Annotated[AsyncSession, Depends(get_database_session)],
+    activity_probe: Annotated[ActivityProbe, Depends(get_wiki_activity_probe)],
 ) -> WikiServices:
     return WikiServices(
         page=WikiPageService(SqlAlchemyPageStore(session)),
         folder=WikiFolderService(SqlAlchemyFolderStore(session)),
-        query=WikiQueryService(session),
+        query=WikiQueryService(session, activity_probe),
     )
 
 
