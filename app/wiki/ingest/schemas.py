@@ -63,6 +63,10 @@ class WikiWorkerOptions(_StrictModel):
     claim_timeout_seconds: int = Field(default=600, ge=60, le=86400)
     max_pages_per_ingest: int = Field(default=0, ge=0)
     extraction_granularity: ExtractionGranularity = "standard"
+    citation_batch_chars: int = Field(default=12000, ge=1000, le=100000)
+    citation_parallel: int = Field(default=4, ge=1, le=32)
+    dedup_candidate_limit: int = Field(default=20, ge=1, le=20)
+    tombstone_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
 
     @classmethod
     def from_env(cls) -> Self:
@@ -79,6 +83,16 @@ class WikiWorkerOptions(_StrictModel):
                 ),
                 "extraction_granularity": os.getenv(
                     "GRAPH_WIKI_EXTRACTION_GRANULARITY", "standard"
+                ),
+                "citation_batch_chars": os.getenv(
+                    "GRAPH_WIKI_CITATION_BATCH_CHARS", "12000"
+                ),
+                "citation_parallel": os.getenv("GRAPH_WIKI_CITATION_PARALLEL", "4"),
+                "dedup_candidate_limit": os.getenv(
+                    "GRAPH_WIKI_DEDUP_CANDIDATE_LIMIT", "20"
+                ),
+                "tombstone_ttl_seconds": os.getenv(
+                    "GRAPH_WIKI_TOMBSTONE_TTL_SECONDS", "3600"
                 ),
             }
         )
@@ -312,6 +326,306 @@ class ReducedPage(_StrictModel):
     def validate_page_type_prefix(self) -> Self:
         if not self.slug.startswith(f"{self.page_type}/"):
             raise ValueError("slug 前缀必须与 page_type 一致")
+        return self
+
+
+class CitationBatchChunk(_StrictModel):
+    alias: str
+    text: str
+
+    @field_validator("alias")
+    @classmethod
+    def validate_alias(cls, value: str) -> str:
+        value = value.strip()
+        if not re.fullmatch(r"c\d{3}", value):
+            raise ValueError("citation alias 必须是 c 加三位数字")
+        return value
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("citation chunk 文本不能为空")
+        return value
+
+
+class CitationBatchRequest(_StrictModel):
+    knowledge_id: str
+    batch_index: int = Field(ge=0)
+    candidates: list[TopicCandidate]
+    chunks: list[CitationBatchChunk] = Field(min_length=1)
+
+    @field_validator("knowledge_id")
+    @classmethod
+    def validate_knowledge_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("知识标识不能为空")
+        return value
+
+    @model_validator(mode="after")
+    def validate_unique_aliases(self) -> Self:
+        aliases = [chunk.alias for chunk in self.chunks]
+        if len(aliases) != len(set(aliases)):
+            raise ValueError("citation batch 中 alias 不能重复")
+        return self
+
+
+class CitationBatchOutput(_StrictModel):
+    refs_by_slug: dict[str, list[str]] = Field(default_factory=dict)
+    supplemental_candidates: list[TopicCandidate] = Field(default_factory=list)
+
+    @field_validator("refs_by_slug")
+    @classmethod
+    def normalize_refs(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        for slug, aliases in value.items():
+            normalized_slug = _normalize_slug(slug, ("entity", "concept"))
+            if normalized_slug in result:
+                raise ValueError("citation refs 的 slug 不能重复")
+            cleaned: list[str] = []
+            for alias in aliases:
+                alias = alias.strip()
+                if not re.fullmatch(r"c\d{3}", alias):
+                    raise ValueError("citation ref alias 必须是 c 加三位数字")
+                if alias not in cleaned:
+                    cleaned.append(alias)
+            if not cleaned:
+                raise ValueError("citation refs 不能包含空 alias 列表")
+            result[normalized_slug] = cleaned
+        return result
+
+
+class DedupPageCandidate(_StrictModel):
+    slug: str
+    title: str
+    page_type: TopicPageType
+    aliases: list[str] = Field(default_factory=list)
+
+    @field_validator("slug")
+    @classmethod
+    def normalize_slug(cls, value: str) -> str:
+        return _normalize_slug(value, ("entity", "concept"))
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("页面标题不能为空")
+        return value
+
+    @field_validator("aliases")
+    @classmethod
+    def normalize_aliases(cls, value: list[str]) -> list[str]:
+        return _stable_clean_strings(value)
+
+    @model_validator(mode="after")
+    def validate_page_type_prefix(self) -> Self:
+        if not self.slug.startswith(f"{self.page_type}/"):
+            raise ValueError("slug 前缀必须与 page_type 一致")
+        return self
+
+
+class DedupCandidateRequest(_StrictModel):
+    candidate: TopicCandidate
+    allowed_targets: list[DedupPageCandidate] = Field(max_length=20)
+
+    @model_validator(mode="after")
+    def validate_targets(self) -> Self:
+        slugs = [target.slug for target in self.allowed_targets]
+        if len(slugs) != len(set(slugs)):
+            raise ValueError("dedup target slug 不能重复")
+        if any(target.page_type != self.candidate.page_type for target in self.allowed_targets):
+            raise ValueError("dedup target page_type 必须与候选一致")
+        return self
+
+
+class DedupRequest(_StrictModel):
+    candidates: list[DedupCandidateRequest] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_candidate_slugs(self) -> Self:
+        slugs = [item.candidate.slug for item in self.candidates]
+        if len(slugs) != len(set(slugs)):
+            raise ValueError("dedup generated candidate slug 不能重复")
+        return self
+
+
+class DedupDecision(_StrictModel):
+    candidate_slug: str
+    canonical_slug: str | None = None
+
+    @field_validator("candidate_slug", "canonical_slug")
+    @classmethod
+    def normalize_decision_slug(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _normalize_slug(value, ("entity", "concept"))
+
+
+class DedupOutput(_StrictModel):
+    decisions: list[DedupDecision] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_decision_slugs(self) -> Self:
+        slugs = [decision.candidate_slug for decision in self.decisions]
+        if len(slugs) != len(set(slugs)):
+            raise ValueError("dedup decision candidate_slug 不能重复")
+        return self
+
+
+ContributionAction = Literal["add", "replace", "retract_stale", "retract"]
+ContributionState = Literal["active", "retract_pending"]
+
+
+class StoredContributionRecord(_StrictModel):
+    id: UUID | None = None
+    tenant_id: int = Field(gt=0)
+    knowledge_base_id: UUID
+    slug: str
+    knowledge_id: str
+    op_version: str
+    page_type: IngestPageType
+    state: ContributionState
+    title: str
+    content: str
+    summary: str
+    aliases: list[str] = Field(default_factory=list)
+    chunk_refs: list[str] = Field(default_factory=list)
+
+    @field_validator("slug")
+    @classmethod
+    def normalize_slug(cls, value: str) -> str:
+        return _normalize_slug(value, ("summary", "entity", "concept"))
+
+    @field_validator("knowledge_id", "op_version", "title")
+    @classmethod
+    def validate_identity(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("贡献身份字段不能为空")
+        return value
+
+    @field_validator("aliases", "chunk_refs")
+    @classmethod
+    def normalize_arrays(cls, value: list[str]) -> list[str]:
+        return _stable_clean_strings(value)
+
+    @model_validator(mode="after")
+    def validate_page_type_prefix(self) -> Self:
+        if not self.slug.startswith(f"{self.page_type}/"):
+            raise ValueError("slug 前缀必须与 page_type 一致")
+        return self
+
+
+class ContributionDelta(_StrictModel):
+    pending_op_id: UUID
+    action: ContributionAction
+    slug: str
+    knowledge_id: str
+    previous: StoredContributionRecord | None
+    current: StoredContributionRecord | None
+
+    @field_validator("slug")
+    @classmethod
+    def normalize_slug(cls, value: str) -> str:
+        return _normalize_slug(value, ("summary", "entity", "concept"))
+
+    @field_validator("knowledge_id")
+    @classmethod
+    def validate_knowledge_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("知识标识不能为空")
+        return value
+
+    @model_validator(mode="after")
+    def validate_action_contract(self) -> Self:
+        expected = {
+            "add": (False, True, None),
+            "replace": (True, True, "active"),
+            "retract_stale": (True, False, "active"),
+            "retract": (True, False, "retract_pending"),
+        }[self.action]
+        require_previous, require_current, previous_state = expected
+        if (self.previous is not None) != require_previous or (self.current is not None) != require_current:
+            raise ValueError("contribution action 的 previous/current 合同不成立")
+        if self.current is not None and self.current.state != "active":
+            raise ValueError("current contribution 必须为 active")
+        if self.previous is not None and previous_state is not None and self.previous.state != previous_state:
+            raise ValueError("previous contribution state 与 action 不一致")
+        records = [record for record in (self.previous, self.current) if record is not None]
+        if any(record.slug != self.slug or record.knowledge_id != self.knowledge_id for record in records):
+            raise ValueError("contribution 的 slug 和 knowledge_id 必须与 delta 一致")
+        if len(records) == 2 and (records[0].tenant_id, records[0].knowledge_base_id, records[0].page_type) != (records[1].tenant_id, records[1].knowledge_base_id, records[1].page_type):
+            raise ValueError("previous/current 的 scope 和 page_type 必须一致")
+        return self
+
+
+class OperationFailure(_StrictModel):
+    pending_op_id: UUID
+    error_code: str
+    error_summary: str
+
+    @field_validator("error_code")
+    @classmethod
+    def validate_error_code(cls, value: str) -> str:
+        value = value.strip()
+        if not 1 <= len(value) <= 128:
+            raise ValueError("error_code 长度必须在 1 到 128 之间")
+        return value
+
+    @field_validator("error_summary")
+    @classmethod
+    def normalize_error_summary(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if not 1 <= len(value) <= 2000:
+            raise ValueError("error_summary 长度必须在 1 到 2000 之间")
+        return value
+
+
+class PageExpectation(_StrictModel):
+    slug: str
+    page_id: UUID | None = None
+    version: int | None = Field(default=None, ge=1)
+
+    @field_validator("slug")
+    @classmethod
+    def normalize_slug(cls, value: str) -> str:
+        return _normalize_slug(value, ("summary", "entity", "concept"))
+
+    @model_validator(mode="after")
+    def validate_page_pair(self) -> Self:
+        if (self.page_id is None) != (self.version is None):
+            raise ValueError("page_id 与 version 必须同时存在或同时为空")
+        return self
+
+
+class BatchApplyRequest(_StrictModel):
+    claim_token: UUID
+    pages: list[ReducedPage]
+    contribution_deltas: list[ContributionDelta]
+    completed_op_ids: list[UUID]
+    superseded_op_ids: list[UUID]
+    failures: list[OperationFailure]
+    expected_pages: list[PageExpectation]
+    operation_id: UUID
+
+    @model_validator(mode="after")
+    def validate_batch_identities(self) -> Self:
+        groups = [self.completed_op_ids, self.superseded_op_ids, [failure.pending_op_id for failure in self.failures]]
+        if any(len(group) != len(set(group)) for group in groups):
+            raise ValueError("batch operation id 不能重复")
+        if len(set().union(*[set(group) for group in groups])) != sum(len(group) for group in groups):
+            raise ValueError("completed、superseded 与 failure operation id 不能重叠")
+        page_slugs = [page.slug for page in self.pages]
+        expected_slugs = [page.slug for page in self.expected_pages]
+        if len(page_slugs) != len(set(page_slugs)):
+            raise ValueError("pages slug 不能重复")
+        if len(expected_slugs) != len(set(expected_slugs)):
+            raise ValueError("expected_pages slug 不能重复")
         return self
 
 

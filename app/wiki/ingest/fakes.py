@@ -11,6 +11,11 @@ from pydantic import ConfigDict, Field, field_validator, model_validator
 from app.wiki.ingest.ports import PermanentModelError, TransientModelError
 from app.wiki.ingest.schemas import (
     CandidateExtraction,
+    CitationBatchOutput,
+    CitationBatchRequest,
+    DedupDecision,
+    DedupOutput,
+    DedupRequest,
     DocumentSummary,
     PageMergeOutput,
     PageMergeRequest,
@@ -37,6 +42,8 @@ class _ModelResponses(_StrictModel):
     extract_candidates: dict[str, CandidateExtraction] = Field(min_length=1)
     summaries: dict[str, DocumentSummary] = Field(min_length=1)
     merges: dict[str, PageMergeOutput] = Field(min_length=1)
+    citations: dict[str, list[CitationBatchOutput]] = Field(default_factory=dict)
+    deduplications: dict[str, DedupDecision] = Field(default_factory=dict)
 
 
 FailureCount = Annotated[int, Field(ge=0)]
@@ -75,10 +82,17 @@ class FakeDataset(_StrictModel):
         unknown_summary_ids = set(self.model_responses.summaries) - knowledge_ids
         if unknown_summary_ids:
             raise ValueError("summaries 响应包含未知 knowledge_id")
+        unknown_citation_ids = set(self.model_responses.citations) - knowledge_ids
+        if unknown_citation_ids:
+            raise ValueError("citations 响应包含未知 knowledge_id")
         for slug in self.model_responses.merges:
             normalized_slug = _normalize_slug(slug, ("entity", "concept"))
             if normalized_slug != slug:
                 raise ValueError("merges 响应键必须是已规范化的小写页面 slug")
+        for slug, decision in self.model_responses.deduplications.items():
+            normalized_slug = _normalize_slug(slug, ("entity", "concept"))
+            if normalized_slug != slug or decision.candidate_slug != slug:
+                raise ValueError("deduplications 响应键必须是规范 slug 且等于 candidate_slug")
         for key in self.transient_failures:
             prefix, _, suffix = key.partition(":")
             if prefix == "extract_candidates" and suffix not in knowledge_ids:
@@ -87,6 +101,12 @@ class FakeDataset(_StrictModel):
                 raise ValueError("summarize 瞬时失败键包含未知 knowledge_id")
             if prefix == "merge" and suffix not in self.model_responses.merges:
                 raise ValueError("merge 瞬时失败键包含未知 slug")
+            if prefix == "citation":
+                knowledge_id, separator, batch_index = suffix.rpartition(":")
+                if not separator or knowledge_id not in knowledge_ids or not batch_index.isdecimal():
+                    raise ValueError("citation 瞬时失败键必须引用已知 knowledge_id 和非负 batch")
+            if prefix == "dedup" and suffix not in self.model_responses.deduplications:
+                raise ValueError("dedup 瞬时失败键包含未知 slug")
         return self
 
     @field_validator("transient_failures")
@@ -98,12 +118,22 @@ class FakeDataset(_StrictModel):
                 "extract_candidates",
                 "summarize",
                 "merge",
+                "citation",
+                "dedup",
             }:
                 raise ValueError(f"不支持的 transient failure key: {key}")
             if prefix == "merge" and not (
                 suffix.startswith("entity/") or suffix.startswith("concept/")
             ):
                 raise ValueError(f"merge transient failure key 必须使用页面 slug: {key}")
+            if prefix == "citation" and ":" not in suffix:
+                raise ValueError(f"citation transient failure key 格式无效: {key}")
+            if prefix == "dedup":
+                try:
+                    if _normalize_slug(suffix, ("entity", "concept")) != suffix:
+                        raise ValueError
+                except ValueError as exc:
+                    raise ValueError(f"dedup transient failure key 必须使用页面 slug: {key}") from exc
         return value
 
 
@@ -166,10 +196,14 @@ class FakeChatModel:
             "extract_candidates": self._responses.extract_candidates,
             "summaries": self._responses.summaries,
             "merges": self._responses.merges,
+            "citations": self._responses.citations,
+            "deduplications": self._responses.deduplications,
         }
         self._remaining_failures = dict(dataset.transient_failures)
         self.calls: list[str] = []
         self.merge_requests: list[PageMergeRequest] = []
+        self.citation_requests: list[CitationBatchRequest] = []
+        self.dedup_requests: list[DedupRequest] = []
 
     def _record_call(self, key: str) -> None:
         self.calls.append(key)
@@ -212,6 +246,27 @@ class FakeChatModel:
         if response is None:
             raise PermanentModelError(f"缺少模型响应: {key}")
         return response.model_copy(deep=True)
+
+    async def classify_chunks(self, request: CitationBatchRequest) -> CitationBatchOutput:
+        key = f"citation:{request.knowledge_id}:{request.batch_index}"
+        self.citation_requests.append(request.model_copy(deep=True))
+        self._record_call(key)
+        responses = self._responses.citations.get(request.knowledge_id)
+        if responses is None or request.batch_index >= len(responses):
+            raise PermanentModelError(f"缺少模型响应: {key}")
+        return responses[request.batch_index].model_copy(deep=True)
+
+    async def resolve_duplicates(self, request: DedupRequest) -> DedupOutput:
+        self.dedup_requests.append(request.model_copy(deep=True))
+        decisions: list[DedupDecision] = []
+        for item in request.candidates:
+            slug = item.candidate.slug
+            self._record_call(f"dedup:{slug}")
+            decision = self._responses.deduplications.get(slug)
+            if decision is None:
+                decision = DedupDecision(candidate_slug=slug)
+            decisions.append(decision.model_copy(deep=True))
+        return DedupOutput(decisions=decisions)
 
 
 def load_fake_adapters(path: str | Path) -> tuple[FakeKnowledgeSource, FakeChatModel]:

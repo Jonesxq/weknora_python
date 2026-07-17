@@ -8,6 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.wiki.ingest.schemas import (
     CandidateExtraction,
+    CitationBatchOutput,
+    CitationBatchRequest,
+    DedupOutput,
+    DedupRequest,
     DocumentSummary,
     FinalizationRequest,
     PageMergeOutput,
@@ -53,6 +57,28 @@ class ChatModelPort(Protocol):
     ) -> DocumentSummary: ...
 
     async def merge_page(self, request: PageMergeRequest) -> PageMergeOutput: ...
+
+
+@runtime_checkable
+class CitationModelPort(Protocol):
+    async def classify_chunks(self, request: CitationBatchRequest) -> CitationBatchOutput: ...
+
+
+@runtime_checkable
+class DedupModelPort(Protocol):
+    async def resolve_duplicates(self, request: DedupRequest) -> DedupOutput: ...
+
+
+@runtime_checkable
+class WikiIngestModelPort(ChatModelPort, CitationModelPort, DedupModelPort, Protocol):
+    pass
+
+
+@runtime_checkable
+class TombstonePort(Protocol):
+    async def mark_deleted(self, scope: WikiScope, knowledge_id: str) -> None: ...
+
+    async def is_deleted(self, scope: WikiScope, knowledge_id: str) -> bool: ...
 
 
 @runtime_checkable

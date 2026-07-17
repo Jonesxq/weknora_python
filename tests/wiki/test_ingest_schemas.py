@@ -6,18 +6,31 @@ import pytest
 from pydantic import ValidationError
 
 from app.wiki.ingest.schemas import (
+    BatchApplyRequest,
     BatchResult,
     CandidateExtraction,
+    CitationBatchChunk,
+    CitationBatchOutput,
+    CitationBatchRequest,
+    ContributionDelta,
+    DedupCandidateRequest,
+    DedupDecision,
+    DedupOutput,
+    DedupPageCandidate,
+    DedupRequest,
     DocumentSummary,
     FinalizationRequest,
     MapDocumentResult,
     PageContribution,
     PageMergeOutput,
     PageMergeRequest,
+    OperationFailure,
+    PageExpectation,
     ReducedPage,
     SlugUpdate,
     SourceChunk,
     SourceKnowledge,
+    StoredContributionRecord,
     TopicCandidate,
     WikiIngestConfig,
     WikiWorkerOptions,
@@ -46,6 +59,10 @@ def test_ingest_config_and_worker_options_use_safe_defaults() -> None:
         "claim_timeout_seconds": 600,
         "max_pages_per_ingest": 0,
         "extraction_granularity": "standard",
+        "citation_batch_chars": 12000,
+        "citation_parallel": 4,
+        "dedup_candidate_limit": 20,
+        "tombstone_ttl_seconds": 3600,
     }
 
 
@@ -56,6 +73,10 @@ def test_worker_options_read_environment(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("GRAPH_WIKI_CLAIM_TIMEOUT_SECONDS", "900")
     monkeypatch.setenv("GRAPH_WIKI_MAX_PAGES_PER_INGEST", "12")
     monkeypatch.setenv("GRAPH_WIKI_EXTRACTION_GRANULARITY", "focused")
+    monkeypatch.setenv("GRAPH_WIKI_CITATION_BATCH_CHARS", "13000")
+    monkeypatch.setenv("GRAPH_WIKI_CITATION_PARALLEL", "5")
+    monkeypatch.setenv("GRAPH_WIKI_DEDUP_CANDIDATE_LIMIT", "19")
+    monkeypatch.setenv("GRAPH_WIKI_TOMBSTONE_TTL_SECONDS", "7200")
 
     options = WikiWorkerOptions.from_env()
 
@@ -65,6 +86,10 @@ def test_worker_options_read_environment(monkeypatch: pytest.MonkeyPatch) -> Non
     assert options.claim_timeout_seconds == 900
     assert options.max_pages_per_ingest == 12
     assert options.extraction_granularity == "focused"
+    assert options.citation_batch_chars == 13000
+    assert options.citation_parallel == 5
+    assert options.dedup_candidate_limit == 19
+    assert options.tombstone_ttl_seconds == 7200
 
 
 @pytest.mark.parametrize(
@@ -339,6 +364,105 @@ def test_identity_fields_strip_and_reject_blank_values() -> None:
             pending_op_id=uuid4(),
             knowledge_id="   ",
         )
+
+
+def test_worker_options_include_incremental_safe_defaults() -> None:
+    options = WikiWorkerOptions()
+
+    assert options.citation_batch_chars == 12000
+    assert options.citation_parallel == 4
+    assert options.dedup_candidate_limit == 20
+    assert options.tombstone_ttl_seconds == 3600
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("GRAPH_WIKI_CITATION_BATCH_CHARS", "999"),
+        ("GRAPH_WIKI_CITATION_PARALLEL", "33"),
+        ("GRAPH_WIKI_DEDUP_CANDIDATE_LIMIT", "21"),
+        ("GRAPH_WIKI_TOMBSTONE_TTL_SECONDS", "59"),
+    ],
+)
+def test_worker_options_reject_invalid_incremental_environment(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValidationError):
+        WikiWorkerOptions.from_env()
+
+
+def test_citation_dtos_normalize_and_reject_hidden_chunk_ids() -> None:
+    candidate = TopicCandidate(name="Acme", slug="entity/acme", page_type="entity")
+    request = CitationBatchRequest(
+        knowledge_id=" knowledge-1 ",
+        batch_index=0,
+        candidates=[candidate],
+        chunks=[CitationBatchChunk(alias="c001", text=" Body ")],
+    )
+    output = CitationBatchOutput(refs_by_slug={" entity/acme ": [" c001 ", "c001"]})
+
+    assert request.knowledge_id == "knowledge-1"
+    assert request.chunks[0].text == "Body"
+    assert output.refs_by_slug == {"entity/acme": ["c001"]}
+    with pytest.raises(ValidationError):
+        CitationBatchChunk(alias="c001", text="Body", chunk_id="internal")
+    with pytest.raises(ValidationError):
+        CitationBatchRequest(
+            knowledge_id="knowledge-1", batch_index=0, candidates=[candidate],
+            chunks=[CitationBatchChunk(alias="c001", text="A"), CitationBatchChunk(alias="c001", text="B")],
+        )
+
+
+def test_dedup_dtos_enforce_static_target_and_decision_contracts() -> None:
+    candidate = TopicCandidate(name="Acme", slug="entity/acme", page_type="entity")
+    target = DedupPageCandidate(slug=" ENTITY/existing ", title=" Existing ", page_type="entity", aliases=[" A ", "A"])
+    request = DedupRequest(candidates=[DedupCandidateRequest(candidate=candidate, allowed_targets=[target])])
+    decision = DedupDecision(candidate_slug=" ENTITY/ACME ", canonical_slug=" entity/existing ")
+
+    assert request.candidates[0].allowed_targets[0].aliases == ["A"]
+    assert decision.candidate_slug == "entity/acme"
+    assert decision.canonical_slug == "entity/existing"
+    with pytest.raises(ValidationError):
+        DedupCandidateRequest(candidate=candidate, allowed_targets=[DedupPageCandidate(slug="concept/x", title="X", page_type="concept")])
+    with pytest.raises(ValidationError):
+        DedupOutput(decisions=[decision, decision])
+
+
+def _record(*, slug: str = "entity/acme", knowledge_id: str = "knowledge-1", state: str = "active") -> StoredContributionRecord:
+    return StoredContributionRecord(
+        id=None, tenant_id=1, knowledge_base_id=KB_ID, slug=slug, knowledge_id=knowledge_id,
+        op_version="v1", page_type="entity", state=state, title="Acme", content="Body", summary="Summary",
+        aliases=[" Acme ", "Acme"], chunk_refs=[" c001 ", "c001"],
+    )
+
+
+def test_contribution_delta_enforces_action_and_identity_contracts() -> None:
+    current = _record()
+    add = ContributionDelta(pending_op_id=uuid4(), action="add", slug="entity/acme", knowledge_id="knowledge-1", previous=None, current=current)
+    assert add.current is not None and add.current.aliases == ["Acme"]
+    with pytest.raises(ValidationError):
+        ContributionDelta(pending_op_id=uuid4(), action="replace", slug="entity/acme", knowledge_id="knowledge-1", previous=None, current=current)
+    with pytest.raises(ValidationError):
+        ContributionDelta(pending_op_id=uuid4(), action="retract", slug="entity/acme", knowledge_id="knowledge-1", previous=current, current=None)
+    with pytest.raises(ValidationError):
+        ContributionDelta(pending_op_id=uuid4(), action="add", slug="entity/acme", knowledge_id="other", previous=None, current=current)
+
+
+def test_apply_request_enforces_operation_and_page_expectation_invariants() -> None:
+    op_id, other_id = uuid4(), uuid4()
+    page = ReducedPage(slug="entity/acme", title="Acme", page_type="entity", content="Body", summary="Summary")
+    request = BatchApplyRequest(
+        claim_token=uuid4(), pages=[page], contribution_deltas=[], completed_op_ids=[op_id],
+        superseded_op_ids=[], failures=[OperationFailure(pending_op_id=other_id, error_code=" CODE ", error_summary=" broken\n now ")],
+        expected_pages=[PageExpectation(slug="entity/acme", page_id=uuid4(), version=1)], operation_id=uuid4(),
+    )
+    assert request.failures[0].error_code == "CODE"
+    assert request.failures[0].error_summary == "broken now"
+    with pytest.raises(ValidationError):
+        PageExpectation(slug="entity/acme", page_id=uuid4(), version=None)
+    with pytest.raises(ValidationError):
+        BatchApplyRequest(claim_token=uuid4(), pages=[page], contribution_deltas=[], completed_op_ids=[op_id], superseded_op_ids=[op_id], failures=[], expected_pages=[], operation_id=uuid4())
     with pytest.raises(ValidationError):
         FinalizationRequest(
             tenant_id=1,
@@ -346,3 +470,15 @@ def test_identity_fields_strip_and_reject_blank_values() -> None:
             knowledge_id="knowledge-1",
             attempt="   ",
         )
+    CitationBatchChunk,
+    CitationBatchOutput,
+    CitationBatchRequest,
+    ContributionDelta,
+    DedupCandidateRequest,
+    DedupDecision,
+    DedupOutput,
+    DedupPageCandidate,
+    DedupRequest,
+    OperationFailure,
+    PageExpectation,
+    StoredContributionRecord,

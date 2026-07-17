@@ -11,11 +11,22 @@ from pydantic import ValidationError
 from app.wiki.ingest.fakes import FakeChatModel, FakeKnowledgeSource, load_fake_adapters
 from app.wiki.ingest.ports import (
     ChatModelPort,
+    DedupModelPort,
     KnowledgeSourcePort,
     PermanentModelError,
     TransientModelError,
 )
-from app.wiki.ingest.schemas import PageContribution, PageMergeRequest, WikiIngestConfig
+from app.wiki.ingest.schemas import (
+    CitationBatchChunk,
+    CitationBatchRequest,
+    DedupCandidateRequest,
+    DedupPageCandidate,
+    DedupRequest,
+    PageContribution,
+    PageMergeRequest,
+    TopicCandidate,
+    WikiIngestConfig,
+)
 from app.wiki.scope import WikiScope
 
 
@@ -126,6 +137,7 @@ def test_load_fake_adapters_validates_fixture_and_protocols(tmp_path: Path) -> N
     assert isinstance(model, FakeChatModel)
     assert isinstance(source, KnowledgeSourcePort)
     assert isinstance(model, ChatModelPort)
+    assert isinstance(model, DedupModelPort)
 
 
 def test_fake_source_is_strictly_scoped_and_returns_copies(tmp_path: Path) -> None:
@@ -357,3 +369,70 @@ def test_fake_model_indexes_duplicate_titles_by_knowledge_id(tmp_path: Path) -> 
         "extract_candidates:knowledge-1",
         "extract_candidates:knowledge-2",
     ]
+
+
+def test_fake_model_returns_citations_and_dedup_decisions_as_copies(tmp_path: Path) -> None:
+    fixture = tmp_path / "wiki.json"
+    data = json.loads(json.dumps(FIXTURE))
+    data["model_responses"]["citations"] = {
+        "knowledge-1": [{"refs_by_slug": {"entity/acme": ["c001"]}}]
+    }
+    data["model_responses"]["deduplications"] = {
+        "entity/acme": {"candidate_slug": "entity/acme", "canonical_slug": "entity/existing"}
+    }
+    data["transient_failures"] = {}
+    write_fixture(fixture, data)
+    _, model = load_fake_adapters(fixture)
+    citation_request = CitationBatchRequest(
+        knowledge_id="knowledge-1", batch_index=0,
+        candidates=[TopicCandidate(name="Acme", slug="entity/acme", page_type="entity")],
+        chunks=[CitationBatchChunk(alias="c001", text="Body")],
+    )
+    dedup_request = DedupRequest(candidates=[DedupCandidateRequest(
+        candidate=TopicCandidate(name="Acme", slug="entity/acme", page_type="entity"),
+        allowed_targets=[DedupPageCandidate(slug="entity/existing", title="Existing", page_type="entity")],
+    )])
+
+    citations = asyncio.run(model.classify_chunks(citation_request))
+    decisions = asyncio.run(model.resolve_duplicates(dedup_request))
+    citations.refs_by_slug["entity/acme"].append("c002")
+    citation_request.chunks[0].text = "Mutated"
+
+    assert decisions.decisions[0].canonical_slug == "entity/existing"
+    assert model.citation_requests[0].chunks[0].text == "Body"
+    assert asyncio.run(model.classify_chunks(citation_request)).refs_by_slug == {"entity/acme": ["c001"]}
+
+
+def test_fake_model_citation_missing_and_transient_failure_are_distinct(tmp_path: Path) -> None:
+    fixture = tmp_path / "wiki.json"
+    data = json.loads(json.dumps(FIXTURE))
+    data["model_responses"]["citations"] = {"knowledge-1": [{"refs_by_slug": {}}]}
+    data["transient_failures"] = {"citation:knowledge-1:0": 1}
+    write_fixture(fixture, data)
+    _, model = load_fake_adapters(fixture)
+    request = CitationBatchRequest(
+        knowledge_id="knowledge-1", batch_index=0, candidates=[],
+        chunks=[CitationBatchChunk(alias="c001", text="Body")],
+    )
+
+    with pytest.raises(TransientModelError, match="citation:knowledge-1:0"):
+        asyncio.run(model.classify_chunks(request))
+    assert asyncio.run(model.classify_chunks(request)).refs_by_slug == {}
+    with pytest.raises(PermanentModelError, match="citation:knowledge-1:1"):
+        asyncio.run(model.classify_chunks(request.model_copy(update={"batch_index": 1})))
+
+
+@pytest.mark.parametrize(
+    ("key", "response"),
+    [
+        ("missing", {"candidate_slug": "entity/missing"}),
+        ("ENTITY/ACME", {"candidate_slug": "entity/acme"}),
+    ],
+)
+def test_fixture_rejects_invalid_dedup_response_keys(tmp_path: Path, key: str, response: dict) -> None:
+    fixture = tmp_path / "wiki.json"
+    data = json.loads(json.dumps(FIXTURE))
+    data["model_responses"]["deduplications"] = {key: response}
+    write_fixture(fixture, data)
+    with pytest.raises(ValidationError):
+        load_fake_adapters(fixture)
