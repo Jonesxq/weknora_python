@@ -195,7 +195,7 @@ def build_claim_pending_ops_statement(
             WikiPendingOp.knowledge_base_id == scope.knowledge_base_id,
             or_(
                 WikiPendingOp.claimed_at.is_(None),
-                WikiPendingOp.claimed_at < stale_before,
+                WikiPendingOp.claimed_at <= stale_before,
             ),
         )
         .order_by(WikiPendingOp.enqueued_at, WikiPendingOp.id)
@@ -347,6 +347,48 @@ def _snapshot_page(page: ReducedPage) -> ReducedPage:
     )
 
 
+def _validate_batch_inputs(
+    pages: Sequence[ReducedPage],
+    completed_op_ids: Sequence[UUID],
+    failed_op_ids: Sequence[UUID],
+    expected_pages: Mapping[str, ExistingPageRecord | None] | None,
+) -> tuple[
+    list[ReducedPage],
+    list[UUID],
+    list[UUID],
+    dict[str, ExistingPageRecord | None],
+]:
+    snapshots = [_snapshot_page(page) for page in pages]
+    if len({page.slug for page in snapshots}) != len(snapshots):
+        raise InvariantError("同一结果批次不能包含重复 slug")
+
+    completed_ids = list(completed_op_ids)
+    failed_ids = list(failed_op_ids)
+    if len(completed_ids) != len(set(completed_ids)):
+        raise InvariantError("completed_op_ids 不能重复")
+    if len(failed_ids) != len(set(failed_ids)):
+        raise InvariantError("failed_op_ids 不能重复")
+    if set(completed_ids) & set(failed_ids):
+        raise InvariantError("completed 与 failed op ids 不能重叠")
+
+    completed_set = set(completed_ids)
+    for page in snapshots:
+        if not page.contributor_op_ids:
+            raise InvariantError("每个结果页面必须至少包含一个 completed contributor")
+        if not set(page.contributor_op_ids).issubset(completed_set):
+            raise InvariantError("页面 contributor 必须属于 completed_op_ids")
+
+    expected = dict(expected_pages or {})
+    slugs = {page.slug for page in snapshots}
+    if set(expected) != slugs:
+        raise InvariantError("expected_pages 必须完整覆盖结果 slug")
+    if not completed_ids and snapshots:
+        raise InvariantError("没有完成操作时不能提交结果页面")
+    if not completed_ids and not failed_ids and expected:
+        raise InvariantError("空结果不能携带 expected_pages")
+    return snapshots, completed_ids, failed_ids, expected
+
+
 async def _enqueue_follow_up(
     session: AsyncSession,
     scope: WikiScope,
@@ -359,6 +401,64 @@ async def _enqueue_follow_up(
         event_type,
         f"operation:{operation_id}",
         "follow-up",
+    )
+
+
+def build_claim_recovery_dedup_key(scope: WikiScope, claim_token: UUID) -> str:
+    return build_outbox_dedup_key(
+        scope.tenant_id,
+        scope.knowledge_base_id,
+        "wiki.batch.trigger",
+        f"claim:{claim_token}",
+        "recovery",
+    )
+
+
+async def _enqueue_claim_recovery(
+    session: AsyncSession,
+    scope: WikiScope,
+    claim_token: UUID,
+    *,
+    available_at: datetime,
+) -> None:
+    await session.execute(
+        postgresql.insert(TaskOutbox)
+        .values(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            event_type="wiki.batch.trigger",
+            dedup_key=build_claim_recovery_dedup_key(scope, claim_token),
+            payload={
+                "tenant_id": scope.tenant_id,
+                "knowledge_base_id": str(scope.knowledge_base_id),
+            },
+            available_at=available_at,
+        )
+        .on_conflict_do_nothing(
+            constraint="uq_task_outbox_scope_event_dedup"
+        )
+    )
+
+
+async def _cancel_claim_recovery(
+    session: AsyncSession,
+    scope: WikiScope,
+    claim_token: UUID,
+) -> None:
+    await session.execute(
+        update(TaskOutbox)
+        .where(
+            TaskOutbox.tenant_id == scope.tenant_id,
+            TaskOutbox.knowledge_base_id == scope.knowledge_base_id,
+            TaskOutbox.event_type == "wiki.batch.trigger",
+            TaskOutbox.dedup_key == build_claim_recovery_dedup_key(scope, claim_token),
+            TaskOutbox.sent_at.is_(None),
+        )
+        .values(
+            sent_at=datetime.now(UTC),
+            claimed_at=None,
+            claim_token=None,
+        )
     )
     await session.execute(
         postgresql.insert(TaskOutbox)
@@ -495,7 +595,8 @@ class SqlAlchemyIngestStore:
         self, scope: WikiScope, limit: int, claim_timeout: timedelta | int
     ) -> list[PendingOpRecord]:
         now = datetime.now(UTC)
-        stale_before = now - _timeout_delta(claim_timeout)
+        timeout = _timeout_delta(claim_timeout)
+        stale_before = now - timeout
         token = uuid4()
         async with self._session_factory() as session:
             async with session.begin():
@@ -508,9 +609,21 @@ class SqlAlchemyIngestStore:
                         )
                     ).scalars()
                 )
+                stale_tokens = {
+                    row.claim_token for row in rows if row.claim_token is not None
+                }
+                for stale_token in stale_tokens:
+                    await _cancel_claim_recovery(session, scope, stale_token)
                 for row in rows:
                     row.claimed_at = now
                     row.claim_token = token
+                if rows:
+                    await _enqueue_claim_recovery(
+                        session,
+                        scope,
+                        token,
+                        available_at=now + timeout,
+                    )
                 await session.flush()
                 return [_pending_record(row) for row in rows]
 
@@ -541,6 +654,20 @@ class SqlAlchemyIngestStore:
                 )
                 if result.rowcount != len(failed_ids):
                     raise ClaimLost("pending-op claim token 或 scope 不匹配")
+                remaining_claimed = int(
+                    (
+                        await session.execute(
+                            select(func.count(WikiPendingOp.id)).where(
+                                WikiPendingOp.tenant_id == scope.tenant_id,
+                                WikiPendingOp.knowledge_base_id
+                                == scope.knowledge_base_id,
+                                WikiPendingOp.claim_token == token,
+                            )
+                        )
+                    ).scalar_one()
+                )
+                if not remaining_claimed:
+                    await _cancel_claim_recovery(session, scope, token)
                 await _enqueue_follow_up(session, scope, token)
 
     async def find_existing_pages(
@@ -591,8 +718,16 @@ class SqlAlchemyIngestStore:
         failed_op_ids: Sequence[UUID] = (),
         expected_pages: Mapping[str, ExistingPageRecord | None] | None = None,
     ) -> bool:
-        if completed_op_ids or failed_op_ids:
-            _require_claim_token(claim_token)
+        snapshots, completed_ids, failed_ids, expected = _validate_batch_inputs(
+            pages,
+            completed_op_ids,
+            failed_op_ids,
+            expected_pages,
+        )
+        all_ids = [*completed_ids, *failed_ids]
+        if not all_ids:
+            return False
+        token = _require_claim_token(claim_token)
         async with self._session_factory() as session:
             async with session.begin():
                 existing_log = (
@@ -610,33 +745,6 @@ class SqlAlchemyIngestStore:
                         raise InvariantError("operation_id 已被其他 scope 使用")
                     return False
 
-                snapshots = [_snapshot_page(page) for page in pages]
-                if len({page.slug for page in snapshots}) != len(snapshots):
-                    raise InvariantError("同一结果批次不能包含重复 slug")
-                completed_ids = list(completed_op_ids)
-                failed_ids = list(failed_op_ids)
-                if len(completed_ids) != len(set(completed_ids)):
-                    raise InvariantError("completed_op_ids 不能重复")
-                if len(failed_ids) != len(set(failed_ids)):
-                    raise InvariantError("failed_op_ids 不能重复")
-                if set(completed_ids) & set(failed_ids):
-                    raise InvariantError("completed 与 failed op ids 不能重叠")
-                page_contributors = {
-                    contributor
-                    for page in snapshots
-                    for contributor in page.contributor_op_ids
-                }
-                if not page_contributors.issubset(set(completed_ids)):
-                    raise InvariantError("页面 contributor 必须属于 completed_op_ids")
-                all_ids = [*completed_ids, *failed_ids]
-                if not all_ids:
-                    if snapshots:
-                        raise InvariantError("没有完成操作时不能提交结果页面")
-                    if expected_pages:
-                        raise InvariantError("空结果不能携带 expected_pages")
-                    return False
-                token = _require_claim_token(claim_token)
-
                 pending_rows = list(
                     (
                         await session.execute(
@@ -645,21 +753,17 @@ class SqlAlchemyIngestStore:
                                 WikiPendingOp.tenant_id == scope.tenant_id,
                                 WikiPendingOp.knowledge_base_id
                                 == scope.knowledge_base_id,
-                                WikiPendingOp.id.in_(all_ids),
                                 WikiPendingOp.claim_token == token,
                             )
                             .with_for_update()
                         )
                     ).scalars()
                 )
-                if len(pending_rows) != len(all_ids):
-                    raise ClaimLost("pending-op 不属于当前 scope 或 claim")
+                if {row.id for row in pending_rows} != set(all_ids):
+                    raise ClaimLost("批次必须完整覆盖当前 scope 和 claim 的 pending-op")
                 pending_by_id = {row.id: row for row in pending_rows}
 
                 slugs = [page.slug for page in snapshots]
-                expected = dict(expected_pages or {})
-                if set(expected) != set(slugs):
-                    raise InvariantError("expected_pages 必须完整覆盖结果 slug")
                 existing_rows = list(
                     (
                         await session.execute(
@@ -791,6 +895,7 @@ class SqlAlchemyIngestStore:
                     pending.fail_count += 1
                     pending.claimed_at = None
                     pending.claim_token = None
+                await _cancel_claim_recovery(session, scope, token)
                 remaining = int(
                     (
                         await session.execute(

@@ -20,6 +20,7 @@ from app.wiki.ingest.store import (
     PageConflict,
     SqlAlchemyIngestStore,
     SqlFinalizationPort,
+    build_claim_recovery_dedup_key,
 )
 from app.wiki.models import (
     TaskOutbox,
@@ -354,6 +355,15 @@ async def test_ingest_store_is_atomic_idempotent_and_writes_follow_up(
     assert completed_duplicate.deduplicated is True
 
     async with postgres_factory() as session:
+        recovery = (
+            await session.execute(
+                select(TaskOutbox).where(
+                    TaskOutbox.dedup_key
+                    == build_claim_recovery_dedup_key(scope, op.claim_token)
+                )
+            )
+        ).scalar_one()
+        assert recovery.sent_at is not None
         pages = list(
             (
                 await session.execute(
@@ -416,7 +426,7 @@ async def test_ingest_store_is_atomic_idempotent_and_writes_follow_up(
                     TaskOutbox.knowledge_base_id == scope.knowledge_base_id,
                 )
             )
-        ).scalar_one() == 4
+        ).scalar_one() == 6
         assert (
             await session.execute(
                 select(func.count(TaskOutbox.id)).where(
@@ -425,7 +435,7 @@ async def test_ingest_store_is_atomic_idempotent_and_writes_follow_up(
                     TaskOutbox.sent_at.is_not(None),
                 )
             )
-        ).scalar_one() == 2
+        ).scalar_one() == 4
 
     class MissingFinalization(SqlFinalizationPort):
         async def release(self, session, request):
@@ -525,6 +535,19 @@ async def test_ingest_concurrent_enqueue_claim_stale_recovery_and_atomic_release
     )
     assert len(claimed_a) == len(claimed_b) == 1
     assert claimed_a[0].id != claimed_b[0].id
+    assert claimed_a[0].claim_token is not None
+    assert claimed_b[0].claim_token is not None
+    old_recovery_key = build_claim_recovery_dedup_key(
+        scope, claimed_a[0].claim_token
+    )
+    async with postgres_factory() as session:
+        recovery = (
+            await session.execute(
+                select(TaskOutbox).where(TaskOutbox.dedup_key == old_recovery_key)
+            )
+        ).scalar_one()
+        assert recovery.sent_at is None
+        assert recovery.available_at >= claimed_a[0].claimed_at + timedelta(seconds=600)
 
     stale = claimed_a[0]
     async with postgres_factory() as session, session.begin():
@@ -536,6 +559,23 @@ async def test_ingest_concurrent_enqueue_claim_stale_recovery_and_atomic_release
     reclaimed = (await store_b.claim_pending(scope, 1, 60))[0]
     assert reclaimed.id == stale.id
     assert reclaimed.claim_token not in {None, stale.claim_token}
+    assert reclaimed.claim_token is not None
+    async with postgres_factory() as session:
+        old_recovery = (
+            await session.execute(
+                select(TaskOutbox).where(TaskOutbox.dedup_key == old_recovery_key)
+            )
+        ).scalar_one()
+        new_recovery = (
+            await session.execute(
+                select(TaskOutbox).where(
+                    TaskOutbox.dedup_key
+                    == build_claim_recovery_dedup_key(scope, reclaimed.claim_token)
+                )
+            )
+        ).scalar_one()
+        assert old_recovery.sent_at is not None
+        assert new_recovery.sent_at is None
 
     invalid_id = uuid4()
     with pytest.raises(ClaimLost):

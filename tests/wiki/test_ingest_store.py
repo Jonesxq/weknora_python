@@ -12,8 +12,10 @@ from app.wiki.ingest.store import (
     ClaimLost,
     EnqueueRecord,
     ExistingPageRecord,
+    InvariantError,
     SqlAlchemyIngestStore,
     SqlFinalizationPort,
+    build_claim_recovery_dedup_key,
     build_claim_outbox_statement,
     build_claim_pending_ops_statement,
     build_finalization_register_statement,
@@ -178,6 +180,65 @@ def test_pending_record_deep_copies_nested_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_claim_pending_atomically_schedules_timeout_recovery() -> None:
+    pending = WikiPendingOp(
+        id=uuid4(),
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        knowledge_id="knowledge-recovery",
+        op="ingest",
+        op_version="version-1",
+        payload={"knowledge_id": "knowledge-recovery"},
+        fail_count=0,
+        enqueued_at=NOW,
+    )
+
+    class Rows:
+        def scalars(self):
+            return [pending]
+
+    class Session:
+        def __init__(self) -> None:
+            self.statements = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def begin(self):
+            return self
+
+        async def execute(self, statement):
+            self.statements.append(statement)
+            return Rows()
+
+        async def flush(self) -> None:
+            return None
+
+    session = Session()
+
+    class Factory:
+        def __call__(self):
+            return session
+
+    store = SqlAlchemyIngestStore(Factory(), SqlFinalizationPort())  # type: ignore[arg-type]
+    claimed = await store.claim_pending(SCOPE, 1, 600)
+
+    assert len(claimed) == 1
+    assert len(session.statements) == 2
+    recovery = session.statements[1]
+    sql = _sql(recovery)
+    assert "INSERT INTO task_outbox" in sql
+    params = recovery.compile(dialect=postgresql.dialect()).params
+    assert params["event_type"] == "wiki.batch.trigger"
+    assert params["dedup_key"] == build_claim_recovery_dedup_key(
+        SCOPE, claimed[0].claim_token
+    )
+
+
+@pytest.mark.asyncio
 async def test_non_empty_runtime_operations_reject_missing_claim_token() -> None:
     class ExplodingFactory:
         def __call__(self):
@@ -225,4 +286,37 @@ async def test_sql_store_rejects_forged_scope_before_opening_session() -> None:
     with pytest.raises(ValueError, match="不一致"):
         await store.enqueue(
             SCOPE, knowledge, {"knowledge_id": knowledge.id}, delay_seconds=0
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completed_count", [0, 1])
+async def test_result_pages_require_completed_contributors(
+    completed_count: int,
+) -> None:
+    class ExplodingFactory:
+        def __call__(self):
+            raise AssertionError("非法批次不应打开数据库 session")
+
+    store = SqlAlchemyIngestStore(ExplodingFactory(), SqlFinalizationPort())  # type: ignore[arg-type]
+    completed_ids = [uuid4()] if completed_count else []
+    failed_ids = [uuid4()]
+    page = ReducedPage(
+        slug="entity/no-contributor",
+        title="无贡献页面",
+        page_type="entity",
+        content="正文",
+        summary="摘要",
+        contributor_op_ids=[],
+    )
+
+    with pytest.raises(InvariantError, match="contributor"):
+        await store.apply_results(
+            SCOPE,
+            uuid4(),
+            [page],
+            completed_ids,
+            uuid4(),
+            failed_op_ids=failed_ids,
+            expected_pages={page.slug: None},
         )
