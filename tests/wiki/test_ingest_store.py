@@ -7,9 +7,11 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy.dialects import postgresql
 
-from app.wiki.ingest.schemas import FinalizationRequest, SourceKnowledge
+from app.wiki.ingest.schemas import FinalizationRequest, ReducedPage, SourceKnowledge
 from app.wiki.ingest.store import (
+    ClaimLost,
     EnqueueRecord,
+    ExistingPageRecord,
     SqlAlchemyIngestStore,
     SqlFinalizationPort,
     build_claim_outbox_statement,
@@ -17,7 +19,9 @@ from app.wiki.ingest.store import (
     build_finalization_register_statement,
     build_finalization_release_statement,
     build_outbox_dedup_key,
+    _pending_record,
 )
+from app.wiki.models import WikiPendingOp
 from app.wiki.scope import WikiScope
 
 
@@ -140,6 +144,69 @@ def test_enqueue_record_is_frozen_and_exposes_pending_id() -> None:
         record.tenant_id = 8  # type: ignore[misc]
 
 
+def test_existing_page_record_is_frozen() -> None:
+    record = ExistingPageRecord(
+        page_id=uuid4(),
+        version=3,
+        page=ReducedPage(
+            slug="entity/acme",
+            title="Acme",
+            page_type="entity",
+            content="正文",
+            summary="摘要",
+        ),
+    )
+    with pytest.raises(FrozenInstanceError):
+        record.version = 4  # type: ignore[misc]
+
+
+def test_pending_record_deep_copies_nested_payload() -> None:
+    row = WikiPendingOp(
+        id=uuid4(),
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        knowledge_id="knowledge-1",
+        op="ingest",
+        op_version="version-1",
+        payload={"nested": {"values": ["original"]}},
+        fail_count=0,
+        enqueued_at=NOW,
+    )
+    record = _pending_record(row)
+    record.payload["nested"]["values"].append("record-only")  # type: ignore[index,union-attr]
+    assert row.payload == {"nested": {"values": ["original"]}}
+
+
+@pytest.mark.asyncio
+async def test_non_empty_runtime_operations_reject_missing_claim_token() -> None:
+    class ExplodingFactory:
+        def __call__(self):
+            raise AssertionError("不应打开数据库 session")
+
+    store = SqlAlchemyIngestStore(ExplodingFactory(), SqlFinalizationPort())  # type: ignore[arg-type]
+    item_id = uuid4()
+
+    with pytest.raises(ClaimLost, match="非空 UUID"):
+        await store.release_failed(SCOPE, [item_id], None)
+    with pytest.raises(ClaimLost, match="非空 UUID"):
+        await store.mark_outbox_sent([item_id], None)
+    with pytest.raises(ClaimLost, match="非空 UUID"):
+        await store.release_outbox([item_id], None)
+    with pytest.raises(ClaimLost, match="非空 UUID"):
+        await store.apply_results(
+            SCOPE,
+            None,
+            [],
+            [item_id],
+            uuid4(),
+            expected_pages={},
+        )
+
+    await store.release_failed(SCOPE, [], None)
+    await store.mark_outbox_sent([], None)
+    await store.release_outbox([], None)
+
+
 @pytest.mark.asyncio
 async def test_sql_store_rejects_forged_scope_before_opening_session() -> None:
     class ExplodingFactory:
@@ -159,4 +226,3 @@ async def test_sql_store_rejects_forged_scope_before_opening_session() -> None:
         await store.enqueue(
             SCOPE, knowledge, {"knowledge_id": knowledge.id}, delay_seconds=0
         )
-

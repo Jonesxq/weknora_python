@@ -1,19 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.infrastructure.database.base import Base
 from app.schemas.wiki.pages import WikiPageCreateRequest, WikiPageUpdateRequest
 from app.wiki.errors import WikiNotFoundError, WikiVersionConflictError
 from app.wiki.ingest.schemas import ReducedPage, SourceKnowledge
-from app.wiki.ingest.store import SqlAlchemyIngestStore, SqlFinalizationPort
+from app.wiki.ingest.store import (
+    ClaimLost,
+    InvariantError,
+    PageConflict,
+    SqlAlchemyIngestStore,
+    SqlFinalizationPort,
+)
 from app.wiki.models import (
     TaskOutbox,
     WikiFinalizationMarker,
@@ -210,14 +217,14 @@ async def test_ingest_store_is_atomic_idempotent_and_writes_follow_up(
     assert duplicate.id == first.id
     assert duplicate.deduplicated is True
 
-    all_failed_operation_id = uuid4()
+    empty_operation_id = uuid4()
     assert await store.apply_results(
-        scope, uuid4(), [], [], all_failed_operation_id
+        scope, None, [], [], empty_operation_id
     ) is False
     assert await store.apply_results(
-        scope, uuid4(), [], [], all_failed_operation_id
+        scope, None, [], [], empty_operation_id
     ) is False
-    with pytest.raises(ValueError, match="不能提交结果页面"):
+    with pytest.raises(InvariantError, match="不能提交结果页面"):
         await store.apply_results(
             scope,
             uuid4(),
@@ -240,7 +247,7 @@ async def test_ingest_store_is_atomic_idempotent_and_writes_follow_up(
     assert outbox_token is not None
     assert {event.claim_token for event in outbox} == {outbox_token}
     assert {event.attempts for event in outbox} == {1}
-    with pytest.raises(ValueError, match="token"):
+    with pytest.raises(ClaimLost, match="token"):
         await store.mark_outbox_sent([event.id for event in outbox], uuid4())
     await store.release_outbox([event.id for event in outbox], outbox_token)
     retried_outbox = await store.claim_outbox(10, 600)
@@ -251,6 +258,18 @@ async def test_ingest_store_is_atomic_idempotent_and_writes_follow_up(
     await store.mark_outbox_sent(
         [event.id for event in retried_outbox], retry_token
     )
+
+    failed_claim = (await store.claim_pending(scope, 1, 600))[0]
+    assert failed_claim.claim_token is not None
+    assert await store.apply_results(
+        scope,
+        failed_claim.claim_token,
+        [],
+        [],
+        uuid4(),
+        failed_op_ids=[failed_claim.id],
+        expected_pages={},
+    ) is True
 
     claimed = await store.claim_pending(scope, 1, 600)
     assert len(claimed) == 1
@@ -316,6 +335,7 @@ async def test_ingest_store_is_atomic_idempotent_and_writes_follow_up(
         ],
         [op.id],
         operation_id,
+        expected_pages={"entity/source": None, "concept/target": None},
     )
     assert applied is True
     assert await store.apply_results(
@@ -415,7 +435,7 @@ async def test_ingest_store_is_atomic_idempotent_and_writes_follow_up(
     assert remaining.claim_token is not None
     rollback_operation_id = uuid4()
     rollback_store = SqlAlchemyIngestStore(postgres_factory, MissingFinalization())
-    with pytest.raises(ValueError, match="finalization"):
+    with pytest.raises(InvariantError, match="finalization"):
         await rollback_store.apply_results(
             scope,
             remaining.claim_token,
@@ -432,6 +452,7 @@ async def test_ingest_store_is_atomic_idempotent_and_writes_follow_up(
             ],
             [remaining.id],
             rollback_operation_id,
+            expected_pages={f"summary/{remaining.knowledge_id}": None},
         )
     async with postgres_factory() as session:
         assert (
@@ -449,3 +470,192 @@ async def test_ingest_store_is_atomic_idempotent_and_writes_follow_up(
             )
         ).scalar_one_or_none() is None
         assert await session.get(WikiPendingOp, remaining.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_ingest_concurrent_enqueue_claim_stale_recovery_and_atomic_release(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(tenant_id=17, knowledge_base_id=uuid4(), actor_id="worker")
+    store_a = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    store_b = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    first_knowledge = SourceKnowledge(
+        id="concurrent-1",
+        tenant_id=scope.tenant_id,
+        knowledge_base_id=scope.knowledge_base_id,
+        title="并发文档一",
+        op_version="version-1",
+    )
+    results = await asyncio.gather(
+        *(
+            store_a.enqueue(
+                scope,
+                first_knowledge,
+                {"knowledge_id": first_knowledge.id},
+                delay_seconds=0,
+            )
+            for _ in range(5)
+        )
+    )
+    assert len({result.pending_op_id for result in results}) == 1
+    assert sum(not result.deduplicated for result in results) == 1
+    async with postgres_factory() as session:
+        assert (
+            await session.execute(select(func.count(WikiPendingOp.id)))
+        ).scalar_one() == 1
+        assert (
+            await session.execute(select(func.count(WikiFinalizationMarker.id)))
+        ).scalar_one() == 1
+        assert (
+            await session.execute(select(func.count(TaskOutbox.id)))
+        ).scalar_one() == 1
+
+    second_knowledge = first_knowledge.model_copy(
+        update={"id": "concurrent-2", "title": "并发文档二"}
+    )
+    await store_a.enqueue(
+        scope,
+        second_knowledge,
+        {"knowledge_id": second_knowledge.id},
+        delay_seconds=0,
+    )
+    claimed_a, claimed_b = await asyncio.gather(
+        store_a.claim_pending(scope, 1, 600),
+        store_b.claim_pending(scope, 1, 600),
+    )
+    assert len(claimed_a) == len(claimed_b) == 1
+    assert claimed_a[0].id != claimed_b[0].id
+
+    stale = claimed_a[0]
+    async with postgres_factory() as session, session.begin():
+        await session.execute(
+            update(WikiPendingOp)
+            .where(WikiPendingOp.id == stale.id)
+            .values(claimed_at=datetime.now(UTC) - timedelta(hours=1))
+        )
+    reclaimed = (await store_b.claim_pending(scope, 1, 60))[0]
+    assert reclaimed.id == stale.id
+    assert reclaimed.claim_token not in {None, stale.claim_token}
+
+    invalid_id = uuid4()
+    with pytest.raises(ClaimLost):
+        await store_b.release_failed(
+            scope, [reclaimed.id, invalid_id], reclaimed.claim_token
+        )
+    async with postgres_factory() as session:
+        row = await session.get(WikiPendingOp, reclaimed.id)
+        assert row is not None
+        assert row.fail_count == 0
+        assert row.claim_token == reclaimed.claim_token
+
+
+@pytest.mark.asyncio
+async def test_ingest_page_snapshot_cas_rejects_concurrent_edit_and_create(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(tenant_id=18, knowledge_base_id=uuid4(), actor_id="worker")
+    store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    knowledge = SourceKnowledge(
+        id="cas-source",
+        tenant_id=scope.tenant_id,
+        knowledge_base_id=scope.knowledge_base_id,
+        title="CAS 文档",
+        op_version="version-1",
+    )
+    await store.enqueue(
+        scope, knowledge, {"knowledge_id": knowledge.id}, delay_seconds=0
+    )
+    pending = (await store.claim_pending(scope, 1, 600))[0]
+    assert pending.claim_token is not None
+    async with postgres_factory() as session, session.begin():
+        page = WikiPage(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            slug="entity/cas",
+            title="旧标题",
+            page_type="entity",
+            status="published",
+            content="旧正文 [[concept/old]]",
+            summary="旧摘要",
+            wiki_path="/entity/cas",
+        )
+        session.add(page)
+        await session.flush()
+        session.add(
+            WikiLink(
+                tenant_id=scope.tenant_id,
+                knowledge_base_id=scope.knowledge_base_id,
+                source_page_id=page.id,
+                target_slug="concept/old",
+            )
+        )
+    expected = await store.find_existing_pages(scope, ["entity/cas"])
+    async with postgres_factory() as session, session.begin():
+        await session.execute(
+            update(WikiPage)
+            .where(WikiPage.slug == "entity/cas")
+            .values(content="人工并发编辑", version=WikiPage.version + 1)
+        )
+    with pytest.raises(PageConflict):
+        await store.apply_results(
+            scope,
+            pending.claim_token,
+            [
+                ReducedPage(
+                    slug="entity/cas",
+                    title="模型标题",
+                    page_type="entity",
+                    content="模型正文 [[concept/new]]",
+                    summary="模型摘要",
+                    contributor_op_ids=[pending.id],
+                )
+            ],
+            [pending.id],
+            uuid4(),
+            expected_pages={"entity/cas": expected["entity/cas"]},
+        )
+    async with postgres_factory() as session:
+        page = (
+            await session.execute(select(WikiPage).where(WikiPage.slug == "entity/cas"))
+        ).scalar_one()
+        assert page.content == "人工并发编辑"
+        assert page.version == 2
+        assert (
+            await session.execute(
+                select(WikiLink.target_slug).where(WikiLink.source_page_id == page.id)
+            )
+        ).scalar_one() == "concept/old"
+        pending_row = await session.get(WikiPendingOp, pending.id)
+        assert pending_row is not None
+        assert pending_row.claim_token == pending.claim_token
+
+    async with postgres_factory() as session, session.begin():
+        session.add(
+            WikiPage(
+                tenant_id=scope.tenant_id,
+                knowledge_base_id=scope.knowledge_base_id,
+                slug="concept/concurrent-new",
+                title="并发新建",
+                page_type="concept",
+                status="published",
+                wiki_path="/concept/concurrent-new",
+            )
+        )
+    with pytest.raises(PageConflict):
+        await store.apply_results(
+            scope,
+            pending.claim_token,
+            [
+                ReducedPage(
+                    slug="concept/concurrent-new",
+                    title="模型新建",
+                    page_type="concept",
+                    content="模型正文",
+                    summary="模型摘要",
+                    contributor_op_ids=[pending.id],
+                )
+            ],
+            [pending.id],
+            uuid4(),
+            expected_pages={"concept/concurrent-new": None},
+        )
