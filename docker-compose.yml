@@ -15,5 +15,44 @@ services:
     volumes:
       - graph_postgres_data:/var/lib/postgresql/data
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  wiki-worker:
+    build: .
+    command: celery -A app.infrastructure.tasks.celery_app:celery_app worker -l INFO
+    environment:
+      - GRAPH_DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/graph
+      - GRAPH_REDIS_URL=redis://redis:6379/2
+      - GRAPH_CELERY_BROKER_URL=redis://redis:6379/0
+      - GRAPH_CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - GRAPH_WIKI_LOCK_MODE=redis
+      - GRAPH_WIKI_FAKE_DATA_FILE=/app/examples/wiki_fake_data.json
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  outbox-dispatcher:
+    build: .
+    command: python -m app.wiki.tasks.outbox_dispatcher
+    environment:
+      - GRAPH_DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/graph
+      - GRAPH_CELERY_BROKER_URL=redis://redis:6379/0
+      - GRAPH_CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
 volumes:
   graph_postgres_data:
