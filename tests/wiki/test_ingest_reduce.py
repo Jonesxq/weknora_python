@@ -52,7 +52,7 @@ def topic_update(
         content=content,
         summary=summary,
         aliases=aliases or [],
-        source_refs=source_refs or [knowledge_id],
+        source_refs=[knowledge_id] if source_refs is None else source_refs,
         chunk_refs=chunk_refs or [],
     )
 
@@ -228,7 +228,7 @@ async def test_reduce_topic_puts_batch_metadata_before_existing_page() -> None:
         pending_op_id=OP_B,
         knowledge_id="knowledge-b",
         aliases=["重复别名", "第二别名"],
-        source_refs=["knowledge-b", "knowledge-a"],
+        source_refs=["knowledge-b", "knowledge-b"],
         chunk_refs=["chunk-shared", "chunk-b"],
         summary="本次贡献摘要",
     )
@@ -249,6 +249,38 @@ async def test_reduce_topic_puts_batch_metadata_before_existing_page() -> None:
     assert page.chunk_refs == ["chunk-a", "chunk-shared", "chunk-b", "chunk-old"]
     assert page.summary == "本次贡献摘要\n\n旧摘要"
     assert page.contributor_op_ids == [OP_A, OP_B]
+
+
+@pytest.mark.asyncio
+async def test_reduce_topic_derives_provenance_when_source_refs_are_empty() -> None:
+    model = RecordingModel()
+    updates = [
+        topic_update(source_refs=[]),
+        topic_update(
+            pending_op_id=OP_B,
+            knowledge_id="knowledge-b",
+            source_refs=[],
+        ),
+    ]
+
+    page = await reduce_slug("entity/acme", updates, None, model)
+
+    assert [item.source_refs for item in model.merge_requests[0].contributions] == [
+        ["knowledge-a"],
+        ["knowledge-b"],
+    ]
+    assert page.source_refs == ["knowledge-a", "knowledge-b"]
+
+
+@pytest.mark.asyncio
+async def test_reduce_topic_rejects_forged_source_ref() -> None:
+    model = RecordingModel()
+    update = topic_update(source_refs=["knowledge-a", "knowledge-forged"])
+
+    with pytest.raises(WikiValidationError, match="source_refs"):
+        await reduce_slug("entity/acme", [update], None, model)
+
+    assert model.merge_requests == []
 
 
 @pytest.mark.asyncio
@@ -365,6 +397,58 @@ async def test_reduce_rejects_summary_slug_for_different_knowledge() -> None:
 
     with pytest.raises(WikiValidationError, match="knowledge_id"):
         await reduce_slug(update.slug, [update], None, RecordingModel())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        SlugUpdate.model_construct(
+            pending_op_id=OP_A,
+            knowledge_id="knowledge-a",
+            slug="entity/acme",
+            title="   ",
+            page_type="entity",
+            content="正文",
+            summary="摘要",
+            aliases=[],
+            source_refs=[],
+            chunk_refs=[],
+        ),
+        SlugUpdate.model_construct(
+            pending_op_id=OP_A,
+            knowledge_id="knowledge-a",
+            slug="entity/acme",
+            title="Acme",
+            page_type="entity",
+            content="正文",
+            summary="摘要",
+            aliases=[None],
+            source_refs=[],
+            chunk_refs=[],
+        ),
+        object(),
+    ],
+)
+async def test_reduce_snapshot_validates_every_update(invalid: object) -> None:
+    model = RecordingModel()
+
+    with pytest.raises(WikiValidationError, match="update"):
+        await reduce_slug("entity/acme", [invalid], None, model)  # type: ignore[list-item]
+
+    assert model.merge_requests == []
+
+
+@pytest.mark.asyncio
+async def test_reduce_snapshot_rejects_polluted_existing_page() -> None:
+    model = RecordingModel()
+    old = existing_page()
+    object.__setattr__(old, "aliases", ["valid", None])
+
+    with pytest.raises(WikiValidationError, match="已有页面"):
+        await reduce_slug("entity/acme", [topic_update()], old, model)
+
+    assert model.merge_requests == []
 
 
 @pytest.mark.asyncio

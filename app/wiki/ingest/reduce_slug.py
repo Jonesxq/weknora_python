@@ -7,6 +7,8 @@ from collections.abc import Iterable, Sequence
 from typing import NoReturn
 from uuid import UUID
 
+from pydantic import ValidationError
+
 from app.wiki.errors import WikiValidationError
 from app.wiki.ingest.ports import ChatModelPort
 from app.wiki.ingest.schemas import (
@@ -17,7 +19,6 @@ from app.wiki.ingest.schemas import (
 )
 
 
-_TOPIC_TYPES = {"entity", "concept"}
 _SLUG_PATTERN = re.compile(
     r"^(summary|entity|concept)/[a-z0-9][a-z0-9_-]*(?:/[a-z0-9][a-z0-9_-]*)*$"
 )
@@ -44,14 +45,57 @@ def _stable_unique_ids(values: Iterable[UUID]) -> list[UUID]:
     return list(dict.fromkeys(values))
 
 
+def _snapshot_updates(updates: object) -> list[SlugUpdate]:
+    if not isinstance(updates, Sequence) or isinstance(updates, (str, bytes)):
+        _reject("WIKI_REDUCE_INVALID_UPDATES", "updates 必须是 SlugUpdate 序列")
+    if not updates:
+        _reject("WIKI_REDUCE_EMPTY", "同一 slug 的 updates 不能为空")
+
+    snapshots: list[SlugUpdate] = []
+    for index, update in enumerate(updates):
+        if not isinstance(update, SlugUpdate):
+            _reject(
+                "WIKI_REDUCE_INVALID_UPDATE",
+                f"update[{index}] 必须是有效的 SlugUpdate",
+            )
+        try:
+            snapshots.append(
+                SlugUpdate.model_validate(
+                    update.model_dump(mode="python", warnings=False)
+                )
+            )
+        except (ValidationError, TypeError, ValueError) as exc:
+            _reject(
+                "WIKI_REDUCE_INVALID_UPDATE",
+                f"update[{index}] 类型或字段未通过完整校验: {exc}",
+            )
+    return snapshots
+
+
+def _snapshot_existing(existing_page: object) -> ReducedPage | None:
+    if existing_page is None:
+        return None
+    if not isinstance(existing_page, ReducedPage):
+        _reject(
+            "WIKI_REDUCE_INVALID_EXISTING",
+            "已有页面必须是有效的 ReducedPage",
+        )
+    try:
+        return ReducedPage.model_validate(
+            existing_page.model_dump(mode="python", warnings=False)
+        )
+    except (ValidationError, TypeError, ValueError) as exc:
+        _reject(
+            "WIKI_REDUCE_INVALID_EXISTING",
+            f"已有页面未通过完整校验: {exc}",
+        )
+
+
 def _validate_inputs(
     slug: str,
     updates: Sequence[SlugUpdate],
     existing_page: ReducedPage | None,
 ) -> str:
-    if not updates:
-        _reject("WIKI_REDUCE_EMPTY", "同一 slug 的 updates 不能为空")
-
     if len(slug) > 255 or not _SLUG_PATTERN.fullmatch(slug):
         _reject(
             "WIKI_REDUCE_INVALID_SLUG",
@@ -104,6 +148,16 @@ def _reduce_summary(update: SlugUpdate) -> ReducedPage:
     )
 
 
+def _trusted_source_refs(update: SlugUpdate) -> list[str]:
+    supplied_refs = _stable_clean(update.source_refs)
+    if any(source_ref != update.knowledge_id for source_ref in supplied_refs):
+        _reject(
+            "WIKI_REDUCE_SOURCE_MISMATCH",
+            "topic update.source_refs 只能为空或包含自身 knowledge_id",
+        )
+    return [update.knowledge_id]
+
+
 def _contribution(update: SlugUpdate) -> PageContribution:
     return PageContribution(
         pending_op_id=update.pending_op_id,
@@ -112,7 +166,7 @@ def _contribution(update: SlugUpdate) -> PageContribution:
         content=update.content,
         summary=update.summary,
         aliases=_stable_clean(update.aliases),
-        source_refs=_stable_clean(update.source_refs),
+        source_refs=_trusted_source_refs(update),
         chunk_refs=_stable_clean(update.chunk_refs),
     )
 
@@ -129,6 +183,10 @@ async def reduce_slug(
     ``merge_page``。本批元数据始终排在已有页面元数据之前。
     """
 
+    if not isinstance(slug, str):
+        _reject("WIKI_REDUCE_INVALID_SLUG", "slug 必须是字符串")
+    updates = _snapshot_updates(updates)
+    existing_page = _snapshot_existing(existing_page)
     page_type = _validate_inputs(slug, updates, existing_page)
     if page_type == "summary":
         if len(updates) != 1:
@@ -142,9 +200,6 @@ async def reduce_slug(
                 "summary slug 必须与 update knowledge_id 完全一致",
             )
         return _reduce_summary(updates[0])
-
-    if page_type not in _TOPIC_TYPES:
-        _reject("WIKI_REDUCE_INVALID_TYPE", "仅支持 summary、entity 和 concept 类型")
 
     existing_aliases = existing_page.aliases if existing_page is not None else []
     existing_source_refs = (
@@ -160,7 +215,7 @@ async def reduce_slug(
     aliases = _stable_clean([*aliases, *existing_aliases])
     source_refs = _stable_clean(
         [
-            *(value for update in updates for value in update.source_refs),
+            *(update.knowledge_id for update in updates),
             *existing_source_refs,
         ]
     )
