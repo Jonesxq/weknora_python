@@ -210,6 +210,30 @@ async def test_ingest_store_is_atomic_idempotent_and_writes_follow_up(
     assert duplicate.id == first.id
     assert duplicate.deduplicated is True
 
+    all_failed_operation_id = uuid4()
+    assert await store.apply_results(
+        scope, uuid4(), [], [], all_failed_operation_id
+    ) is False
+    assert await store.apply_results(
+        scope, uuid4(), [], [], all_failed_operation_id
+    ) is False
+    with pytest.raises(ValueError, match="不能提交结果页面"):
+        await store.apply_results(
+            scope,
+            uuid4(),
+            [
+                ReducedPage(
+                    slug="concept/invalid-empty-batch",
+                    title="非法空完成批次",
+                    page_type="concept",
+                    content="不应写入",
+                    summary="不应写入",
+                )
+            ],
+            [],
+            uuid4(),
+        )
+
     outbox = await store.claim_outbox(10, 600)
     assert len(outbox) == 2
     outbox_token = outbox[0].claim_token
@@ -323,6 +347,7 @@ async def test_ingest_store_is_atomic_idempotent_and_writes_follow_up(
         assert {page.status for page in pages} == {"published"}
         source_page = next(page for page in pages if page.slug == "entity/source")
         assert source_page.version == 1
+        assert source_page.wiki_path == "/entity/source"
         assert source_page.aliases == ["Source"]
         assert source_page.source_refs == [op.knowledge_id]
         assert source_page.chunk_refs == ["chunk-1"]
@@ -371,7 +396,7 @@ async def test_ingest_store_is_atomic_idempotent_and_writes_follow_up(
                     TaskOutbox.knowledge_base_id == scope.knowledge_base_id,
                 )
             )
-        ).scalar_one() == 3
+        ).scalar_one() == 4
         assert (
             await session.execute(
                 select(func.count(TaskOutbox.id)).where(
@@ -382,15 +407,15 @@ async def test_ingest_store_is_atomic_idempotent_and_writes_follow_up(
             )
         ).scalar_one() == 2
 
-    class FailingFinalization(SqlFinalizationPort):
+    class MissingFinalization(SqlFinalizationPort):
         async def release(self, session, request):
-            raise RuntimeError("release failed")
+            return False
 
     remaining = (await store.claim_pending(scope, 1, 600))[0]
     assert remaining.claim_token is not None
     rollback_operation_id = uuid4()
-    rollback_store = SqlAlchemyIngestStore(postgres_factory, FailingFinalization())
-    with pytest.raises(RuntimeError, match="release failed"):
+    rollback_store = SqlAlchemyIngestStore(postgres_factory, MissingFinalization())
+    with pytest.raises(ValueError, match="finalization"):
         await rollback_store.apply_results(
             scope,
             remaining.claim_token,

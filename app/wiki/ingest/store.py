@@ -307,6 +307,38 @@ def _snapshot_page(page: ReducedPage) -> ReducedPage:
     )
 
 
+async def _enqueue_follow_up(
+    session: AsyncSession,
+    scope: WikiScope,
+    operation_id: UUID,
+) -> None:
+    event_type = "wiki.batch.trigger"
+    dedup_key = build_outbox_dedup_key(
+        scope.tenant_id,
+        scope.knowledge_base_id,
+        event_type,
+        f"operation:{operation_id}",
+        "follow-up",
+    )
+    await session.execute(
+        postgresql.insert(TaskOutbox)
+        .values(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            event_type=event_type,
+            dedup_key=dedup_key,
+            payload={
+                "tenant_id": scope.tenant_id,
+                "knowledge_base_id": str(scope.knowledge_base_id),
+            },
+            available_at=datetime.now(UTC) + timedelta(seconds=5),
+        )
+        .on_conflict_do_nothing(
+            constraint="uq_task_outbox_scope_event_dedup"
+        )
+    )
+
+
 class SqlAlchemyIngestStore:
     """每个公开操作使用独立短 session 的 PostgreSQL 摄取仓储。"""
 
@@ -535,6 +567,21 @@ class SqlAlchemyIngestStore:
                 if not page_contributors.issubset(set(completed_ids)):
                     raise ValueError("页面 contributor 必须属于 completed_op_ids")
                 if not completed_ids:
+                    if snapshots:
+                        raise ValueError("completed_op_ids 为空时不能提交结果页面")
+                    remaining = int(
+                        (
+                            await session.execute(
+                                select(func.count(WikiPendingOp.id)).where(
+                                    WikiPendingOp.tenant_id == scope.tenant_id,
+                                    WikiPendingOp.knowledge_base_id
+                                    == scope.knowledge_base_id,
+                                )
+                            )
+                        ).scalar_one()
+                    )
+                    if remaining:
+                        await _enqueue_follow_up(session, scope, operation_id)
                     return False
 
                 pending_rows = list(
@@ -601,6 +648,7 @@ class SqlAlchemyIngestStore:
                             aliases=list(reduced.aliases),
                             source_refs=list(reduced.source_refs),
                             chunk_refs=list(reduced.chunk_refs),
+                            wiki_path=f"/{reduced.slug}",
                         )
                         session.add(row)
                     else:
@@ -639,7 +687,7 @@ class SqlAlchemyIngestStore:
                     )
                 )
                 for pending in pending_rows:
-                    await self._finalization.release(
+                    released = await self._finalization.release(
                         session,
                         FinalizationRequest(
                             tenant_id=scope.tenant_id,
@@ -648,6 +696,8 @@ class SqlAlchemyIngestStore:
                             attempt=pending.op_version,
                         ),
                     )
+                    if not released:
+                        raise ValueError("finalization marker 不存在或已被释放")
                 await session.execute(
                     delete(WikiPendingOp).where(
                         WikiPendingOp.tenant_id == scope.tenant_id,
@@ -668,31 +718,7 @@ class SqlAlchemyIngestStore:
                     ).scalar_one()
                 )
                 if remaining:
-                    event_type = "wiki.batch.trigger"
-                    dedup_key = build_outbox_dedup_key(
-                        scope.tenant_id,
-                        scope.knowledge_base_id,
-                        event_type,
-                        f"operation:{operation_id}",
-                        "follow-up",
-                    )
-                    await session.execute(
-                        postgresql.insert(TaskOutbox)
-                        .values(
-                            tenant_id=scope.tenant_id,
-                            knowledge_base_id=scope.knowledge_base_id,
-                            event_type=event_type,
-                            dedup_key=dedup_key,
-                            payload={
-                                "tenant_id": scope.tenant_id,
-                                "knowledge_base_id": str(scope.knowledge_base_id),
-                            },
-                            available_at=datetime.now(UTC) + timedelta(seconds=5),
-                        )
-                        .on_conflict_do_nothing(
-                            constraint="uq_task_outbox_scope_event_dedup"
-                        )
-                    )
+                    await _enqueue_follow_up(session, scope, operation_id)
                 await session.flush()
                 return True
 
