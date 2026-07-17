@@ -38,6 +38,7 @@ return 0
 """
 
 _LeaseOperation = Callable[[], Awaitable[bool]]
+_LeaseCloseOperation = Callable[[], Awaitable[None]]
 _RedisClientFactory = Callable[[], "_RedisLockClient"]
 
 
@@ -86,6 +87,7 @@ class LockLease:
         operation_timeout_seconds: float,
         renew_operation: _LeaseOperation,
         release_operation: _LeaseOperation,
+        close_operation: _LeaseCloseOperation | None = None,
     ) -> None:
         self.key = key
         self.token = token
@@ -94,10 +96,13 @@ class LockLease:
         self._operation_timeout_seconds = operation_timeout_seconds
         self._renew_operation = renew_operation
         self._release_operation = release_operation
+        self._close_operation = close_operation
         self._keep_alive_task: asyncio.Task[None] | None = None
         self._released = False
+        self._close_started = False
         self._renew_lock = asyncio.Lock()
         self._release_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
 
     async def renew(self) -> bool:
         """比较 token 后续期；任何失败都会把租约标记为已丢失。"""
@@ -142,9 +147,30 @@ class LockLease:
         async with self._release_lock:
             if self._released:
                 return False
-            released = bool(await self._release_operation())
-            self._released = True
-            return released
+            try:
+                released = bool(await self._release_operation())
+                self._released = True
+                return released
+            finally:
+                await self._close_once()
+
+    async def _close_once(self) -> None:
+        if self._close_operation is None:
+            return
+        async with self._close_lock:
+            if self._close_started:
+                return
+            self._close_started = True
+            try:
+                await self._close_operation()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning(
+                    "Wiki Redis 租约客户端关闭失败: key=%s error_type=%s",
+                    self.key,
+                    type(error).__name__,
+                )
 
     async def keep_alive(self) -> None:
         """按固定间隔续期，失去所有权或 Redis 异常后立即结束。"""
@@ -178,7 +204,7 @@ class LockLease:
         await self._stop_keep_alive()
         try:
             await self.release()
-        except BaseException as cleanup_error:
+        except Exception as cleanup_error:
             if exc_type is None:
                 raise
             logger.warning(
@@ -252,11 +278,24 @@ class RedisWikiLockManager:
                 await client.eval(RENEW_SCRIPT, 1, key, token, self._ttl_seconds)
             )
 
-        async def release() -> bool:
-            released = bool(await client.eval(RELEASE_SCRIPT, 1, key, token))
-            if owned_client:
-                await self._close_owned_client(client)
-            return released
+        if owned_client:
+
+            async def release() -> bool:
+                release_client, _ = self._get_client()
+                try:
+                    return bool(
+                        await release_client.eval(RELEASE_SCRIPT, 1, key, token)
+                    )
+                finally:
+                    await self._close_owned_client(release_client)
+
+            close_operation: _LeaseCloseOperation | None = client.aclose
+        else:
+
+            async def release() -> bool:
+                return bool(await client.eval(RELEASE_SCRIPT, 1, key, token))
+
+            close_operation = None
 
         return LockLease(
             key=key,
@@ -265,6 +304,7 @@ class RedisWikiLockManager:
             operation_timeout_seconds=self._operation_timeout_seconds,
             renew_operation=renew,
             release_operation=release,
+            close_operation=close_operation,
         )
 
     async def is_active(self, knowledge_base_id: UUID) -> bool:

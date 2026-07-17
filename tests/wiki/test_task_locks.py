@@ -27,8 +27,8 @@ KB_ID = UUID("11111111-1111-1111-1111-111111111111")
 class FakeRedis:
     """只实现锁测试需要的 Redis 命令。"""
 
-    def __init__(self) -> None:
-        self.values: dict[str, str] = {}
+    def __init__(self, values: dict[str, str] | None = None) -> None:
+        self.values = values if values is not None else {}
         self.set_calls: list[tuple[str, str, bool, int]] = []
         self.eval_calls: list[tuple[str, int, tuple[object, ...]]] = []
         self.exists_calls: list[str] = []
@@ -39,6 +39,7 @@ class FakeRedis:
         self.eval_after_effect_errors: dict[str, Exception] = {}
         self.eval_waiter: asyncio.Event | None = None
         self.exists_error: Exception | None = None
+        self.aclose_error: Exception | None = None
         self.aclose_count = 0
 
     async def set(
@@ -87,13 +88,15 @@ class FakeRedis:
 
     async def aclose(self) -> None:
         self.aclose_count += 1
+        if self.aclose_error is not None:
+            raise self.aclose_error
 
 
 class LoopBoundFakeRedis(FakeRedis):
     """模拟 redis.asyncio 客户端不能跨事件循环复用。"""
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, values: dict[str, str] | None = None) -> None:
+        super().__init__(values)
         self.loop = asyncio.get_running_loop()
 
     def _assert_loop(self) -> None:
@@ -172,6 +175,7 @@ async def test_redis_lock_uses_random_token_and_exact_commands() -> None:
         (first.key, first.token, 60),
     )
     assert await first.release() is True
+    assert redis.aclose_count == 0
     assert redis.eval_calls[-1] == (
         RELEASE_SCRIPT,
         1,
@@ -326,23 +330,37 @@ async def test_release_can_retry_after_command_error() -> None:
 
 @pytest.mark.asyncio
 async def test_release_response_loss_can_retry_to_definitive_false() -> None:
-    redis = FakeRedis()
-    redis.eval_after_effect_errors[RELEASE_SCRIPT] = ConnectionError(
-        "response lost"
-    )
-    manager = RedisWikiLockManager(client_factory=lambda: redis)
+    values: dict[str, str] = {}
+    clients: list[FakeRedis] = []
+
+    def client_factory() -> FakeRedis:
+        client = FakeRedis(values)
+        if len(clients) == 1:
+            client.eval_after_effect_errors[RELEASE_SCRIPT] = ConnectionError(
+                "response lost"
+            )
+        clients.append(client)
+        return client
+
+    manager = RedisWikiLockManager(client_factory=client_factory)
     lease = await manager.acquire(KB_ID)
     assert lease is not None
 
     with pytest.raises(ConnectionError, match="response lost"):
         await lease.release()
 
-    assert lease.key not in redis.values
-    assert redis.aclose_count == 0
+    assert lease.key not in values
+    assert len(clients) == 2
+    assert [client.aclose_count for client in clients] == [1, 1]
     assert await lease.release() is False
-    assert redis.aclose_count == 1
+    assert len(clients) == 3
+    assert [client.aclose_count for client in clients] == [1, 1, 1]
     assert await lease.release() is False
-    assert sum(call[0] == RELEASE_SCRIPT for call in redis.eval_calls) == 2
+    assert sum(
+        call[0] == RELEASE_SCRIPT
+        for client in clients
+        for call in client.eval_calls
+    ) == 2
 
 
 @pytest.mark.asyncio
@@ -451,6 +469,141 @@ async def test_context_preserves_cancellation_when_release_cleanup_fails(
     assert lease.token not in caplog.text
     del redis.eval_errors[RELEASE_SCRIPT]
     assert await lease.release() is True
+
+
+@pytest.mark.asyncio
+async def test_new_cancellation_during_release_overrides_body_error() -> None:
+    release_started = asyncio.Event()
+    release_blocker = asyncio.Event()
+    renew_calls = 0
+    close_calls = 0
+
+    async def renew() -> bool:
+        nonlocal renew_calls
+        renew_calls += 1
+        return True
+
+    async def release() -> bool:
+        release_started.set()
+        await release_blocker.wait()
+        return True
+
+    async def close() -> None:
+        nonlocal close_calls
+        close_calls += 1
+
+    lease = LockLease(
+        key=f"wiki:active:{KB_ID}",
+        token="not-logged",
+        renew_interval_seconds=0.01,
+        operation_timeout_seconds=0.1,
+        renew_operation=renew,
+        release_operation=release,
+        close_operation=close,
+    )
+
+    async def fail_in_body() -> None:
+        async with lease:
+            raise ValueError("business failed")
+
+    task = asyncio.create_task(fail_in_body())
+    await release_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    frozen_renew_calls = renew_calls
+    await asyncio.sleep(0.03)
+    assert renew_calls == frozen_renew_calls
+    assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_owned_clients_close_when_business_and_release_both_fail(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    values: dict[str, str] = {}
+    clients: list[FakeRedis] = []
+
+    def client_factory() -> FakeRedis:
+        client = FakeRedis(values)
+        if len(clients) == 1:
+            client.eval_errors[RELEASE_SCRIPT] = ConnectionError("release failed")
+        clients.append(client)
+        return client
+
+    lease = await RedisWikiLockManager(client_factory=client_factory).acquire(KB_ID)
+    assert lease is not None
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(ValueError, match="business failed"):
+            async with lease:
+                raise ValueError("business failed")
+
+    assert len(clients) == 2
+    assert [client.aclose_count for client in clients] == [1, 1]
+    assert lease.key in values
+    assert "释放清理失败" in caplog.text
+    assert lease.token not in caplog.text
+
+    assert await lease.release() is True
+    assert len(clients) == 3
+    assert [client.aclose_count for client in clients] == [1, 1, 1]
+    assert lease.key not in values
+
+
+@pytest.mark.asyncio
+async def test_owned_lease_close_error_warns_without_losing_release_result(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    values: dict[str, str] = {}
+    clients: list[FakeRedis] = []
+
+    def client_factory() -> FakeRedis:
+        client = FakeRedis(values)
+        if not clients:
+            client.aclose_error = ConnectionError("close failed")
+        clients.append(client)
+        return client
+
+    lease = await RedisWikiLockManager(client_factory=client_factory).acquire(KB_ID)
+    assert lease is not None
+
+    with caplog.at_level(logging.WARNING):
+        assert await lease.release() is True
+
+    assert [client.aclose_count for client in clients] == [1, 1]
+    assert "客户端关闭失败" in caplog.text
+    assert lease.token not in caplog.text
+    assert await lease.release() is False
+
+
+@pytest.mark.asyncio
+async def test_close_operation_cancellation_is_not_swallowed() -> None:
+    async def renew() -> bool:
+        return True
+
+    async def release() -> bool:
+        return True
+
+    async def close() -> None:
+        raise asyncio.CancelledError
+
+    lease = LockLease(
+        key=f"wiki:active:{KB_ID}",
+        token="not-logged",
+        renew_interval_seconds=20,
+        operation_timeout_seconds=5,
+        renew_operation=renew,
+        release_operation=release,
+        close_operation=close,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await lease.release()
+
+    assert await lease.release() is False
 
 
 @pytest.mark.asyncio
@@ -600,10 +753,11 @@ def test_environment_factory_defaults_to_cached_redis_manager(
 def test_cached_environment_manager_uses_fresh_client_per_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    values: dict[str, str] = {}
     clients: list[LoopBoundFakeRedis] = []
 
     def fake_from_url(url: str, **kwargs: object) -> LoopBoundFakeRedis:
-        client = LoopBoundFakeRedis()
+        client = LoopBoundFakeRedis(values)
         clients.append(client)
         return client
 
@@ -620,10 +774,12 @@ def test_cached_environment_manager_uses_fresh_client_per_event_loop(
     asyncio.run(acquire_and_release())
     asyncio.run(acquire_and_release())
 
-    assert len(clients) == 2
-    assert clients[0] is not clients[1]
-    assert clients[0].loop is not clients[1].loop
-    assert [client.aclose_count for client in clients] == [1, 1]
+    assert len(clients) == 4
+    assert len({id(client) for client in clients}) == 4
+    assert clients[0].loop is clients[1].loop
+    assert clients[0].loop is not clients[2].loop
+    assert clients[2].loop is clients[3].loop
+    assert [client.aclose_count for client in clients] == [1, 1, 1, 1]
 
 
 @pytest.mark.asyncio
