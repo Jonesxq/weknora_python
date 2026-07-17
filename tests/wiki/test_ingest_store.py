@@ -50,7 +50,7 @@ def test_claim_pending_sql_is_scoped_ordered_and_skip_locked() -> None:
     assert "wiki_pending_ops.tenant_id" in sql
     assert "wiki_pending_ops.knowledge_base_id" in sql
     assert "wiki_pending_ops.claimed_at IS NULL" in sql
-    assert "wiki_pending_ops.claimed_at <" in sql
+    assert "wiki_pending_ops.claimed_at <=" in sql
     assert "ORDER BY wiki_pending_ops.enqueued_at, wiki_pending_ops.id" in sql
     assert "LIMIT" in sql
     assert "FOR UPDATE SKIP LOCKED" in sql
