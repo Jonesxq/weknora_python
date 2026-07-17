@@ -264,6 +264,95 @@ class WikiPendingOp(Base):
     claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
 
 
+class WikiPageContribution(Base):
+    """按知识来源记录页面内容贡献及其当前状态。"""
+
+    __tablename__ = "wiki_page_contributions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "knowledge_base_id",
+            "slug",
+            "knowledge_id",
+            "op_version",
+            name="uq_wiki_page_contributions_version",
+        ),
+        Index(
+            "uq_wiki_page_contributions_active_source",
+            "tenant_id",
+            "knowledge_base_id",
+            "slug",
+            "knowledge_id",
+            unique=True,
+            postgresql_where=text("state = 'active'"),
+        ),
+        Index(
+            "ix_wiki_page_contributions_slug_state",
+            "tenant_id",
+            "knowledge_base_id",
+            "slug",
+            "state",
+        ),
+        Index(
+            "ix_wiki_page_contributions_source_state",
+            "tenant_id",
+            "knowledge_base_id",
+            "knowledge_id",
+            "state",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    tenant_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    knowledge_base_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    slug: Mapped[str] = mapped_column(String(255), nullable=False)
+    knowledge_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    op_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    page_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    title: Mapped[str] = mapped_column(String(512), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    aliases: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    chunk_refs: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class WikiDeadLetter(Base):
+    """达到重试上限后保留的 Wiki 异步操作。"""
+
+    __tablename__ = "wiki_dead_letters"
+    __table_args__ = (
+        UniqueConstraint("pending_op_id", name="uq_wiki_dead_letters_pending_op"),
+        Index(
+            "ix_wiki_dead_letters_scope_dead_at",
+            "tenant_id",
+            "knowledge_base_id",
+            "dead_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    pending_op_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    tenant_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    knowledge_base_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    knowledge_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    op: Mapped[str] = mapped_column(String(32), nullable=False)
+    op_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    fail_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error_summary: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    dead_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class WikiFinalizationMarker(Base):
     """Wiki 摄取尝试的收尾子任务登记标记。"""
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, DateTime, Integer, String, UniqueConstraint
+from sqlalchemy import BigInteger, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateIndex
 
@@ -8,12 +8,14 @@ from app.infrastructure.database.base import Base
 from app.wiki.models import (
     TaskOutbox,
     WikiFinalizationMarker,
+    WikiDeadLetter,
     WikiFolder,
     WikiLink,
     WikiLogEntry,
     WikiPage,
     WikiPageIssue,
     WikiPendingOp,
+    WikiPageContribution,
 )
 
 
@@ -219,6 +221,111 @@ def test_phase_two_python_and_server_defaults_are_exact() -> None:
     assert finalization.subtask_name.default.arg == "wiki"
     assert finalization.id.default.arg.__name__ == "_uuid"
     assert str(finalization.registered_at.server_default.arg) == "now()"
+
+
+def test_phase_three_models_are_registered() -> None:
+    assert WikiPageContribution.__table__.name == "wiki_page_contributions"
+    assert WikiDeadLetter.__table__.name == "wiki_dead_letters"
+
+
+def test_page_contribution_has_idempotency_and_active_source_contract() -> None:
+    columns = WikiPageContribution.__table__.c
+    assert _string_lengths(WikiPageContribution) == {
+        "slug": 255,
+        "knowledge_id": 255,
+        "op_version": 255,
+        "page_type": 32,
+        "state": 32,
+        "title": 512,
+        "content": None,
+        "summary": None,
+    }
+    assert _nullable_columns(WikiPageContribution) == set()
+    assert _unique_constraints(WikiPageContribution) == {
+        "uq_wiki_page_contributions_version": (
+            "tenant_id",
+            "knowledge_base_id",
+            "slug",
+            "knowledge_id",
+            "op_version",
+        )
+    }
+    assert _indexes(WikiPageContribution) == {
+        "uq_wiki_page_contributions_active_source": (
+            "tenant_id",
+            "knowledge_base_id",
+            "slug",
+            "knowledge_id",
+        ),
+        "ix_wiki_page_contributions_slug_state": (
+            "tenant_id",
+            "knowledge_base_id",
+            "slug",
+            "state",
+        ),
+        "ix_wiki_page_contributions_source_state": (
+            "tenant_id",
+            "knowledge_base_id",
+            "knowledge_id",
+            "state",
+        ),
+    }
+    assert isinstance(columns.id.type, postgresql.UUID)
+    assert isinstance(columns.tenant_id.type, BigInteger)
+    assert isinstance(columns.knowledge_base_id.type, postgresql.UUID)
+    assert isinstance(columns.aliases.type, postgresql.JSONB)
+    assert isinstance(columns.chunk_refs.type, postgresql.JSONB)
+    assert isinstance(columns.content.type, Text)
+    assert isinstance(columns.summary.type, Text)
+    assert columns.id.default.arg.__name__ == "_uuid"
+    assert columns.state.default.arg == "active"
+    assert columns.content.default.arg == ""
+    assert columns.summary.default.arg == ""
+    assert columns.aliases.default.arg.__name__ == "list"
+    assert columns.chunk_refs.default.arg.__name__ == "list"
+    assert str(columns.created_at.server_default.arg) == "now()"
+    assert str(columns.updated_at.server_default.arg) == "now()"
+
+    active_index = next(
+        index
+        for index in WikiPageContribution.__table__.indexes
+        if index.name == "uq_wiki_page_contributions_active_source"
+    )
+    sql = str(CreateIndex(active_index).compile(dialect=postgresql.dialect()))
+    assert "CREATE UNIQUE INDEX uq_wiki_page_contributions_active_source" in sql
+    assert "WHERE state = 'active'" in sql
+
+
+def test_dead_letter_has_failure_record_contract() -> None:
+    columns = WikiDeadLetter.__table__.c
+    assert _string_lengths(WikiDeadLetter) == {
+        "knowledge_id": 255,
+        "op": 32,
+        "op_version": 255,
+        "last_error_code": 128,
+        "last_error_summary": 2000,
+    }
+    assert _nullable_columns(WikiDeadLetter) == {"last_error_code", "last_error_summary"}
+    assert _unique_constraints(WikiDeadLetter) == {
+        "uq_wiki_dead_letters_pending_op": ("pending_op_id",)
+    }
+    assert _indexes(WikiDeadLetter) == {
+        "ix_wiki_dead_letters_scope_dead_at": (
+            "tenant_id",
+            "knowledge_base_id",
+            "dead_at",
+        )
+    }
+    assert isinstance(columns.id.type, postgresql.UUID)
+    assert isinstance(columns.pending_op_id.type, postgresql.UUID)
+    assert isinstance(columns.tenant_id.type, BigInteger)
+    assert isinstance(columns.knowledge_base_id.type, postgresql.UUID)
+    assert isinstance(columns.payload.type, postgresql.JSONB)
+    assert isinstance(columns.fail_count.type, Integer)
+    assert columns.id.default.arg.__name__ == "_uuid"
+    assert columns.payload.default.arg.__name__ == "dict"
+    assert columns.fail_count.default.arg == 0
+    assert str(columns.dead_at.server_default.arg) == "now()"
 
 
 def _unique_constraints(model: type) -> dict[str, tuple[str, ...]]:
