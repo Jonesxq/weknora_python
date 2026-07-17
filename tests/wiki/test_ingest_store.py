@@ -21,6 +21,8 @@ from app.wiki.ingest.store import (
     build_finalization_register_statement,
     build_finalization_release_statement,
     build_outbox_dedup_key,
+    _cancel_claim_recovery,
+    _enqueue_follow_up,
     _pending_record,
 )
 from app.wiki.models import WikiPendingOp
@@ -236,6 +238,26 @@ async def test_claim_pending_atomically_schedules_timeout_recovery() -> None:
     assert params["dedup_key"] == build_claim_recovery_dedup_key(
         SCOPE, claimed[0].claim_token
     )
+
+
+@pytest.mark.asyncio
+async def test_follow_up_and_recovery_cancel_emit_one_statement_each() -> None:
+    class Session:
+        def __init__(self) -> None:
+            self.statements = []
+
+        async def execute(self, statement):
+            self.statements.append(statement)
+
+    follow_up_session = Session()
+    await _enqueue_follow_up(follow_up_session, SCOPE, uuid4())  # type: ignore[arg-type]
+    assert len(follow_up_session.statements) == 1
+    assert "INSERT INTO task_outbox" in _sql(follow_up_session.statements[0])
+
+    cancel_session = Session()
+    await _cancel_claim_recovery(cancel_session, SCOPE, uuid4())  # type: ignore[arg-type]
+    assert len(cancel_session.statements) == 1
+    assert _sql(cancel_session.statements[0]).startswith("UPDATE task_outbox")
 
 
 @pytest.mark.asyncio

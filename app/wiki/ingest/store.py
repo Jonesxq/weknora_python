@@ -402,6 +402,23 @@ async def _enqueue_follow_up(
         f"operation:{operation_id}",
         "follow-up",
     )
+    await session.execute(
+        postgresql.insert(TaskOutbox)
+        .values(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            event_type=event_type,
+            dedup_key=dedup_key,
+            payload={
+                "tenant_id": scope.tenant_id,
+                "knowledge_base_id": str(scope.knowledge_base_id),
+            },
+            available_at=datetime.now(UTC) + timedelta(seconds=5),
+        )
+        .on_conflict_do_nothing(
+            constraint="uq_task_outbox_scope_event_dedup"
+        )
+    )
 
 
 def build_claim_recovery_dedup_key(scope: WikiScope, claim_token: UUID) -> str:
@@ -458,23 +475,6 @@ async def _cancel_claim_recovery(
             sent_at=datetime.now(UTC),
             claimed_at=None,
             claim_token=None,
-        )
-    )
-    await session.execute(
-        postgresql.insert(TaskOutbox)
-        .values(
-            tenant_id=scope.tenant_id,
-            knowledge_base_id=scope.knowledge_base_id,
-            event_type=event_type,
-            dedup_key=dedup_key,
-            payload={
-                "tenant_id": scope.tenant_id,
-                "knowledge_base_id": str(scope.knowledge_base_id),
-            },
-            available_at=datetime.now(UTC) + timedelta(seconds=5),
-        )
-        .on_conflict_do_nothing(
-            constraint="uq_task_outbox_scope_event_dedup"
         )
     )
 
