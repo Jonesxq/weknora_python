@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
+from collections.abc import Sequence
 from uuid import UUID, uuid4
 
 import pytest
@@ -130,12 +131,20 @@ class _QuerySession:
         return Result(batch)
 
 
+class _RowLike(Sequence[object]):
+    def __init__(self, page: WikiPage, distance: object): self.values = (page, distance)
+    def __getitem__(self, index): return self.values[index]
+    def __len__(self): return 2
+
+
 @pytest.mark.asyncio
 async def test_dedup_query_aggregates_min_distance_and_global_top_limit() -> None:
     main = [(_dedup_row(slug=f"entity/main-{index}"), float(index + 1)) for index in range(20)]
     alias_best = _dedup_row(slug="entity/alias-best")
     duplicate = main[5][0]
-    session = _QuerySession([main, [(alias_best, 0.01), (duplicate, 0.1)]])
+    row_like = _RowLike(alias_best, 0.01)
+    assert not isinstance(row_like, tuple)
+    session = _QuerySession([main, [row_like, _RowLike(duplicate, 0.1)]])
     store = SqlAlchemyIngestStore(lambda: session, SqlFinalizationPort())  # type: ignore[arg-type]
     result = await store.find_dedup_candidates(
         SCOPE, TopicCandidate(name="Main", slug="entity/new", page_type="entity", aliases=["Alias"])

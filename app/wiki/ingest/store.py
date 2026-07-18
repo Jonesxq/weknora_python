@@ -780,7 +780,7 @@ class SqlAlchemyIngestStore:
                 rows.extend(found)
         merged: dict[str, tuple[WikiPage, float]] = {}
         for result_row in rows:
-            if not isinstance(result_row, tuple) or len(result_row) != 2:
+            if isinstance(result_row, (str, bytes)) or not isinstance(result_row, Sequence) or len(result_row) != 2:
                 raise InvariantError("dedup 查询返回行形状无效")
             row, distance = result_row
             if not isinstance(row, WikiPage):
