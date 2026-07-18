@@ -216,15 +216,57 @@ def test_classify_degrades_batch_with_conflicting_duplicate_supplements() -> Non
     assert supplements == []
 
 
-def test_classify_runs_all_batches_with_concurrency_limit() -> None:
-    model = ScriptedModel({index: ["yield"] for index in range(9)})
-    refs, _ = asyncio.run(classify_citations(
-        knowledge_id="k", chunks=[chunk(str(i), "x") for i in range(9)], candidates=[candidate()],
-        model=model, max_chars=1, max_parallel=4,
-    ))
+def test_classify_runs_all_batches_with_bounded_workers_and_concurrency(monkeypatch: pytest.MonkeyPatch) -> None:
+    class BarrierModel:
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.requests = []
+            self.active = 0
+            self.peak = 0
+
+        async def classify_chunks(self, request):  # type: ignore[no-untyped-def]
+            self.requests.append(request)
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            if len(self.requests) == 4:
+                self.entered.set()
+            try:
+                await self.release.wait()
+                return CitationBatchOutput(refs_by_slug={"entity/acme": (request.chunks[0].alias,)})
+            finally:
+                self.active -= 1
+
+    async def exercise() -> tuple[BarrierModel, int]:
+        import app.wiki.ingest.citations as citations
+
+        model = BarrierModel()
+        created = 0
+        original = asyncio.create_task
+
+        def count_workers(coro):  # type: ignore[no-untyped-def]
+            nonlocal created
+            created += 1
+            return original(coro)
+
+        monkeypatch.setattr(citations.asyncio, "create_task", count_workers)
+        operation = original(classify_citations(
+            knowledge_id="k", chunks=[chunk(str(i), "x", i) for i in range(1000)], candidates=[candidate()],
+            model=model, max_chars=1, max_parallel=4,
+        ))
+        await model.entered.wait()
+        assert model.peak == 4
+        assert len(model.requests) == 4
+        assert created == 4
+        model.release.set()
+        refs, _ = await operation
+        assert refs["entity/acme"] == [str(i) for i in range(1000)]
+        return model, created
+
+    model, created = asyncio.run(exercise())
     assert model.peak <= 4
-    assert len(model.requests) == 9
-    assert refs["entity/acme"] == [str(i) for i in range(9)]
+    assert len(model.requests) == 1000
+    assert created == 4
     with pytest.raises(ValueError):
         asyncio.run(classify_citations(knowledge_id="k", chunks=[], candidates=[], model=model, max_parallel=0))
 
@@ -318,7 +360,10 @@ def test_classify_merges_reversed_completion_in_batch_order() -> None:
 def test_classify_keeps_inputs_model_output_and_return_containers_isolated() -> None:
     sources = [chunk("source-id", "a")]
     candidates = [candidate()]
-    output = CitationBatchOutput(refs_by_slug={"entity/acme": ("c000",)})
+    output = CitationBatchOutput(
+        refs_by_slug={"entity/acme": ("c000",)},
+        supplemental_candidates=(candidate("concept/extra"),),
+    )
     source_before = [item.model_dump() for item in sources]
     candidate_before = [item.model_dump() for item in candidates]
     output_before = output.model_dump()
@@ -338,10 +383,14 @@ def test_classify_keeps_inputs_model_output_and_return_containers_isolated() -> 
 
     refs["entity/acme"].append("forged")
     refs["forged"] = ["source-id"]
-    again, _ = asyncio.run(classify_citations(
+    supplements[0].aliases.append("mutated")
+    supplements[0].details = "mutated"
+    again, again_supplements = asyncio.run(classify_citations(
         knowledge_id="k", chunks=sources, candidates=candidates, model=model, max_chars=1,
     ))
     assert again == {"entity/acme": ["source-id"]}
+    assert again_supplements[0].aliases == []
+    assert again_supplements[0].details == ""
     assert [item.model_dump() for item in sources] == source_before
     assert output.model_dump() == output_before
 

@@ -115,9 +115,19 @@ async def classify_citations(
                 return None
         return None
 
-    tasks = [asyncio.create_task(run_batch(batch)) for batch in batches]
+    results: list[tuple[PreparedCitationBatch, CitationBatchOutput] | None] = [None] * len(batches)
+    next_batch = 0
+
+    async def worker() -> None:
+        nonlocal next_batch
+        while next_batch < len(batches):
+            batch = batches[next_batch]
+            next_batch += 1
+            results[batch.batch_index] = await run_batch(batch)
+
+    tasks = [asyncio.create_task(worker()) for _ in range(min(max_parallel, len(batches)))]
     try:
-        results = await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks)
     except BaseException:
         for task in tasks:
             task.cancel()
