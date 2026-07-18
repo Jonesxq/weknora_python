@@ -110,8 +110,64 @@ class _DedupSession:
     async def execute(self, _statement):
         class Result:
             def __init__(self, rows): self.rows = rows
-            def scalars(self): return self.rows
+            def all(self): return [(row, float(index)) for index, row in enumerate(self.rows)]
         return Result(self.rows)
+
+
+class _QuerySession:
+    def __init__(self, batches):
+        self.batches = list(batches)
+        self.calls = 0
+
+    async def __aenter__(self): return self
+    async def __aexit__(self, *_args): return None
+    async def execute(self, _statement):
+        batch = self.batches[self.calls]
+        self.calls += 1
+        class Result:
+            def __init__(self, rows): self.rows = rows
+            def all(self): return self.rows
+        return Result(batch)
+
+
+@pytest.mark.asyncio
+async def test_dedup_query_aggregates_min_distance_and_global_top_limit() -> None:
+    main = [(_dedup_row(slug=f"entity/main-{index}"), float(index + 1)) for index in range(20)]
+    alias_best = _dedup_row(slug="entity/alias-best")
+    duplicate = main[5][0]
+    session = _QuerySession([main, [(alias_best, 0.01), (duplicate, 0.1)]])
+    store = SqlAlchemyIngestStore(lambda: session, SqlFinalizationPort())  # type: ignore[arg-type]
+    result = await store.find_dedup_candidates(
+        SCOPE, TopicCandidate(name="Main", slug="entity/new", page_type="entity", aliases=["Alias"])
+    )
+    assert result[0].slug == "entity/alias-best"
+    assert "entity/main-19" not in [item.slug for item in result]
+    assert session.calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("distance", [None, "bad", float("nan"), float("inf"), -0.1])
+async def test_dedup_query_rejects_invalid_distance(distance) -> None:
+    store = SqlAlchemyIngestStore(lambda: _QuerySession([[(_dedup_row(), distance)]]), SqlFinalizationPort())  # type: ignore[arg-type]
+    with pytest.raises(InvariantError):
+        await store.find_dedup_candidates(SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [[_dedup_row()], [(_dedup_row(), 1.0, "extra")], [(object(), 1.0)]])
+async def test_dedup_query_rejects_bad_result_shape(bad) -> None:
+    store = SqlAlchemyIngestStore(lambda: _QuerySession([bad]), SqlFinalizationPort())  # type: ignore[arg-type]
+    with pytest.raises(InvariantError):
+        await store.find_dedup_candidates(SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity"))
+
+
+@pytest.mark.asyncio
+async def test_dedup_query_validates_late_alias_batch_after_limit_is_full() -> None:
+    first = [(_dedup_row(slug=f"entity/{index}"), float(index)) for index in range(20)]
+    bad = _dedup_row(slug="entity/bad", tenant_id=99)
+    store = SqlAlchemyIngestStore(lambda: _QuerySession([first, [(bad, 1.0)]]), SqlFinalizationPort())  # type: ignore[arg-type]
+    with pytest.raises(InvariantError):
+        await store.find_dedup_candidates(SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity", aliases=["B"]))
 
 
 @pytest.mark.asyncio

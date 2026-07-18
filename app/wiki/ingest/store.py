@@ -774,12 +774,17 @@ class SqlAlchemyIngestStore:
             rows: list[tuple[WikiPage, object]] = []
             for name in names:
                 result = await session.execute(build_dedup_candidate_statement(scope, candidate, limit, query_name=name))
-                found = list(result.all()) if hasattr(result, "all") else [(row, 0.0) for row in result.scalars()]
+                found = list(result.all())
                 if len(found) > limit:
                     raise InvariantError("dedup 查询返回超过 limit 的候选")
                 rows.extend(found)
         merged: dict[str, tuple[WikiPage, float]] = {}
-        for row, distance in rows:
+        for result_row in rows:
+            if not isinstance(result_row, tuple) or len(result_row) != 2:
+                raise InvariantError("dedup 查询返回行形状无效")
+            row, distance = result_row
+            if not isinstance(row, WikiPage):
+                raise InvariantError("dedup 查询返回非 WikiPage")
             if (
                 row.tenant_id != scope.tenant_id
                 or row.knowledge_base_id != scope.knowledge_base_id

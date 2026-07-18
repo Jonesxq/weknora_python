@@ -311,3 +311,28 @@ async def test_service_input_model_output_and_return_value_are_isolated() -> Non
     assert target.aliases == ("Target",)
     assert output.decisions[0].canonical_slug == "entity/db"
     assert again[0].name == "DB" and "returned only" not in again[0].aliases
+
+
+@pytest.mark.asyncio
+async def test_absorbed_exact_slug_anchors_entire_cluster_without_model() -> None:
+    class AnchorStore(Store):
+        async def find_existing_pages(self, _scope, _slugs):
+            return {"entity/b": ExistingPageRecord(page_id=uuid4(), version=1, page=ReducedPage(slug="entity/b", title="DB B", page_type="entity", content="", summary=""))}
+    model = Model(DedupOutput())
+    result, mapping = await deduplicate_candidates(
+        SCOPE, [TopicCandidate(name="Same", slug="entity/a", page_type="entity"), TopicCandidate(name="same", slug="entity/b", page_type="entity")], AnchorStore({}), model
+    )
+    assert model.calls == 0 and [item.slug for item in result] == ["entity/b"]
+    assert mapping == {"entity/a": "entity/b", "entity/b": "entity/b"}
+
+
+@pytest.mark.asyncio
+async def test_two_exact_anchors_in_one_cluster_are_ambiguous() -> None:
+    class AmbiguousStore(Store):
+        async def find_existing_pages(self, _scope, _slugs):
+            return {
+                "entity/a": ExistingPageRecord(page_id=uuid4(), version=1, page=ReducedPage(slug="entity/a", title="A", page_type="entity", content="", summary="")),
+                "entity/b": ExistingPageRecord(page_id=uuid4(), version=1, page=ReducedPage(slug="entity/b", title="B", page_type="entity", content="", summary="")),
+            }
+    with pytest.raises(WikiValidationError, match="多个已有页面"):
+        await deduplicate_candidates(SCOPE, [TopicCandidate(name="Same", slug="entity/a", page_type="entity"), TopicCandidate(name="same", slug="entity/b", page_type="entity")], AmbiguousStore({}), Model(DedupOutput()))
