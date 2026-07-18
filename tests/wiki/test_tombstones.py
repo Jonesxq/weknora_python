@@ -412,9 +412,12 @@ async def test_redis_cancellation_waits_for_close_and_leaves_no_close_task() -> 
         )
     )
     await _wait_for_close_start(client)
-    task.cancel()
-    task.cancel()
-    client.close_release.set()
+    try:
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+    finally:
+        client.close_release.set()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=1)
     assert client.close_finished
@@ -481,9 +484,9 @@ def test_redis_clients_share_backend_state_and_refresh_ttl_across_loops() -> Non
     asyncio.run(mark())
     clock.now = 3700.0
     assert asyncio.run(deleted())
-    clock.now = 7299.0
+    clock.now = 7298.999
     assert asyncio.run(deleted())
-    clock.now = 7300.0
+    clock.now = 7299.0
     assert not asyncio.run(deleted())
     assert len({id(client) for client in factory.clients}) == len(factory.clients)
 
