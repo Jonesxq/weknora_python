@@ -189,28 +189,45 @@ def _active_projection(
     records: Sequence[StoredContributionRecord],
 ) -> list[StoredContributionRecord]:
     snapshots = _snapshot_records(records, "records")
-    active = [record for record in snapshots if record.state == "active"]
-    if not active:
+    if not snapshots:
         return []
     target = (
-        active[0].tenant_id,
-        active[0].knowledge_base_id,
-        active[0].slug,
-        active[0].page_type,
+        snapshots[0].tenant_id,
+        snapshots[0].knowledge_base_id,
+        snapshots[0].slug,
+        snapshots[0].page_type,
     )
     if any(
         (record.tenant_id, record.knowledge_base_id, record.slug, record.page_type)
         != target
-        for record in active
+        for record in snapshots
     ):
-        _reject("WIKI_CONTRIBUTION_MIXED_TARGET", "活动贡献必须投影到同一目标页面")
+        _reject("WIKI_CONTRIBUTION_MIXED_TARGET", "贡献必须投影到同一目标页面")
+    active = [record for record in snapshots if record.state == "active"]
+    if not active:
+        return []
+    active_keys: set[tuple[int, UUID, str, str]] = set()
+    for record in active:
+        key = (
+            record.tenant_id,
+            record.knowledge_base_id,
+            record.slug,
+            record.knowledge_id,
+        )
+        if key in active_keys:
+            _reject(
+                "WIKI_CONTRIBUTION_DUPLICATE_ACTIVE",
+                "同一知识来源在同一页面只能有一条活动贡献",
+            )
+        active_keys.add(key)
     return sorted(
         active,
         key=lambda record: (
             record.knowledge_id,
             record.op_version,
             record.slug,
-            str(record.id or UUID(int=0)),
+            0 if record.id is None else 1,
+            0 if record.id is None else record.id.int,
         ),
     )
 

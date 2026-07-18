@@ -73,7 +73,10 @@ def test_ingest_plans_add_replace_unchanged_and_stale_in_required_order() -> Non
     "field,value",
     [
         ("op_version", "v2"),
+        ("page_type", "concept"),
+        ("title", "Changed title"),
         ("content", "changed"),
+        ("summary", "Changed summary"),
         ("aliases", ("Other",)),
         ("chunk_refs", ("other",)),
     ],
@@ -82,10 +85,20 @@ def test_ingest_replaces_when_contribution_content_changes(
     field: str, value: object
 ) -> None:
     old = record()
-    new = record(**{field: value})
-    assert [item.action for item in plan_ingest_deltas(uuid4(), [old], [new])] == [
-        "replace"
-    ]
+    new = (
+        record(**{field: value})
+        if field != "page_type"
+        else StoredContributionRecord.model_construct(
+            **{**record().model_dump(), "page_type": value}
+        )
+    )
+    if field == "page_type":
+        with pytest.raises(WikiValidationError):
+            plan_ingest_deltas(uuid4(), [old], [new])
+    else:
+        assert [item.action for item in plan_ingest_deltas(uuid4(), [old], [new])] == [
+            "replace"
+        ]
 
 
 def test_ingest_ignores_id_only_change_and_does_not_mutate_inputs() -> None:
@@ -121,6 +134,41 @@ def test_ingest_rejects_previous_and_current_from_different_operations() -> None
             [record()],
             [record(slug="entity/other", knowledge_id="knowledge-other")],
         )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"tenant_id": 2},
+        {"knowledge_base_id": UUID("22222222-2222-2222-2222-222222222222")},
+        {"knowledge_id": "knowledge-other"},
+    ],
+)
+def test_ingest_rejects_cross_collection_scope_mismatch(
+    change: dict[str, object],
+) -> None:
+    with pytest.raises(WikiValidationError):
+        plan_ingest_deltas(uuid4(), [record()], [record(slug="entity/other", **change)])
+
+
+@pytest.mark.parametrize(
+    "field,value", [("version", "v2"), ("state", "retract_pending")]
+)
+@pytest.mark.parametrize("position", ["previous", "current"])
+def test_ingest_rejects_mixed_versions_and_states_in_each_collection(
+    field: str, value: str, position: str
+) -> None:
+    records = [record(slug="entity/a"), record(slug="entity/b", **{field: value})]
+    previous, current = (records, []) if position == "previous" else ([], records)
+    with pytest.raises(WikiValidationError):
+        plan_ingest_deltas(uuid4(), previous, current)
+
+
+def test_empty_sequences_have_empty_delta_and_projection_results() -> None:
+    assert plan_ingest_deltas(uuid4(), [], []) == []
+    assert plan_retract_deltas(uuid4(), []) == []
+    assert project_active_refs([]) == ([], [])
+    assert project_aliases([]) == []
 
 
 def test_ingest_rejects_pending_id_and_malicious_record_without_leaking_pydantic_details() -> (
@@ -196,6 +244,57 @@ def test_projection_rejects_mixed_target_and_malicious_records() -> None:
         project_active_refs([bad])
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"tenant_id": 2},
+        {"knowledge_base_id": UUID("22222222-2222-2222-2222-222222222222")},
+        {"slug": "entity/other"},
+        {"page_type": "concept", "slug": "concept/acme"},
+    ],
+)
+def test_projection_rejects_mixed_target_even_when_pending(
+    change: dict[str, object],
+) -> None:
+    with pytest.raises(WikiValidationError):
+        project_active_refs([record(), record(state="retract_pending", **change)])
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        [record(), record(id=uuid4(), version="v2")],
+        [record(id=uuid4(), version="v2"), record()],
+    ],
+)
+def test_projection_rejects_duplicate_active_source_regardless_of_input_order(
+    records: list[StoredContributionRecord],
+) -> None:
+    with pytest.raises(WikiValidationError) as caught:
+        project_aliases(records)
+    assert caught.value.code == "WIKI_CONTRIBUTION_DUPLICATE_ACTIVE"
+
+
+def test_projection_is_stable_for_none_and_uuid_ids_and_returned_lists_are_isolated() -> (
+    None
+):
+    records = [
+        record(knowledge_id="z", id=uuid4(), aliases=("Z",), refs=("z",)),
+        record(knowledge_id="a", id=None, aliases=("A",), refs=("a",)),
+    ]
+    expected_refs = (["a", "z"], ["a", "z"])
+    assert project_active_refs(records) == expected_refs
+    assert project_active_refs(list(reversed(records))) == expected_refs
+    assert project_aliases(records) == ["A", "Z"]
+    sources, chunks = project_active_refs(records)
+    aliases = project_aliases(records)
+    sources.append("mutated")
+    chunks.append("mutated")
+    aliases.append("mutated")
+    assert project_active_refs(records) == expected_refs
+    assert project_aliases(records) == ["A", "Z"]
+
+
 def test_large_input_uses_all_records_without_quadratic_deduplication() -> None:
     records = [
         record(
@@ -207,3 +306,4 @@ def test_large_input_uses_all_records_without_quadratic_deduplication() -> None:
     ]
     assert len(project_active_refs(records)[0]) == 1000
     assert len(project_aliases(records)) == 1000
+    assert project_active_refs(records) == project_active_refs(list(reversed(records)))
