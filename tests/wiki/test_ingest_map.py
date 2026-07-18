@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from uuid import UUID
+from dataclasses import FrozenInstanceError
+from uuid import UUID, uuid4
 
 import pytest
+from pydantic import ValidationError
+from sqlalchemy.dialects import postgresql
 
 from app.wiki.ingest.map_document import (
     has_meaningful_text,
@@ -12,13 +15,21 @@ from app.wiki.ingest.map_document import (
 )
 from app.wiki.ingest.schemas import (
     CandidateExtraction,
+    CitationBatchOutput,
+    DedupDecision,
+    DedupOutput,
+    DedupPageCandidate,
     DocumentSummary,
+    MapDocumentResult,
     SourceChunk,
     SourceKnowledge,
+    StoredContributionRecord,
     TopicCandidate,
     WikiIngestConfig,
     WikiWorkerOptions,
 )
+from app.wiki.ingest.store import SqlAlchemyIngestStore
+from app.wiki.models import WikiPageContribution
 from app.wiki.scope import WikiScope
 
 
@@ -139,12 +150,113 @@ class RecordingModel:
         raise AssertionError("Map 阶段不应调用 merge_page")
 
 
+class IncrementalStore:
+    def __init__(
+        self,
+        previous: list[StoredContributionRecord] | None = None,
+        *,
+        dedup_targets: dict[str, list[DedupPageCandidate]] | None = None,
+    ) -> None:
+        self.previous = list(previous or [])
+        self.dedup_targets = dedup_targets or {}
+        self.events: list[tuple[object, ...]] = []
+        self.deleted_contributions: list[object] = []
+
+    async def list_source_contributions(
+        self,
+        scope: WikiScope,
+        knowledge_id: str,
+        *,
+        state: str,
+    ) -> list[StoredContributionRecord]:
+        self.events.append(("list_source_contributions", scope, knowledge_id, state))
+        return list(self.previous)
+
+    async def find_existing_pages(
+        self, scope: WikiScope, slugs: list[str]
+    ) -> dict[str, object]:
+        self.events.append(("find_existing_pages", scope, tuple(slugs)))
+        return {}
+
+    async def find_dedup_candidates(
+        self,
+        scope: WikiScope,
+        candidate: TopicCandidate,
+        limit: int = 20,
+    ) -> list[DedupPageCandidate]:
+        self.events.append(("find_dedup_candidates", scope, candidate.slug, limit))
+        return self.dedup_targets.get(candidate.slug, [])[:limit]
+
+
+class MemoryTombstones:
+    def __init__(self, deleted: bool = False) -> None:
+        self.deleted = deleted
+        self.calls: list[tuple[WikiScope, str]] = []
+
+    async def is_deleted(self, scope: WikiScope, knowledge_id: str) -> bool:
+        self.calls.append((scope, knowledge_id))
+        return self.deleted
+
+    async def mark_deleted(self, scope: WikiScope, knowledge_id: str) -> None:
+        raise AssertionError("Map 阶段不应写 tombstone")
+
+
+class IncrementalModel(RecordingModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.citation_output = CitationBatchOutput()
+        self.dedup_mapping: dict[str, str | None] = {}
+
+    async def classify_chunks(self, request: object) -> CitationBatchOutput:
+        self.calls.append(("classify_chunks", request, None))
+        return self.citation_output
+
+    async def resolve_duplicates(self, request: object) -> DedupOutput:
+        candidates = request.candidates  # type: ignore[attr-defined]
+        self.calls.append(("resolve_duplicates", request, None))
+        return DedupOutput(
+            decisions=tuple(
+                DedupDecision(
+                    candidate_slug=item.candidate.slug,
+                    canonical_slug=self.dedup_mapping.get(item.candidate.slug),
+                )
+                for item in candidates
+            )
+        )
+
+
+def contribution(
+    slug: str,
+    *,
+    version: str = "version-1",
+    page_type: str | None = None,
+    title: str = "Old title",
+    content: str = "Old content",
+    summary: str = "Old summary",
+    aliases: tuple[str, ...] = (),
+    refs: tuple[str, ...] = (),
+) -> StoredContributionRecord:
+    return StoredContributionRecord(
+        id=uuid4(),
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        slug=slug,
+        knowledge_id="knowledge-1",
+        op_version=version,
+        page_type=page_type or slug.split("/", 1)[0],
+        state="active",
+        title=title,
+        content=content,
+        summary=summary,
+        aliases=aliases,
+        chunk_refs=refs,
+    )
+
+
 def test_rebuild_content_sorts_parts_and_truncates_unicode_characters() -> None:
     chunks = [
         SourceChunk(id="b", chunk_index=2, start_at=0, text=" 后文 "),
-        SourceChunk(
-            id="z", chunk_index=1, start_at=5, text=" 前文 ", ocr_text=" OCR "
-        ),
+        SourceChunk(id="z", chunk_index=1, start_at=5, text=" 前文 ", ocr_text=" OCR "),
         SourceChunk(id="a", chunk_index=1, start_at=5, image_caption=" 图片 "),
     ]
 
@@ -199,7 +311,9 @@ async def test_map_document_skips_missing_inactive_and_short_sources() -> None:
 
 
 @pytest.mark.asyncio
-async def test_map_document_rejects_source_identity_mismatch_before_other_calls() -> None:
+async def test_map_document_rejects_source_identity_mismatch_before_other_calls() -> (
+    None
+):
     returned = SourceKnowledge(
         id="knowledge-2",
         tenant_id=1,
@@ -426,9 +540,7 @@ async def test_parent_cancellation_cleans_up_both_model_tasks() -> None:
 
 @pytest.mark.asyncio
 async def test_worker_options_override_a_copy_and_limit_only_topic_updates() -> None:
-    config = WikiIngestConfig(
-        extraction_granularity="focused", max_pages_per_ingest=3
-    )
+    config = WikiIngestConfig(extraction_granularity="focused", max_pages_per_ingest=3)
     source = StubSource(config=config)
     model = RecordingModel()
 
@@ -476,3 +588,391 @@ async def test_zero_worker_limit_falls_back_to_fixture_limit() -> None:
         "entity/acme",
     ]
     assert model.calls[0][2].extraction_granularity == "standard"
+
+
+@pytest.mark.asyncio
+async def test_incremental_map_builds_real_chunk_refs_and_add_deltas() -> None:
+    source = StubSource(
+        chunks=[
+            SourceChunk(id="chunk-2", chunk_index=2, text="Second useful section."),
+            SourceChunk(id="empty", chunk_index=0, text=" ", ocr_text=""),
+            SourceChunk(id="chunk-1", chunk_index=1, text="First useful section."),
+        ]
+    )
+    model = IncrementalModel()
+    model.citation_output = CitationBatchOutput(
+        refs_by_slug={
+            "entity/acme": ("c001", "c000"),
+            "concept/retrieval": ("c000",),
+        }
+    )
+    store = IncrementalStore()
+    tombstones = MemoryTombstones()
+
+    result = await map_document(
+        SCOPE,
+        "knowledge-1",
+        source,
+        model,
+        store,
+        tombstones,
+        pending_op_id=PENDING_OP_ID,
+        op_version="trusted-version-1",
+        options=WikiWorkerOptions(),
+    )
+
+    assert result.pending_op_id == PENDING_OP_ID
+    assert result.knowledge_id == "knowledge-1"
+    assert result.skipped_reason is None
+    assert result.superseded is False
+    assert isinstance(result.contribution_deltas, tuple)
+    assert [(item.action, item.slug) for item in result.contribution_deltas] == [
+        ("add", "summary/knowledge-1"),
+        ("add", "entity/acme"),
+        ("add", "entity/beta"),
+        ("add", "concept/retrieval"),
+    ]
+    by_slug = {item.slug: item.current for item in result.contribution_deltas}
+    assert by_slug["summary/knowledge-1"] is not None
+    assert by_slug["summary/knowledge-1"].chunk_refs == ("chunk-1", "chunk-2")
+    assert by_slug["entity/acme"] is not None
+    assert by_slug["entity/acme"].chunk_refs == ("chunk-1", "chunk-2")
+    assert by_slug["entity/beta"] is not None
+    assert by_slug["entity/beta"].chunk_refs == ()
+    assert by_slug["concept/retrieval"] is not None
+    assert by_slug["concept/retrieval"].chunk_refs == ("chunk-1",)
+    assert all(
+        ref != "c000"
+        for current in by_slug.values()
+        if current is not None
+        for ref in current.chunk_refs
+    )
+    assert all(
+        current is not None
+        and current.tenant_id == SCOPE.tenant_id
+        and current.knowledge_base_id == SCOPE.knowledge_base_id
+        and current.knowledge_id == "knowledge-1"
+        and current.op_version == "trusted-version-1"
+        for current in by_slug.values()
+    )
+    assert source.active_calls == [("knowledge-1", "trusted-version-1")]
+    assert store.events[0] == (
+        "list_source_contributions",
+        SCOPE,
+        "knowledge-1",
+        "active",
+    )
+    with pytest.raises((ValidationError, FrozenInstanceError)):
+        result.superseded = True
+    legacy_update = result.updates[1]
+    with pytest.raises((ValidationError, FrozenInstanceError)):
+        legacy_update.title = "mutated"
+    with pytest.raises(AttributeError):
+        legacy_update.aliases.append("mutated")
+
+
+@pytest.mark.asyncio
+async def test_reparse_plans_replace_then_stale_without_mutating_old_records() -> None:
+    previous = [
+        contribution("summary/knowledge-1", page_type="summary"),
+        contribution("entity/acme"),
+        contribution("entity/retired"),
+    ]
+    before = [record.model_dump() for record in previous]
+    store = IncrementalStore(previous)
+    source = StubSource()
+    model = IncrementalModel()
+    model.extraction = CandidateExtraction(
+        entities=[model.extraction.entities[0]],
+        concepts=[],
+    )
+    model.citation_output = CitationBatchOutput(refs_by_slug={"entity/acme": ("c000",)})
+
+    result = await map_document(
+        SCOPE,
+        "knowledge-1",
+        source,
+        model,
+        store,
+        MemoryTombstones(),
+        pending_op_id=PENDING_OP_ID,
+        op_version="version-2",
+        options=WikiWorkerOptions(),
+    )
+
+    assert [(item.action, item.slug) for item in result.contribution_deltas] == [
+        ("replace", "summary/knowledge-1"),
+        ("replace", "entity/acme"),
+        ("retract_stale", "entity/retired"),
+    ]
+    assert [record.model_dump() for record in previous] == before
+    assert store.deleted_contributions == []
+    assert [event[0] for event in store.events].count("list_source_contributions") == 1
+
+
+@pytest.mark.asyncio
+async def test_tombstoned_ingest_is_superseded_before_store_and_models() -> None:
+    source = StubSource()
+    model = IncrementalModel()
+    store = IncrementalStore()
+    tombstones = MemoryTombstones(deleted=True)
+
+    result = await map_document(
+        SCOPE,
+        "knowledge-1",
+        source,
+        model,
+        store,
+        tombstones,
+        pending_op_id=PENDING_OP_ID,
+        op_version="version-1",
+        options=WikiWorkerOptions(),
+    )
+
+    assert result.superseded is True
+    assert result.contribution_deltas == ()
+    assert result.skipped_reason is None
+    assert tombstones.calls == [(SCOPE, "knowledge-1")]
+    assert store.events == []
+    assert model.calls == []
+
+
+@pytest.mark.asyncio
+async def test_supplemental_and_generated_citations_merge_into_canonical_slug() -> None:
+    source = StubSource(
+        chunks=[
+            SourceChunk(id="chunk-1", chunk_index=0, text="First evidence section."),
+            SourceChunk(id="chunk-2", chunk_index=1, text="Second evidence section."),
+        ]
+    )
+    model = IncrementalModel()
+    generated = TopicCandidate(
+        name="Acme New",
+        slug="entity/acme-new",
+        page_type="entity",
+        description="Generated description",
+    )
+    supplemental = TopicCandidate(
+        name="Acme Alternative",
+        slug="entity/acme-alt",
+        page_type="entity",
+        details="Supplemental details",
+    )
+    model.extraction = CandidateExtraction(entities=[generated])
+    model.citation_output = CitationBatchOutput(
+        refs_by_slug={
+            "entity/acme-new": ("c001",),
+            "entity/acme-alt": ("c000",),
+        },
+        supplemental_candidates=(supplemental,),
+    )
+    model.dedup_mapping = {
+        "entity/acme-new": "entity/acme",
+        "entity/acme-alt": "entity/acme",
+    }
+    canonical = DedupPageCandidate(
+        slug="entity/acme",
+        title="ACME",
+        page_type="entity",
+        aliases=("Company",),
+    )
+    store = IncrementalStore(
+        dedup_targets={
+            "entity/acme-new": [canonical],
+            "entity/acme-alt": [canonical],
+        }
+    )
+
+    result = await map_document(
+        SCOPE,
+        "knowledge-1",
+        source,
+        model,
+        store,
+        MemoryTombstones(),
+        pending_op_id=PENDING_OP_ID,
+        op_version="version-1",
+        options=WikiWorkerOptions(),
+    )
+
+    canonical_delta = next(
+        item for item in result.contribution_deltas if item.slug == "entity/acme"
+    )
+    assert canonical_delta.current is not None
+    assert canonical_delta.current.chunk_refs == ("chunk-1", "chunk-2")
+    assert canonical_delta.current.aliases == (
+        "Company",
+        "Acme New",
+        "Acme Alternative",
+    )
+    assert all(
+        item.slug not in {"entity/acme-new", "entity/acme-alt"}
+        for item in result.contribution_deltas
+    )
+
+
+@pytest.mark.asyncio
+async def test_map_propagates_dedup_failure() -> None:
+    target = DedupPageCandidate(
+        slug="entity/canonical", title="Canonical", page_type="entity"
+    )
+    store = IncrementalStore(
+        dedup_targets={
+            "entity/acme": [target],
+            "entity/beta": [target],
+        }
+    )
+    model = IncrementalModel()
+    failure = RuntimeError("dedup failed")
+
+    async def fail_dedup(_request: object) -> DedupOutput:
+        raise failure
+
+    model.resolve_duplicates = fail_dedup  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError) as error:
+        await map_document(
+            SCOPE,
+            "knowledge-1",
+            StubSource(),
+            model,
+            store,
+            MemoryTombstones(),
+            pending_op_id=PENDING_OP_ID,
+            op_version="version-1",
+            options=WikiWorkerOptions(),
+        )
+
+    assert error.value is failure
+
+
+@pytest.mark.asyncio
+async def test_topic_limit_excludes_candidates_before_dedup_failure_boundary() -> None:
+    target = DedupPageCandidate(
+        slug="entity/canonical", title="Canonical", page_type="entity"
+    )
+    store = IncrementalStore(dedup_targets={"entity/beta": [target]})
+    model = IncrementalModel()
+    failure = RuntimeError("excluded candidate must not reach dedup")
+
+    async def fail_dedup(_request: object) -> DedupOutput:
+        raise failure
+
+    model.resolve_duplicates = fail_dedup  # type: ignore[method-assign]
+
+    result = await map_document(
+        SCOPE,
+        "knowledge-1",
+        StubSource(),
+        model,
+        store,
+        MemoryTombstones(),
+        pending_op_id=PENDING_OP_ID,
+        op_version="version-1",
+        options=WikiWorkerOptions(max_pages_per_ingest=1),
+    )
+
+    assert [item.slug for item in result.contribution_deltas] == [
+        "summary/knowledge-1",
+        "entity/acme",
+    ]
+    assert not any(
+        event[0] == "find_dedup_candidates" and event[2] == "entity/beta"
+        for event in store.events
+    )
+
+
+def test_map_result_rejects_conflicting_terminal_states() -> None:
+    with pytest.raises(ValidationError):
+        MapDocumentResult(
+            pending_op_id=PENDING_OP_ID,
+            knowledge_id="knowledge-1",
+            skipped_reason="source_inactive",
+            superseded=True,
+        )
+
+
+class _ContributionResult:
+    def __init__(self, rows: list[WikiPageContribution]) -> None:
+        self.rows = rows
+
+    def scalars(self) -> _ContributionResult:
+        return self
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        return iter(self.rows)
+
+
+class _ContributionSession:
+    def __init__(self, rows: list[WikiPageContribution]) -> None:
+        self.rows = rows
+        self.statements: list[object] = []
+        self.flush_calls = 0
+
+    async def __aenter__(self) -> _ContributionSession:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def execute(self, statement: object) -> _ContributionResult:
+        self.statements.append(statement)
+        return _ContributionResult(self.rows)
+
+    async def flush(self) -> None:
+        self.flush_calls += 1
+
+
+class _ContributionSessionFactory:
+    def __init__(self, session: _ContributionSession) -> None:
+        self.session = session
+
+    def __call__(self) -> _ContributionSession:
+        return self.session
+
+
+@pytest.mark.asyncio
+async def test_store_lists_detached_scoped_contributions_in_stable_sql_order() -> None:
+    row = WikiPageContribution(
+        id=uuid4(),
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        slug="entity/acme",
+        knowledge_id="knowledge-1",
+        op_version="version-1",
+        page_type="entity",
+        state="active",
+        title="Acme",
+        content="Body",
+        summary="Summary",
+        aliases=["Company"],
+        chunk_refs=["chunk-1"],
+    )
+    session = _ContributionSession([row])
+    store = SqlAlchemyIngestStore(
+        _ContributionSessionFactory(session),
+        object(),  # type: ignore[arg-type]
+    )
+
+    records = await store.list_source_contributions(
+        SCOPE, "knowledge-1", state="active"
+    )
+
+    sql = " ".join(
+        str(session.statements[0].compile(dialect=postgresql.dialect())).split()
+    )
+    assert "wiki_page_contributions.tenant_id" in sql
+    assert "wiki_page_contributions.knowledge_base_id" in sql
+    assert "wiki_page_contributions.knowledge_id" in sql
+    assert "wiki_page_contributions.state" in sql
+    assert (
+        "ORDER BY wiki_page_contributions.slug, "
+        "wiki_page_contributions.op_version, wiki_page_contributions.id"
+    ) in sql
+    assert session.flush_calls == 0
+    assert records[0].aliases == ("Company",)
+    assert records[0].chunk_refs == ("chunk-1",)
+    row.aliases.append("mutated")
+    row.chunk_refs.append("mutated")
+    assert records[0].aliases == ("Company",)
+    assert records[0].chunk_refs == ("chunk-1",)

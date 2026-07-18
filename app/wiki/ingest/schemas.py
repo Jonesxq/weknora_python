@@ -10,7 +10,14 @@ from types import MappingProxyType
 from typing import Any, Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from app.wiki.scope import WikiScope
 
@@ -41,7 +48,10 @@ class _FrozenMapping(Mapping[str, tuple[str, ...]]):
 
     __slots__ = ("_items", "_lookup")
 
-    def __init__(self, values: Mapping[str, tuple[str, ...]] | Iterable[tuple[str, tuple[str, ...]]]) -> None:
+    def __init__(
+        self,
+        values: Mapping[str, tuple[str, ...]] | Iterable[tuple[str, tuple[str, ...]]],
+    ) -> None:
         source = values.items() if isinstance(values, Mapping) else values
         items = tuple((key, tuple(value)) for key, value in source)
         object.__setattr__(self, "_items", items)
@@ -68,7 +78,9 @@ class _FrozenMapping(Mapping[str, tuple[str, ...]]):
     def __copy__(self) -> Self:
         return self
 
-    def __reduce__(self) -> tuple[type[Self], tuple[tuple[tuple[str, tuple[str, ...]], ...]]]:
+    def __reduce__(
+        self,
+    ) -> tuple[type[Self], tuple[tuple[tuple[str, tuple[str, ...]], ...]]]:
         return type(self), (self._items,)
 
     def __deepcopy__(self, memo: dict[int, object]) -> Self:
@@ -339,19 +351,37 @@ class SlugUpdate(_StrictModel):
         return value
 
 
-class MapDocumentResult(_StrictModel):
-    pending_op_id: UUID
-    knowledge_id: str
-    updates: list[SlugUpdate] = Field(default_factory=list)
-    skipped_reason: str | None = None
+class _ReadOnlyStrings(tuple):
+    """保留阶段二 list 比较语义的只读字符串序列。"""
 
-    @field_validator("knowledge_id")
+    def __new__(cls, values: Iterable[str] = ()) -> Self:
+        return super().__new__(cls, values)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (list, tuple)):
+            return tuple.__eq__(self, tuple(other))
+        return False
+
+    __hash__ = tuple.__hash__
+
+
+class _FrozenSlugUpdate(SlugUpdate):
+    """兼容 Reduce 类型检查的深度只读 SlugUpdate 快照。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    aliases: _ReadOnlyStrings = Field(default_factory=_ReadOnlyStrings)
+    source_refs: _ReadOnlyStrings = Field(default_factory=_ReadOnlyStrings)
+    chunk_refs: _ReadOnlyStrings = Field(default_factory=_ReadOnlyStrings)
+
+    @field_validator("aliases", "source_refs", "chunk_refs", mode="before")
     @classmethod
-    def normalize_knowledge_id(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("知识标识不能为空")
-        return value
+    def snapshot_strings(cls, value: object) -> _ReadOnlyStrings:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("兼容 update 的引用字段必须是字符串序列")
+        if any(not isinstance(item, str) for item in value):
+            raise ValueError("兼容 update 的引用字段只能包含字符串")
+        return _ReadOnlyStrings(value)
 
 
 class ReducedPage(_StrictModel):
@@ -449,7 +479,9 @@ class _FrozenReducedPage(_FrozenValueModel):
         return self
 
 
-def _snapshot_topic(value: TopicCandidate | _FrozenTopicCandidate | dict[str, Any]) -> object:
+def _snapshot_topic(
+    value: TopicCandidate | _FrozenTopicCandidate | dict[str, Any],
+) -> object:
     return value.model_dump() if isinstance(value, TopicCandidate) else value
 
 
@@ -487,7 +519,11 @@ class CitationBatchRequest(_FrozenValueModel):
     @field_validator("candidates", mode="before")
     @classmethod
     def snapshot_candidates(cls, value: object) -> object:
-        return [_snapshot_topic(item) for item in value] if isinstance(value, (list, tuple)) else value
+        return (
+            [_snapshot_topic(item) for item in value]
+            if isinstance(value, (list, tuple))
+            else value
+        )
 
     @field_validator("knowledge_id")
     @classmethod
@@ -512,17 +548,25 @@ class CitationBatchOutput(_FrozenValueModel):
     @field_validator("supplemental_candidates", mode="before")
     @classmethod
     def snapshot_supplemental_candidates(cls, value: object) -> object:
-        return [_snapshot_topic(item) for item in value] if isinstance(value, (list, tuple)) else value
+        return (
+            [_snapshot_topic(item) for item in value]
+            if isinstance(value, (list, tuple))
+            else value
+        )
 
     @field_serializer("refs_by_slug")
-    def serialize_refs_by_slug(self, value: Mapping[str, tuple[str, ...]]) -> dict[str, tuple[str, ...]]:
+    def serialize_refs_by_slug(
+        self, value: Mapping[str, tuple[str, ...]]
+    ) -> dict[str, tuple[str, ...]]:
         if isinstance(value, _FrozenMapping):
             return dict(value._iter_pairs())
         return dict(value)
 
     @field_validator("refs_by_slug")
     @classmethod
-    def normalize_refs(cls, value: Mapping[str, tuple[str, ...]]) -> Mapping[str, tuple[str, ...]]:
+    def normalize_refs(
+        cls, value: Mapping[str, tuple[str, ...]]
+    ) -> Mapping[str, tuple[str, ...]]:
         result: dict[str, tuple[str, ...]] = {}
         for slug, aliases in value.items():
             normalized_slug = _normalize_slug(slug, ("entity", "concept"))
@@ -583,7 +627,10 @@ class DedupCandidateRequest(_FrozenValueModel):
         slugs = [target.slug for target in self.allowed_targets]
         if len(slugs) != len(set(slugs)):
             raise ValueError("dedup target slug 不能重复")
-        if any(target.page_type != self.candidate.page_type for target in self.allowed_targets):
+        if any(
+            target.page_type != self.candidate.page_type
+            for target in self.allowed_targets
+        ):
             raise ValueError("dedup target page_type 必须与候选一致")
         return self
 
@@ -696,17 +743,113 @@ class ContributionDelta(_FrozenValueModel):
             "retract": (True, False, "retract_pending"),
         }[self.action]
         require_previous, require_current, previous_state = expected
-        if (self.previous is not None) != require_previous or (self.current is not None) != require_current:
+        if (self.previous is not None) != require_previous or (
+            self.current is not None
+        ) != require_current:
             raise ValueError("contribution action 的 previous/current 合同不成立")
         if self.current is not None and self.current.state != "active":
             raise ValueError("current contribution 必须为 active")
-        if self.previous is not None and previous_state is not None and self.previous.state != previous_state:
+        if (
+            self.previous is not None
+            and previous_state is not None
+            and self.previous.state != previous_state
+        ):
             raise ValueError("previous contribution state 与 action 不一致")
-        records = [record for record in (self.previous, self.current) if record is not None]
-        if any(record.slug != self.slug or record.knowledge_id != self.knowledge_id for record in records):
+        records = [
+            record for record in (self.previous, self.current) if record is not None
+        ]
+        if any(
+            record.slug != self.slug or record.knowledge_id != self.knowledge_id
+            for record in records
+        ):
             raise ValueError("contribution 的 slug 和 knowledge_id 必须与 delta 一致")
-        if len(records) == 2 and (records[0].tenant_id, records[0].knowledge_base_id, records[0].page_type) != (records[1].tenant_id, records[1].knowledge_base_id, records[1].page_type):
+        if len(records) == 2 and (
+            records[0].tenant_id,
+            records[0].knowledge_base_id,
+            records[0].page_type,
+        ) != (records[1].tenant_id, records[1].knowledge_base_id, records[1].page_type):
             raise ValueError("previous/current 的 scope 和 page_type 必须一致")
+        return self
+
+
+class _LegacyUpdates(tuple):
+    """阶段二 Worker 的只读更新视图。"""
+
+    def __new__(cls, values: Iterable[SlugUpdate] = ()) -> Self:
+        return super().__new__(cls, values)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (list, tuple)):
+            return tuple.__eq__(self, tuple(other))
+        return False
+
+    __hash__ = tuple.__hash__
+
+
+class MapDocumentResult(_FrozenValueModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    pending_op_id: UUID
+    knowledge_id: str
+    contribution_deltas: tuple[ContributionDelta, ...] = ()
+    skipped_reason: str | None = None
+    superseded: bool = False
+    # 任务 11 切换 Worker 后移除；它始终由贡献差量派生，不是第二写入源。
+    updates: _LegacyUpdates = Field(
+        default_factory=_LegacyUpdates, exclude=True, repr=False
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def derive_legacy_updates(cls, value: object) -> object:
+        if isinstance(value, cls) or not isinstance(value, Mapping):
+            return value
+        data = dict(value)
+        if "updates" in data:
+            raise ValueError("updates 为只读兼容字段")
+        updates: list[_FrozenSlugUpdate] = []
+        for raw_delta in data.get("contribution_deltas", ()):
+            delta = (
+                raw_delta
+                if isinstance(raw_delta, ContributionDelta)
+                else ContributionDelta.model_validate(raw_delta)
+            )
+            current = delta.current
+            if current is None:
+                continue
+            updates.append(
+                _FrozenSlugUpdate(
+                    pending_op_id=delta.pending_op_id,
+                    knowledge_id=current.knowledge_id,
+                    slug=current.slug,
+                    title=current.title,
+                    page_type=current.page_type,
+                    content=current.content,
+                    summary=current.summary,
+                    aliases=current.aliases,
+                    source_refs=(current.knowledge_id,),
+                    chunk_refs=current.chunk_refs,
+                )
+            )
+        data["updates"] = _LegacyUpdates(updates)
+        return data
+
+    @field_validator("knowledge_id")
+    @classmethod
+    def normalize_knowledge_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("知识标识不能为空")
+        return value
+
+    @model_validator(mode="after")
+    def validate_terminal_state(self) -> Self:
+        if self.skipped_reason is not None and self.superseded:
+            raise ValueError("skipped_reason 与 superseded 不能同时设置")
+        if (
+            self.skipped_reason is not None or self.superseded
+        ) and self.contribution_deltas:
+            raise ValueError("跳过或 superseded 结果不能包含贡献差量")
         return self
 
 
@@ -762,14 +905,24 @@ class BatchApplyRequest(_FrozenValueModel):
     @field_validator("pages", mode="before")
     @classmethod
     def snapshot_pages(cls, value: object) -> object:
-        return [_snapshot_page(item) for item in value] if isinstance(value, (list, tuple)) else value
+        return (
+            [_snapshot_page(item) for item in value]
+            if isinstance(value, (list, tuple))
+            else value
+        )
 
     @model_validator(mode="after")
     def validate_batch_identities(self) -> Self:
-        groups = [self.completed_op_ids, self.superseded_op_ids, [failure.pending_op_id for failure in self.failures]]
+        groups = [
+            self.completed_op_ids,
+            self.superseded_op_ids,
+            [failure.pending_op_id for failure in self.failures],
+        ]
         if any(len(group) != len(set(group)) for group in groups):
             raise ValueError("batch operation id 不能重复")
-        if len(set().union(*[set(group) for group in groups])) != sum(len(group) for group in groups):
+        if len(set().union(*[set(group) for group in groups])) != sum(
+            len(group) for group in groups
+        ):
             raise ValueError("completed、superseded 与 failure operation id 不能重叠")
         page_slugs = [page.slug for page in self.pages]
         expected_slugs = [page.slug for page in self.expected_pages]

@@ -33,6 +33,7 @@ from app.wiki.domain import extract_wiki_links
 from app.wiki.ingest.ports import FinalizationPort
 from app.wiki.ingest.retract import project_active_refs
 from app.wiki.ingest.schemas import (
+    ContributionState,
     DedupPageCandidate,
     FinalizationRequest,
     ReducedPage,
@@ -176,6 +177,14 @@ class IngestStore(Protocol):
     async def find_existing_pages(
         self, scope: WikiScope, slugs: Iterable[str]
     ) -> dict[str, ExistingPageRecord]: ...
+
+    async def list_source_contributions(
+        self,
+        scope: WikiScope,
+        knowledge_id: str,
+        *,
+        state: ContributionState,
+    ) -> list[StoredContributionRecord]: ...
 
     async def find_dedup_candidates(
         self, scope: WikiScope, candidate: TopicCandidate, limit: int = 20
@@ -1178,6 +1187,51 @@ class SqlAlchemyIngestStore:
                 )
                 for row in rows
             }
+
+    async def list_source_contributions(
+        self,
+        scope: WikiScope,
+        knowledge_id: str,
+        *,
+        state: ContributionState,
+    ) -> list[StoredContributionRecord]:
+        if not isinstance(scope, WikiScope):
+            raise TypeError("scope 必须是 WikiScope")
+        if not isinstance(knowledge_id, str) or not knowledge_id.strip():
+            raise ValueError("knowledge_id 不能为空")
+        if state not in {"active", "retract_pending"}:
+            raise ValueError("contribution state 无效")
+        checked_knowledge_id = knowledge_id.strip()
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(WikiPageContribution)
+                        .where(
+                            WikiPageContribution.tenant_id == scope.tenant_id,
+                            WikiPageContribution.knowledge_base_id
+                            == scope.knowledge_base_id,
+                            WikiPageContribution.knowledge_id == checked_knowledge_id,
+                            WikiPageContribution.state == state,
+                        )
+                        .order_by(
+                            WikiPageContribution.slug,
+                            WikiPageContribution.op_version,
+                            WikiPageContribution.id,
+                        )
+                    )
+                ).scalars()
+            )
+            records = [_contribution_record(row) for row in rows]
+        if any(
+            record.tenant_id != scope.tenant_id
+            or record.knowledge_base_id != scope.knowledge_base_id
+            or record.knowledge_id != checked_knowledge_id
+            or record.state != state
+            for record in records
+        ):
+            raise InvariantError("贡献查询返回了越界记录")
+        return records
 
     async def find_dedup_candidates(
         self, scope: WikiScope, candidate: TopicCandidate, limit: int = 20
