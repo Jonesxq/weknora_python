@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+from numbers import Real
 from copy import deepcopy
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -186,7 +188,7 @@ def _dedup_names_expression():
 
 def build_dedup_candidate_statement(
     scope: WikiScope, candidate: TopicCandidate, limit: int = 20, *, query_name: str | None = None
-) -> Select[tuple[WikiPage]]:
+) -> Select[tuple[WikiPage, float]]:
     """构造限定范围的 pg_trgm 候选页查询。"""
     checked_limit = _dedup_limit(limit)
     query = query_name if query_name is not None else candidate.name
@@ -195,7 +197,7 @@ def build_dedup_candidate_statement(
     expression = _dedup_names_expression()
     distance = expression.op("<->")(func.lower(query))
     return (
-        select(WikiPage)
+        select(WikiPage, distance.label("dedup_distance"))
         .where(
             WikiPage.tenant_id == scope.tenant_id,
             WikiPage.knowledge_base_id == scope.knowledge_base_id,
@@ -769,15 +771,15 @@ class SqlAlchemyIngestStore:
             if cleaned and cleaned not in names:
                 names.append(cleaned)
         async with self._session_factory() as session:
-            rows: list[WikiPage] = []
+            rows: list[tuple[WikiPage, object]] = []
             for name in names:
-                found = list((await session.execute(build_dedup_candidate_statement(scope, candidate, limit, query_name=name))).scalars())
+                result = await session.execute(build_dedup_candidate_statement(scope, candidate, limit, query_name=name))
+                found = list(result.all()) if hasattr(result, "all") else [(row, 0.0) for row in result.scalars()]
                 if len(found) > limit:
                     raise InvariantError("dedup 查询返回超过 limit 的候选")
                 rows.extend(found)
-        snapshots: list[DedupPageCandidate] = []
-        seen: set[str] = set()
-        for row in rows:
+        merged: dict[str, tuple[WikiPage, float]] = {}
+        for row, distance in rows:
             if (
                 row.tenant_id != scope.tenant_id
                 or row.knowledge_base_id != scope.knowledge_base_id
@@ -786,12 +788,14 @@ class SqlAlchemyIngestStore:
                 or row.page_type != candidate.page_type
             ):
                 raise InvariantError("dedup 查询返回越界页面")
-            if row.slug not in seen:
-                seen.add(row.slug)
-                snapshots.append(_dedup_candidate_record(row))
-                if len(snapshots) == limit:
-                    break
-        return snapshots
+            if not isinstance(distance, Real) or isinstance(distance, bool) or not math.isfinite(float(distance)) or float(distance) < 0:
+                raise InvariantError("dedup 查询返回无效距离")
+            old = merged.get(row.slug)
+            if old is not None and (old[0].id != row.id or old[0].title != row.title or old[0].page_type != row.page_type or old[0].aliases != row.aliases):
+                raise InvariantError("dedup 查询返回冲突页面")
+            if old is None or float(distance) < old[1]:
+                merged[row.slug] = (row, float(distance))
+        return [_dedup_candidate_record(row) for _, (row, _) in sorted(merged.items(), key=lambda item: (item[1][1], item[0]))[:limit]]
 
     async def apply_results(
         self,

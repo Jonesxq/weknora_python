@@ -139,12 +139,31 @@ async def deduplicate_candidates(scope: WikiScope, candidates: Sequence[TopicCan
             undecided.append(item)
     generated = {item.slug for item in originals} - set(exact_targets)
     requests: list[DedupCandidateRequest] = []
-    semaphore = asyncio.Semaphore(8)
-    async def query(item: TopicCandidate) -> list[DedupPageCandidate]:
-        async with semaphore:
-            return await store.find_dedup_candidates(scope, item, limit)
-    results = await asyncio.gather(*(query(item) for item in undecided))
+    results: list[list[DedupPageCandidate] | None] = [None] * len(undecided)
+    queue: asyncio.Queue[tuple[int, TopicCandidate] | None] = asyncio.Queue()
+    for index, item in enumerate(undecided):
+        queue.put_nowait((index, item))
+    worker_count = min(8, len(undecided))
+    for _ in range(worker_count):
+        queue.put_nowait(None)
+    async def worker() -> None:
+        while True:
+            work = await queue.get()
+            if work is None:
+                return
+            index, item = work
+            results[index] = await store.find_dedup_candidates(scope, item, limit)
+    workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+    try:
+        await asyncio.gather(*workers)
+    except BaseException:
+        for task in workers:
+            task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        raise
     for item, found_targets in zip(undecided, results, strict=True):
+        if found_targets is None:
+            raise RuntimeError("dedup worker 未返回结果")
         allowed: list[DedupPageCandidate] = []
         seen: set[str] = set()
         for target in found_targets:

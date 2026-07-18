@@ -90,7 +90,7 @@ def test_dedup_single_name_sql_has_no_least_and_aliases_do_not_add_empty_query()
         SCOPE, TopicCandidate(name="Acme", slug="entity/acme", page_type="entity", aliases=[])
     ))
     assert "LEAST" not in sql
-    assert sql.count(" <-> ") == 1
+    assert sql.count(" <-> ") == 2  # select distance + KNN order
 
 
 def _dedup_row(**updates) -> WikiPage:
