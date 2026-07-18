@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import time
+import unicodedata
 from collections.abc import Awaitable, Callable
 from typing import Protocol
 
@@ -12,8 +13,8 @@ from redis.asyncio import Redis
 from app.wiki.scope import WikiScope
 
 
-DEFAULT_TTL_SECONDS = 60
-DEFAULT_SOCKET_TIMEOUT_SECONDS = 5.0
+DEFAULT_TTL_SECONDS = 3600
+DEFAULT_SOCKET_TIMEOUT_SECONDS = 2.0
 
 
 class _RedisTombstoneClient(Protocol):
@@ -57,7 +58,7 @@ def tombstone_key(scope: WikiScope, knowledge_id: str) -> str:
         character.isspace() and character not in {" "} for character in knowledge_id
     ):
         raise ValueError("knowledge_id 不能包含控制字符")
-    if any(ord(character) < 32 or ord(character) == 127 for character in knowledge_id):
+    if any(unicodedata.category(character) == "Cc" for character in knowledge_id):
         raise ValueError("knowledge_id 不能包含控制字符")
     return f"wiki:deleted:{scope.knowledge_base_id}:{knowledge_id}"
 
@@ -112,7 +113,11 @@ class RedisTombstones:
         self._url = url.strip()
         self._ttl_seconds = ttl_seconds
         self._socket_timeout = socket_timeout
-        self._client_factory = client_factory or Redis.from_url
+        if client_factory is not None and not callable(client_factory):
+            raise TypeError("client_factory 必须可调用")
+        self._client_factory = (
+            Redis.from_url if client_factory is None else client_factory
+        )
 
     def _new_client(self) -> _RedisTombstoneClient:
         return self._client_factory(

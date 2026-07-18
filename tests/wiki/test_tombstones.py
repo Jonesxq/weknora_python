@@ -85,11 +85,27 @@ def test_key_uses_kb_identity_without_changing_knowledge_id() -> None:
 
 
 @pytest.mark.parametrize(
-    "knowledge_id", ["", "   ", " knowledge-1", "knowledge-1 ", "a\nb", "a\tb"]
+    "knowledge_id",
+    [
+        "",
+        "   ",
+        " knowledge-1",
+        "knowledge-1 ",
+        "a\nb",
+        "a\tb",
+        "a\x7fb",
+        "a\x80b",
+        "a\x81b",
+        "a\x9fb",
+    ],
 )
 def test_key_rejects_ambiguous_knowledge_id(knowledge_id: str) -> None:
     with pytest.raises(ValueError):
         tombstone_key(scope(), knowledge_id)
+
+
+def test_key_allows_normal_unicode_knowledge_id() -> None:
+    assert tombstone_key(scope(), "知识-Δ-文档") == f"wiki:deleted:{KB_ID}:知识-Δ-文档"
 
 
 @pytest.mark.asyncio
@@ -118,6 +134,17 @@ async def test_memory_separates_kbs_but_shares_same_kb_across_tenants() -> None:
         scope(knowledge_base_id=OTHER_KB_ID), "knowledge-1"
     )
     assert not await tombstones.is_deleted(scope(), "knowledge-2")
+
+
+@pytest.mark.asyncio
+async def test_memory_uses_one_hour_default_ttl() -> None:
+    clock = Clock()
+    tombstones = MemoryTombstones(clock=clock)
+    await tombstones.mark_deleted(scope(), "knowledge-1")
+    clock.now = 3699.0
+    assert await tombstones.is_deleted(scope(), "knowledge-1")
+    clock.now = 3700.0
+    assert not await tombstones.is_deleted(scope(), "knowledge-1")
 
 
 @pytest.mark.parametrize("ttl", [True, False, 0, -1, 1.0, "1"])
@@ -168,8 +195,21 @@ def test_redis_refreshes_ttl_and_works_across_independent_event_loops() -> None:
     asyncio.run(run_once())
     assert len(factory.clients) == 2
     assert all(
-        client.calls[-1][-1] == 60 and client.closed == 1 for client in factory.clients
+        client.calls[-1][-1] == 3600 and client.closed == 1
+        for client in factory.clients
     )
+    assert factory.kwargs == [
+        {
+            "decode_responses": True,
+            "socket_connect_timeout": 2.0,
+            "socket_timeout": 2.0,
+        },
+        {
+            "decode_responses": True,
+            "socket_connect_timeout": 2.0,
+            "socket_timeout": 2.0,
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -274,6 +314,19 @@ async def test_redis_propagates_close_failure_when_operation_succeeds() -> None:
 def test_redis_rejects_empty_url(url: str) -> None:
     with pytest.raises(ValueError):
         RedisTombstones(url)
+
+
+@pytest.mark.parametrize("client_factory", [False, 0, "", object()])
+def test_redis_rejects_non_callable_client_factory(client_factory: object) -> None:
+    with pytest.raises(TypeError):
+        RedisTombstones("redis://example", client_factory=client_factory)  # type: ignore[arg-type]
+
+
+def test_redis_accepts_function_client_factory() -> None:
+    def client_factory(*args: object, **kwargs: object) -> FakeRedisClient:
+        return FakeRedisClient()
+
+    assert RedisTombstones("redis://example", client_factory=client_factory)
 
 
 @pytest.mark.parametrize("ttl", [True, False, 0, -1, 1.0, "1"])
