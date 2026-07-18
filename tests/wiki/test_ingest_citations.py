@@ -37,7 +37,8 @@ def test_prepare_batches_joins_content_sorts_and_does_not_mutate_inputs() -> Non
 
 
 def test_prepare_batches_honors_boundary_splits_long_chunks_and_alias_limit() -> None:
-    assert len(prepare_citation_batches([chunk("one", "x" * 12)], max_chars=12)) == 1
+    assert len(prepare_citation_batches([chunk("one", "x" * 12000)])) == 1
+    assert [len(batch.chunks) for batch in prepare_citation_batches([chunk("one", "x" * 12001)])] == [1, 1]
     split = prepare_citation_batches([chunk("one", "abcdefgh")], max_chars=3)
     assert [[piece.text for piece in batch.chunks] for batch in split] == [["abc"], ["def"], ["gh"]]
     assert [dict(batch.alias_to_chunk_id) for batch in split] == [{"c000": "one"}] * 3
@@ -52,6 +53,16 @@ def test_prepare_batches_honors_boundary_splits_long_chunks_and_alias_limit() ->
 
 def test_prepare_batches_empty_input_is_empty() -> None:
     assert prepare_citation_batches([]) == []
+
+
+@pytest.mark.parametrize(("text", "max_chars", "expected"), [
+    ("a    b", 2, ["a", "b"]),
+    ("a  b", 1, ["a", "b"]),
+])
+def test_prepare_batches_skips_whitespace_only_slices(text: str, max_chars: int, expected: list[str]) -> None:
+    batches = prepare_citation_batches([chunk("one", text)], max_chars=max_chars)
+    assert [piece.text for batch in batches for piece in batch.chunks] == expected
+    assert [piece.alias for batch in batches for piece in batch.chunks] == ["c000", "c000"]
 
 
 class ScriptedModel:
@@ -107,6 +118,22 @@ def test_classify_degrades_only_invalid_or_permanent_batches() -> None:
     assert supplements == []
 
 
+def test_classify_rejects_cross_batch_alias_and_supplement_conflicts() -> None:
+    first = candidate("concept/extra")
+    conflicting = TopicCandidate(name="Other", slug="concept/extra", page_type="concept")
+    model = ScriptedModel({
+        0: [CitationBatchOutput(refs_by_slug={"concept/extra": ("c000",)}, supplemental_candidates=(first,))],
+        1: [CitationBatchOutput(refs_by_slug={"concept/extra": ("c000",)}, supplemental_candidates=(conflicting,))],
+        2: [CitationBatchOutput(refs_by_slug={"entity/acme": ("c001",)})],
+    })
+    refs, supplements = asyncio.run(classify_citations(
+        knowledge_id="k", chunks=[chunk("a", "a"), chunk("b", "b"), chunk("c", "c")],
+        candidates=[candidate()], model=model, max_chars=1,
+    ))
+    assert refs == {"concept/extra": ["a"]}
+    assert [item.slug for item in supplements] == ["concept/extra"]
+
+
 def test_classify_retries_transient_twice_and_merges_supplements_stably() -> None:
     extra = candidate("concept/extra")
     model = ScriptedModel({
@@ -127,6 +154,24 @@ def test_classify_retries_transient_twice_and_merges_supplements_stably() -> Non
     assert waits == [2, 4]
     assert refs == {"concept/extra": ["a"]}
     assert [item.slug for item in supplements] == ["concept/extra"]
+
+
+def test_classify_transient_exhaustion_and_all_permanent_failures_return_empty() -> None:
+    model = ScriptedModel({
+        0: [TransientModelError("one"), TransientModelError("two"), TransientModelError("three")],
+        1: [PermanentModelError("bad")],
+    })
+    waits: list[int] = []
+
+    async def wait(seconds: int) -> None:
+        waits.append(seconds)
+
+    result = asyncio.run(classify_citations(
+        knowledge_id="k", chunks=[chunk("a", "a"), chunk("b", "b")], candidates=[candidate()],
+        model=model, max_chars=1, retry_wait=wait,
+    ))
+    assert result == ({}, [])
+    assert waits == [2, 4]
 
 
 def test_classify_degrades_batch_with_conflicting_duplicate_supplements() -> None:
@@ -164,3 +209,59 @@ def test_classify_rejects_unknown_exceptions_after_cleaning_siblings() -> None:
             knowledge_id="k", chunks=[chunk("a", "a"), chunk("b", "b")], candidates=[candidate()],
             model=model, max_chars=1,
         ))
+
+
+@pytest.mark.parametrize("error", [ValueError("bad value"), TypeError("bad type"), RuntimeError("bad runtime")])
+def test_classify_propagates_unknown_model_exceptions(error: BaseException) -> None:
+    model = ScriptedModel({0: [error], 1: ["yield"]})
+    with pytest.raises(type(error), match=str(error)):
+        asyncio.run(classify_citations(
+            knowledge_id="k", chunks=[chunk("a", "a"), chunk("b", "b")], candidates=[candidate()],
+            model=model, max_chars=1,
+        ))
+    assert model.active == 0
+
+
+def test_classify_propagates_child_cancellation_and_collects_siblings() -> None:
+    model = ScriptedModel({0: [asyncio.CancelledError()], 1: ["yield"]})
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(classify_citations(
+            knowledge_id="k", chunks=[chunk("a", "a"), chunk("b", "b")], candidates=[candidate()],
+            model=model, max_chars=1,
+        ))
+    assert model.active == 0
+
+
+def test_classify_propagates_parent_cancellation_and_collects_siblings() -> None:
+    class BlockingModel:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.active = 0
+            self.cancelled = 0
+
+        async def classify_chunks(self, request):  # type: ignore[no-untyped-def]
+            self.active += 1
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+            finally:
+                self.active -= 1
+
+    async def cancel_parent() -> BlockingModel:
+        model = BlockingModel()
+        task = asyncio.create_task(classify_citations(
+            knowledge_id="k", chunks=[chunk("a", "a"), chunk("b", "b")], candidates=[candidate()],
+            model=model, max_chars=1,
+        ))
+        await model.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return model
+
+    model = asyncio.run(cancel_parent())
+    assert model.active == 0
+    assert model.cancelled >= 1

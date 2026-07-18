@@ -20,6 +20,10 @@ from app.wiki.ingest.schemas import (
 )
 
 
+class _CitationOutputRejected(Exception):
+    """当前批次的模型输出违反 citation 白名单。"""
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedCitationBatch:
     batch_index: int
@@ -58,6 +62,8 @@ def prepare_citation_batches(
             continue
         for offset in range(0, len(text), max_chars):
             piece = text[offset : offset + max_chars]
+            if not piece.strip():
+                continue
             if pending and (used_chars + len(piece) > max_chars or len(pending) == 1000):
                 flush()
             alias = f"c{len(pending):03d}"
@@ -105,7 +111,7 @@ async def classify_citations(
                 if attempt == 2:
                     return None
                 await retry_wait(2 if attempt == 0 else 4)
-            except (PermanentModelError, WikiValidationError, ValidationError, ValueError, TypeError):
+            except (PermanentModelError, WikiValidationError, ValidationError, _CitationOutputRejected):
                 return None
         return None
 
@@ -164,10 +170,10 @@ def _validate_batch_output(
         previous = supplemental_by_slug.get(item.slug)
         snapshot = item.model_dump()
         if previous is not None and previous != snapshot:
-            raise ValueError("citation supplemental candidate slug 冲突")
+            raise _CitationOutputRejected("citation supplemental candidate slug 冲突")
         supplemental_by_slug[item.slug] = snapshot
     supplemental_slugs = set(supplemental_by_slug)
     allowed_slugs = initial_slugs | supplemental_slugs
     for slug, aliases in output.refs_by_slug.items():
         if slug not in allowed_slugs or any(alias not in batch.alias_to_chunk_id for alias in aliases):
-            raise ValueError("citation 模型输出包含未授权 slug 或 alias")
+            raise _CitationOutputRejected("citation 模型输出包含未授权 slug 或 alias")
