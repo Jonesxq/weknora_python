@@ -272,7 +272,7 @@ async def map_document(
         )
 
     chunks = await source.list_chunks(scope, knowledge_id)
-    content = rebuild_source_content(chunks, max_chars=max_chars)
+    content = rebuild_source_content(chunks, max_chars=min(max_chars, 32768))
     if not has_meaningful_text(content):
         return _skipped_result(
             scope,

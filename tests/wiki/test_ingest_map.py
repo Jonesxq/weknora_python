@@ -417,6 +417,30 @@ async def test_map_document_truncates_same_input_for_both_model_calls() -> None:
 
 
 @pytest.mark.asyncio
+async def test_incremental_map_caps_explicit_max_chars_at_32768() -> None:
+    source = StubSource(chunks=[SourceChunk(id="chunk", text="x" * 40000)])
+    model = IncrementalModel()
+
+    await map_document(
+        SCOPE,
+        "knowledge-1",
+        source,
+        model,
+        IncrementalStore(),
+        MemoryTombstones(),
+        pending_op_id=PENDING_OP_ID,
+        op_version="version-1",
+        options=WikiWorkerOptions(),
+        max_chars=40000,
+    )
+
+    assert model.extract_input is not None
+    assert model.summary_input is not None
+    assert model.extract_input[1] == model.summary_input[2]
+    assert len(model.extract_input[1]) == 32768
+
+
+@pytest.mark.asyncio
 async def test_map_document_starts_model_calls_concurrently() -> None:
     both_started = asyncio.Event()
     release = asyncio.Event()
