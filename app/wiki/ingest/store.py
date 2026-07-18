@@ -12,14 +12,14 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import Select, delete, func, or_, select, update
+from sqlalchemy import Select, Text, cast, delete, func, literal, or_, select, update
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.exc import IntegrityError
 
 from app.wiki.domain import extract_wiki_links
 from app.wiki.ingest.ports import FinalizationPort
-from app.wiki.ingest.schemas import FinalizationRequest, ReducedPage, SourceKnowledge
+from app.wiki.ingest.schemas import DedupPageCandidate, FinalizationRequest, ReducedPage, SourceKnowledge, TopicCandidate
 from app.wiki.models import (
     TaskOutbox,
     WikiFinalizationMarker,
@@ -134,6 +134,10 @@ class IngestStore(Protocol):
         self, scope: WikiScope, slugs: Iterable[str]
     ) -> dict[str, ExistingPageRecord]: ...
 
+    async def find_dedup_candidates(
+        self, scope: WikiScope, candidate: TopicCandidate, limit: int = 20
+    ) -> list[DedupPageCandidate]: ...
+
     async def apply_results(
         self,
         scope: WikiScope,
@@ -165,6 +169,42 @@ def _positive_limit(limit: int) -> int:
     if isinstance(limit, bool) or limit <= 0:
         raise ValueError("limit 必须是正整数")
     return limit
+
+
+def _dedup_limit(limit: int) -> int:
+    if isinstance(limit, bool) or not 1 <= limit <= 20:
+        raise ValueError("dedup limit 必须在 1 到 20 之间")
+    return limit
+
+
+def _dedup_names_expression():
+    """与 ix_wiki_pages_dedup_names_trgm 完全相同的索引表达式。"""
+    return func.lower(WikiPage.title) + literal(" ") + func.lower(
+        func.coalesce(cast(WikiPage.aliases, Text), literal(""))
+    )
+
+
+def build_dedup_candidate_statement(
+    scope: WikiScope, candidate: TopicCandidate, limit: int = 20
+) -> Select[tuple[WikiPage]]:
+    """构造限定范围的 pg_trgm 候选页查询。"""
+    checked_limit = _dedup_limit(limit)
+    names = [candidate.name, *candidate.aliases]
+    query = " ".join(" ".join(value.split()).casefold() for value in names if value.strip())
+    expression = _dedup_names_expression()
+    distance = expression.op("<->")(query)
+    return (
+        select(WikiPage)
+        .where(
+            WikiPage.tenant_id == scope.tenant_id,
+            WikiPage.knowledge_base_id == scope.knowledge_base_id,
+            WikiPage.deleted_at.is_(None),
+            WikiPage.status == "published",
+            WikiPage.page_type == candidate.page_type,
+        )
+        .order_by(distance, WikiPage.slug)
+        .limit(checked_limit)
+    )
 
 
 def _timeout_delta(value: timedelta | int) -> timedelta:
@@ -316,6 +356,15 @@ def _outbox_record(row: TaskOutbox) -> OutboxEventRecord:
         claim_token=row.claim_token,
         attempts=row.attempts,
         sent_at=row.sent_at,
+    )
+
+
+def _dedup_candidate_record(row: WikiPage) -> DedupPageCandidate:
+    return DedupPageCandidate(
+        slug=row.slug,
+        title=row.title,
+        page_type=row.page_type,
+        aliases=tuple(deepcopy(row.aliases)),
     )
 
 
@@ -706,6 +755,14 @@ class SqlAlchemyIngestStore:
                 )
                 for row in rows
             }
+
+    async def find_dedup_candidates(
+        self, scope: WikiScope, candidate: TopicCandidate, limit: int = 20
+    ) -> list[DedupPageCandidate]:
+        statement = build_dedup_candidate_statement(scope, candidate, limit)
+        async with self._session_factory() as session:
+            rows = list((await session.execute(statement)).scalars())
+        return [_dedup_candidate_record(row) for row in rows]
 
     async def apply_results(
         self,

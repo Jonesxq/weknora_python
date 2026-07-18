@@ -24,7 +24,9 @@ from app.wiki.ingest.store import (
     _cancel_claim_recovery,
     _enqueue_follow_up,
     _pending_record,
+    build_dedup_candidate_statement,
 )
+from app.wiki.ingest.schemas import TopicCandidate
 from app.wiki.models import WikiPendingOp
 from app.wiki.scope import WikiScope
 
@@ -54,6 +56,38 @@ def test_claim_pending_sql_is_scoped_ordered_and_skip_locked() -> None:
     assert "ORDER BY wiki_pending_ops.enqueued_at, wiki_pending_ops.id" in sql
     assert "LIMIT" in sql
     assert "FOR UPDATE SKIP LOCKED" in sql
+
+
+def test_dedup_candidate_sql_is_scoped_index_equivalent_and_limited() -> None:
+    statement = build_dedup_candidate_statement(
+        SCOPE,
+        TopicCandidate(name="Acme", slug="entity/acme", page_type="entity", aliases=["ACME Corp"]),
+        limit=20,
+    )
+    sql = _sql(statement)
+
+    for fragment in (
+        "wiki_pages.tenant_id",
+        "wiki_pages.knowledge_base_id",
+        "wiki_pages.deleted_at IS NULL",
+        "wiki_pages.status =",
+        "wiki_pages.page_type =",
+        "lower(wiki_pages.title)",
+        "coalesce(CAST(wiki_pages.aliases AS TEXT),",
+        " <-> ",
+        "ORDER BY",
+        "wiki_pages.slug",
+        "LIMIT",
+    ):
+        assert fragment in sql
+
+
+@pytest.mark.parametrize("limit", [True, 0, 21])
+def test_dedup_candidate_statement_rejects_invalid_limit(limit: int) -> None:
+    with pytest.raises(ValueError):
+        build_dedup_candidate_statement(
+            SCOPE, TopicCandidate(name="Acme", slug="entity/acme", page_type="entity"), limit=limit
+        )
 
 
 def test_claim_outbox_sql_excludes_sent_and_future_events() -> None:
