@@ -16,6 +16,7 @@ from app.wiki.ingest.map_document import (
 from app.wiki.ingest.schemas import (
     CandidateExtraction,
     CitationBatchOutput,
+    ContributionDelta,
     DedupDecision,
     DedupOutput,
     DedupPageCandidate,
@@ -23,6 +24,7 @@ from app.wiki.ingest.schemas import (
     MapDocumentResult,
     SourceChunk,
     SourceKnowledge,
+    SlugUpdate,
     StoredContributionRecord,
     TopicCandidate,
     WikiIngestConfig,
@@ -250,6 +252,18 @@ def contribution(
         summary=summary,
         aliases=aliases,
         chunk_refs=refs,
+    )
+
+
+def add_delta(slug: str) -> ContributionDelta:
+    current = contribution(slug)
+    return ContributionDelta(
+        pending_op_id=PENDING_OP_ID,
+        action="add",
+        slug=slug,
+        knowledge_id=current.knowledge_id,
+        previous=None,
+        current=current,
     )
 
 
@@ -914,6 +928,71 @@ def test_map_result_rejects_conflicting_terminal_states() -> None:
             skipped_reason="source_inactive",
             superseded=True,
         )
+
+
+def test_map_result_copy_cannot_inject_mutable_updates() -> None:
+    delta = add_delta("entity/acme")
+    result = MapDocumentResult(
+        pending_op_id=PENDING_OP_ID,
+        knowledge_id="knowledge-1",
+        contribution_deltas=(delta,),
+    )
+
+    copied = result.model_copy(update={"updates": []})
+
+    assert [update.slug for update in copied.updates] == ["entity/acme"]
+    assert isinstance(copied.updates, tuple)
+    assert isinstance(copied.updates[0], SlugUpdate)
+    with pytest.raises(AttributeError):
+        copied.updates.append(copied.updates[0])
+    with pytest.raises((ValidationError, FrozenInstanceError)):
+        copied.updates[0].title = "mutated"
+    assert hash(copied) == hash(result)
+
+
+def test_map_result_copy_rederives_updates_from_replaced_deltas() -> None:
+    first = add_delta("entity/first")
+    second = add_delta("entity/second")
+    result = MapDocumentResult(
+        pending_op_id=PENDING_OP_ID,
+        knowledge_id="knowledge-1",
+        contribution_deltas=(first,),
+    )
+
+    copied = result.model_copy(update={"contribution_deltas": (second,)})
+
+    assert [update.slug for update in result.updates] == ["entity/first"]
+    assert [update.slug for update in copied.updates] == ["entity/second"]
+
+
+def test_map_result_serialization_excludes_derived_updates() -> None:
+    result = MapDocumentResult(
+        pending_op_id=PENDING_OP_ID,
+        knowledge_id="knowledge-1",
+        contribution_deltas=(add_delta("entity/acme"),),
+    )
+
+    assert "updates" not in result.model_dump()
+    assert '"updates"' not in result.model_dump_json()
+    with pytest.raises(ValidationError):
+        MapDocumentResult(
+            pending_op_id=PENDING_OP_ID,
+            knowledge_id="knowledge-1",
+            updates=[],
+        )
+
+
+def test_map_result_derived_updates_preserve_hash_and_worker_type_contract() -> None:
+    result = MapDocumentResult(
+        pending_op_id=PENDING_OP_ID,
+        knowledge_id="knowledge-1",
+        contribution_deltas=(add_delta("entity/acme"),),
+    )
+
+    assert isinstance(result.updates, tuple)
+    assert all(isinstance(update, SlugUpdate) for update in result.updates)
+    assert hash(result) == hash(result.model_copy())
+    assert hash(result.updates) == hash(tuple(result.updates))
 
 
 class _ContributionResult:

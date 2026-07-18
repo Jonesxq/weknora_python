@@ -787,28 +787,18 @@ class _LegacyUpdates(tuple):
 
 
 class MapDocumentResult(_FrozenValueModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
-
     pending_op_id: UUID
     knowledge_id: str
     contribution_deltas: tuple[ContributionDelta, ...] = ()
     skipped_reason: str | None = None
     superseded: bool = False
-    # 任务 11 切换 Worker 后移除；它始终由贡献差量派生，不是第二写入源。
-    updates: _LegacyUpdates = Field(
-        default_factory=_LegacyUpdates, exclude=True, repr=False
-    )
 
-    @model_validator(mode="before")
-    @classmethod
-    def derive_legacy_updates(cls, value: object) -> object:
-        if isinstance(value, cls) or not isinstance(value, Mapping):
-            return value
-        data = dict(value)
-        if "updates" in data:
-            raise ValueError("updates 为只读兼容字段")
+    @property
+    def updates(self) -> _LegacyUpdates:
+        """任务 11 切换 Worker 后移除的只读派生视图。"""
+
         updates: list[_FrozenSlugUpdate] = []
-        for raw_delta in data.get("contribution_deltas", ()):
+        for raw_delta in self.contribution_deltas:
             delta = (
                 raw_delta
                 if isinstance(raw_delta, ContributionDelta)
@@ -831,8 +821,7 @@ class MapDocumentResult(_FrozenValueModel):
                     chunk_refs=current.chunk_refs,
                 )
             )
-        data["updates"] = _LegacyUpdates(updates)
-        return data
+        return _LegacyUpdates(updates)
 
     @field_validator("knowledge_id")
     @classmethod
