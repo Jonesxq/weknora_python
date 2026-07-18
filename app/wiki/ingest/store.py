@@ -172,7 +172,7 @@ def _positive_limit(limit: int) -> int:
 
 
 def _dedup_limit(limit: int) -> int:
-    if isinstance(limit, bool) or not 1 <= limit <= 20:
+    if type(limit) is not int or not 1 <= limit <= 20:
         raise ValueError("dedup limit 必须在 1 到 20 之间")
     return limit
 
@@ -185,26 +185,23 @@ def _dedup_names_expression():
 
 
 def build_dedup_candidate_statement(
-    scope: WikiScope, candidate: TopicCandidate, limit: int = 20
+    scope: WikiScope, candidate: TopicCandidate, limit: int = 20, *, query_name: str | None = None
 ) -> Select[tuple[WikiPage]]:
     """构造限定范围的 pg_trgm 候选页查询。"""
     checked_limit = _dedup_limit(limit)
-    names: list[str] = []
-    for value in (candidate.name, *candidate.aliases):
-        normalized = " ".join(value.split()).casefold()
-        if normalized and normalized not in names:
-            names.append(normalized)
+    query = query_name if query_name is not None else candidate.name
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("dedup query_name 不能为空")
     expression = _dedup_names_expression()
-    distances = [expression.op("<->")(name) for name in names]
-    distance = distances[0] if len(distances) == 1 else func.least(*distances)
+    distance = expression.op("<->")(func.lower(query))
     return (
         select(WikiPage)
         .where(
             WikiPage.tenant_id == scope.tenant_id,
             WikiPage.knowledge_base_id == scope.knowledge_base_id,
             WikiPage.deleted_at.is_(None),
-            WikiPage.status == "published",
-            WikiPage.page_type == candidate.page_type,
+            WikiPage.status == literal_column("'published'"),
+            WikiPage.page_type == literal_column(f"'{candidate.page_type}'"),
         )
         .order_by(distance, WikiPage.slug)
         .limit(checked_limit)
@@ -766,12 +763,20 @@ class SqlAlchemyIngestStore:
     async def find_dedup_candidates(
         self, scope: WikiScope, candidate: TopicCandidate, limit: int = 20
     ) -> list[DedupPageCandidate]:
-        statement = build_dedup_candidate_statement(scope, candidate, limit)
+        names: list[str] = []
+        for name in (candidate.name, *candidate.aliases):
+            cleaned = " ".join(name.split())
+            if cleaned and cleaned not in names:
+                names.append(cleaned)
         async with self._session_factory() as session:
-            rows = list((await session.execute(statement)).scalars())
-        if len(rows) > limit:
-            raise InvariantError("dedup 查询返回超过 limit 的候选")
+            rows: list[WikiPage] = []
+            for name in names:
+                found = list((await session.execute(build_dedup_candidate_statement(scope, candidate, limit, query_name=name))).scalars())
+                if len(found) > limit:
+                    raise InvariantError("dedup 查询返回超过 limit 的候选")
+                rows.extend(found)
         snapshots: list[DedupPageCandidate] = []
+        seen: set[str] = set()
         for row in rows:
             if (
                 row.tenant_id != scope.tenant_id
@@ -781,7 +786,11 @@ class SqlAlchemyIngestStore:
                 or row.page_type != candidate.page_type
             ):
                 raise InvariantError("dedup 查询返回越界页面")
-            snapshots.append(_dedup_candidate_record(row))
+            if row.slug not in seen:
+                seen.add(row.slug)
+                snapshots.append(_dedup_candidate_record(row))
+                if len(snapshots) == limit:
+                    break
         return snapshots
 
     async def apply_results(

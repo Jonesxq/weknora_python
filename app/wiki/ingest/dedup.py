@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from typing import Protocol
 from uuid import UUID
@@ -105,28 +106,48 @@ def _exact_target(item: TopicCandidate, record: ExistingPageRecord) -> DedupPage
 
 
 async def deduplicate_candidates(scope: WikiScope, candidates: Sequence[TopicCandidate], store: DedupStorePort, model, *, limit: int = 20) -> tuple[list[TopicCandidate], dict[str, str]]:
-    if isinstance(limit, bool) or not 1 <= limit <= 20:
+    if type(limit) is not int or not 1 <= limit <= 20:
         raise ValueError("dedup limit 必须在 1 到 20 之间")
     originals = [item.model_copy(deep=True) for item in candidates]
-    merged = [_combine(cluster) for cluster in _clusters(originals)]
-    mapping = {item.slug: merged[index].slug for index, cluster in enumerate(_clusters(originals)) for item in cluster}
-    exact = await store.find_existing_pages(scope, [item.slug for item in merged])
+    clusters = _clusters(originals)
+    exact = await store.find_existing_pages(scope, [item.slug for item in originals])
+    exact_targets: dict[str, DedupPageCandidate] = {}
+    for slug, record in exact.items():
+        source = next((item for item in originals if item.slug == slug), None)
+        if source is None:
+            raise WikiValidationError("DEDUP_EXISTING_INVALID", "已有页面不属于请求候选")
+        exact_targets[slug] = _exact_target(source, record)
+    merged: list[TopicCandidate] = []
+    mapping: dict[str, str] = {}
     targets: dict[str, DedupPageCandidate] = {}
     undecided: list[TopicCandidate] = []
-    for item in merged:
-        record = exact.get(item.slug)
-        if record is None:
-            undecided.append(item)
-        else:
-            target = _exact_target(item, record)
+    for cluster in clusters:
+        anchors = {exact_targets[item.slug].slug: exact_targets[item.slug] for item in cluster if item.slug in exact_targets}
+        if len(anchors) > 1:
+            raise WikiValidationError("DEDUP_AMBIGUOUS_EXACT", "同一候选簇命中多个已有页面")
+        item = _combine(cluster)
+        if anchors:
+            target = next(iter(anchors.values()))
             targets[target.slug] = target
-            mapping[item.slug] = target.slug
-    generated = {item.slug for item in originals} - set(targets)
+            item = TopicCandidate(name=target.title, slug=target.slug, page_type=target.page_type, aliases=_unique([*target.aliases, *[v for candidate in cluster for v in (candidate.name, *candidate.aliases)]]), description=item.description, details=item.details)
+            for candidate in cluster:
+                mapping[candidate.slug] = target.slug
+        else:
+            merged.append(item)
+            for candidate in cluster:
+                mapping[candidate.slug] = item.slug
+            undecided.append(item)
+    generated = {item.slug for item in originals} - set(exact_targets)
     requests: list[DedupCandidateRequest] = []
-    for item in undecided:
+    semaphore = asyncio.Semaphore(8)
+    async def query(item: TopicCandidate) -> list[DedupPageCandidate]:
+        async with semaphore:
+            return await store.find_dedup_candidates(scope, item, limit)
+    results = await asyncio.gather(*(query(item) for item in undecided))
+    for item, found_targets in zip(undecided, results, strict=True):
         allowed: list[DedupPageCandidate] = []
         seen: set[str] = set()
-        for target in await store.find_dedup_candidates(scope, item, limit):
+        for target in found_targets:
             if target.slug in seen:
                 continue
             seen.add(target.slug)
@@ -145,10 +166,11 @@ async def deduplicate_candidates(scope: WikiScope, candidates: Sequence[TopicCan
                 mapping[slug] = canonical
     output: list[TopicCandidate] = []
     positions: dict[str, int] = {}
-    for item in merged:
-        final = mapping[item.slug]
+    for cluster in clusters:
+        representative = _combine(cluster)
+        final = mapping[cluster[0].slug]
         target = targets.get(final)
-        current = TopicCandidate(name=target.title, slug=target.slug, page_type=target.page_type, aliases=_unique([*target.aliases, item.name, *item.aliases]), description=item.description, details=item.details) if target else item.model_copy(deep=True)
+        current = TopicCandidate(name=target.title, slug=target.slug, page_type=target.page_type, aliases=_unique([*target.aliases, *[v for c in cluster for v in (c.name, *c.aliases)]]), description=representative.description, details=representative.details) if target else representative.model_copy(deep=True)
         if final in positions:
             old = output[positions[final]]
             output[positions[final]] = TopicCandidate(name=old.name, slug=old.slug, page_type=old.page_type, aliases=_unique([*old.aliases, *current.aliases]), description="\n\n".join(_unique([old.description, current.description])), details="\n\n".join(_unique([old.details, current.details])))
