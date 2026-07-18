@@ -10,6 +10,7 @@ from copy import deepcopy
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import Any, Mapping, Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
@@ -33,9 +34,12 @@ from app.wiki.domain import extract_wiki_links
 from app.wiki.ingest.ports import FinalizationPort
 from app.wiki.ingest.retract import project_active_refs
 from app.wiki.ingest.schemas import (
+    BatchApplyRequest,
     ContributionState,
     DedupPageCandidate,
     FinalizationRequest,
+    OperationFailure,
+    PageExpectation,
     ReducedPage,
     SourceKnowledge,
     StoredContributionRecord,
@@ -44,6 +48,7 @@ from app.wiki.ingest.schemas import (
 from app.wiki.models import (
     TaskOutbox,
     WikiFinalizationMarker,
+    WikiDeadLetter,
     WikiLogEntry,
     WikiLink,
     WikiPage,
@@ -112,6 +117,24 @@ class OutboxEventRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class DeadLetterRecord:
+    """达到重试上限后可在 session 外安全读取的不可变快照。"""
+
+    id: UUID
+    pending_op_id: UUID
+    tenant_id: int
+    knowledge_base_id: UUID
+    knowledge_id: str
+    op: str
+    op_version: str
+    payload: Mapping[str, object]
+    fail_count: int
+    last_error_code: str
+    last_error_summary: str
+    dead_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class ExistingPageRecord:
     """Reduce 前读取的页面身份、版本和内容快照。"""
 
@@ -174,6 +197,10 @@ class IngestStore(Protocol):
         self, scope: WikiScope, ids: Sequence[UUID], claim_token: UUID | None
     ) -> None: ...
 
+    async def release_claim(
+        self, scope: WikiScope, ids: Sequence[UUID], claim_token: UUID
+    ) -> None: ...
+
     async def find_existing_pages(
         self, scope: WikiScope, slugs: Iterable[str]
     ) -> dict[str, ExistingPageRecord]: ...
@@ -193,14 +220,12 @@ class IngestStore(Protocol):
     async def apply_results(
         self,
         scope: WikiScope,
-        claim_token: UUID | None,
-        pages: Sequence[ReducedPage],
-        completed_op_ids: Sequence[UUID],
-        operation_id: UUID,
-        *,
-        failed_op_ids: Sequence[UUID] = (),
-        expected_pages: Mapping[str, ExistingPageRecord | None] | None = None,
+        request: BatchApplyRequest,
     ) -> bool: ...
+
+    async def list_dead_letters(
+        self, scope: WikiScope, *, limit: int = 100
+    ) -> list[DeadLetterRecord]: ...
 
     async def pending_count(self, scope: WikiScope) -> int: ...
 
@@ -226,6 +251,12 @@ def _positive_limit(limit: int) -> int:
 def _dedup_limit(limit: int) -> int:
     if type(limit) is not int or not 1 <= limit <= 20:
         raise ValueError("dedup limit 必须在 1 到 20 之间")
+    return limit
+
+
+def _dead_letter_limit(limit: int) -> int:
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("dead-letter limit 必须在 1 到 100 之间")
     return limit
 
 
@@ -482,6 +513,93 @@ def _snapshot_page(page: ReducedPage) -> ReducedPage:
     )
 
 
+def _safe_dead_letter_payload(
+    payload: dict[str, Any], *, knowledge_id: str
+) -> dict[str, Any]:
+    if type(payload) is not dict or payload.get("knowledge_id") != knowledge_id:
+        raise InvariantError("pending payload 与知识来源不一致")
+    return {"knowledge_id": knowledge_id}
+
+
+def _safe_error_summary(summary: str) -> str:
+    cleaned = " ".join(summary.replace("\r", " ").replace("\n", " ").split())
+    folded = cleaned.casefold()
+    markers = (
+        "traceback",
+        "claim_token",
+        "claim token",
+        "chunk text",
+        "raw chunk",
+        "chunk原文",
+        "model output",
+        "raw output",
+        "模型原始输出",
+    )
+    positions = [folded.find(marker) for marker in markers if marker in folded]
+    if positions:
+        cleaned = cleaned[: min(positions)].strip()
+    return (cleaned or "敏感错误详情已省略")[:2000]
+
+
+def _freeze_json_snapshot(value: Any) -> object:
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {str(key): _freeze_json_snapshot(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_json_snapshot(item) for item in value)
+    return deepcopy(value)
+
+
+def _dead_letter_record(row: WikiDeadLetter) -> DeadLetterRecord:
+    payload = _freeze_json_snapshot(row.payload)
+    if not isinstance(payload, Mapping):
+        raise InvariantError("dead-letter payload 必须是 JSON object")
+    return DeadLetterRecord(
+        id=row.id,
+        pending_op_id=row.pending_op_id,
+        tenant_id=row.tenant_id,
+        knowledge_base_id=row.knowledge_base_id,
+        knowledge_id=row.knowledge_id,
+        op=row.op,
+        op_version=row.op_version,
+        payload=payload,
+        fail_count=row.fail_count,
+        last_error_code=row.last_error_code,
+        last_error_summary=row.last_error_summary,
+        dead_at=row.dead_at,
+    )
+
+
+def _validate_batch_request(request: BatchApplyRequest) -> BatchApplyRequest:
+    if not isinstance(request, BatchApplyRequest):
+        raise InvariantError("结果批次必须是 BatchApplyRequest")
+    try:
+        snapshot = BatchApplyRequest.model_validate(request.model_dump(mode="python"))
+    except (ValidationError, TypeError, ValueError) as exc:
+        raise InvariantError("结果批次未通过完整校验") from exc
+    page_slugs = {page.slug for page in snapshot.pages}
+    expected_slugs = {expectation.slug for expectation in snapshot.expected_pages}
+    if page_slugs != expected_slugs:
+        raise InvariantError("expected_pages 必须完整覆盖 pages slug")
+
+    claimed_ids = {
+        *snapshot.completed_op_ids,
+        *snapshot.superseded_op_ids,
+        *(failure.pending_op_id for failure in snapshot.failures),
+    }
+    active_sources: set[tuple[str, str]] = set()
+    for delta in snapshot.contribution_deltas:
+        if delta.pending_op_id not in claimed_ids:
+            raise InvariantError("贡献 delta pending_op 不属于本批次 claim 集合")
+        if delta.current is not None:
+            active_key = (delta.slug, delta.knowledge_id)
+            if active_key in active_sources:
+                raise InvariantError("同一 slug 和 source 不能产生两个 current active")
+            active_sources.add(active_key)
+    return snapshot
+
+
 def _validate_batch_inputs(
     pages: Sequence[ReducedPage],
     completed_op_ids: Sequence[UUID],
@@ -522,6 +640,50 @@ def _validate_batch_inputs(
     if not completed_ids and not failed_ids and expected:
         raise InvariantError("空结果不能携带 expected_pages")
     return snapshots, completed_ids, failed_ids, expected
+
+
+def _legacy_batch_request(
+    claim_token: UUID | None,
+    pages: Sequence[ReducedPage],
+    completed_op_ids: Sequence[UUID],
+    operation_id: UUID,
+    failed_op_ids: Sequence[UUID],
+    expected_pages: Mapping[str, ExistingPageRecord | None] | None,
+) -> BatchApplyRequest:
+    snapshots, completed_ids, failed_ids, expected = _validate_batch_inputs(
+        pages, completed_op_ids, failed_op_ids, expected_pages
+    )
+    token = (
+        _require_claim_token(claim_token)
+        if completed_ids or failed_ids
+        else claim_token
+    )
+    return _validate_batch_request(
+        BatchApplyRequest(
+            claim_token=token,
+            pages=tuple(snapshots),
+            contribution_deltas=(),
+            completed_op_ids=tuple(completed_ids),
+            superseded_op_ids=(),
+            failures=tuple(
+                OperationFailure(
+                    pending_op_id=op_id,
+                    error_code="LEGACY_WORKER_FAILURE",
+                    error_summary="阶段二 Worker 未提供结构化失败详情",
+                )
+                for op_id in failed_ids
+            ),
+            expected_pages=tuple(
+                PageExpectation(
+                    slug=slug,
+                    page_id=record.page_id if record is not None else None,
+                    version=record.version if record is not None else None,
+                )
+                for slug, record in expected.items()
+            ),
+            operation_id=operation_id,
+        )
+    )
 
 
 async def _enqueue_follow_up(
@@ -1151,6 +1313,58 @@ class SqlAlchemyIngestStore:
                     await _cancel_claim_recovery(session, scope, token)
                 await _enqueue_follow_up(session, scope, token)
 
+    async def release_claim(
+        self, scope: WikiScope, ids: Sequence[UUID], claim_token: UUID
+    ) -> None:
+        pending_ids = list(ids)
+        if not pending_ids:
+            return
+        if len(pending_ids) != len(set(pending_ids)):
+            raise InvariantError("release claim ids 不能重复")
+        token = _require_claim_token(claim_token)
+        async with self._session_factory() as session:
+            async with session.begin():
+                result = await session.execute(
+                    update(WikiPendingOp)
+                    .where(
+                        WikiPendingOp.tenant_id == scope.tenant_id,
+                        WikiPendingOp.knowledge_base_id == scope.knowledge_base_id,
+                        WikiPendingOp.id.in_(pending_ids),
+                        WikiPendingOp.claim_token == token,
+                    )
+                    .values(claimed_at=None, claim_token=None)
+                )
+                if result.rowcount != len(pending_ids):
+                    raise ClaimLost("pending-op claim token、scope 或 ids 不匹配")
+                await session.flush()
+
+    async def list_dead_letters(
+        self, scope: WikiScope, *, limit: int = 100
+    ) -> list[DeadLetterRecord]:
+        checked_limit = _dead_letter_limit(limit)
+        async with self._session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(WikiDeadLetter)
+                        .where(
+                            WikiDeadLetter.tenant_id == scope.tenant_id,
+                            WikiDeadLetter.knowledge_base_id == scope.knowledge_base_id,
+                        )
+                        .order_by(WikiDeadLetter.dead_at, WikiDeadLetter.id)
+                        .limit(checked_limit)
+                    )
+                ).scalars()
+            )
+        records = [_dead_letter_record(row) for row in rows]
+        if any(
+            record.tenant_id != scope.tenant_id
+            or record.knowledge_base_id != scope.knowledge_base_id
+            for record in records
+        ):
+            raise InvariantError("dead-letter 查询返回了越界记录")
+        return records
+
     async def find_existing_pages(
         self, scope: WikiScope, slugs: Iterable[str]
     ) -> dict[str, ExistingPageRecord]:
@@ -1301,30 +1515,48 @@ class SqlAlchemyIngestStore:
     async def apply_results(
         self,
         scope: WikiScope,
-        claim_token: UUID | None,
-        pages: Sequence[ReducedPage],
-        completed_op_ids: Sequence[UUID],
-        operation_id: UUID,
+        request: BatchApplyRequest | UUID | None,
+        pages: Sequence[ReducedPage] | None = None,
+        completed_op_ids: Sequence[UUID] | None = None,
+        operation_id: UUID | None = None,
         *,
         failed_op_ids: Sequence[UUID] = (),
         expected_pages: Mapping[str, ExistingPageRecord | None] | None = None,
     ) -> bool:
-        snapshots, completed_ids, failed_ids, expected = _validate_batch_inputs(
-            pages,
-            completed_op_ids,
-            failed_op_ids,
-            expected_pages,
-        )
-        all_ids = [*completed_ids, *failed_ids]
-        if not all_ids:
-            return False
-        token = _require_claim_token(claim_token)
+        if isinstance(request, BatchApplyRequest):
+            if (
+                pages is not None
+                or completed_op_ids is not None
+                or operation_id is not None
+                or failed_op_ids
+                or expected_pages is not None
+            ):
+                raise TypeError("现代 apply_results 不能混用 legacy 参数")
+            checked = _validate_batch_request(request)
+        else:
+            if pages is None or completed_op_ids is None or operation_id is None:
+                raise TypeError("legacy apply_results 参数不完整")
+            if not completed_op_ids and not failed_op_ids and not pages:
+                return False
+            checked = _legacy_batch_request(
+                request,
+                pages,
+                completed_op_ids,
+                operation_id,
+                failed_op_ids,
+                expected_pages,
+            )
+        return await self._apply_batch_results(scope, checked)
+
+    async def _apply_batch_results(
+        self, scope: WikiScope, request: BatchApplyRequest
+    ) -> bool:
         async with self._session_factory() as session:
             async with session.begin():
                 existing_log = (
                     await session.execute(
                         select(WikiLogEntry).where(
-                            WikiLogEntry.operation_id == operation_id
+                            WikiLogEntry.operation_id == request.operation_id
                         )
                     )
                 ).scalar_one_or_none()
@@ -1335,7 +1567,11 @@ class SqlAlchemyIngestStore:
                     ):
                         raise InvariantError("operation_id 已被其他 scope 使用")
                     return False
-
+                requested_ids = {
+                    *request.completed_op_ids,
+                    *request.superseded_op_ids,
+                    *(failure.pending_op_id for failure in request.failures),
+                }
                 pending_rows = list(
                     (
                         await session.execute(
@@ -1344,18 +1580,79 @@ class SqlAlchemyIngestStore:
                                 WikiPendingOp.tenant_id == scope.tenant_id,
                                 WikiPendingOp.knowledge_base_id
                                 == scope.knowledge_base_id,
-                                WikiPendingOp.claim_token == token,
+                                WikiPendingOp.claim_token == request.claim_token,
                             )
                             .with_for_update()
                         )
                     ).scalars()
                 )
-                if {row.id for row in pending_rows} != set(all_ids):
+                if {row.id for row in pending_rows} != requested_ids:
                     raise ClaimLost("批次必须完整覆盖当前 scope 和 claim 的 pending-op")
                 pending_by_id = {row.id: row for row in pending_rows}
 
-                slugs = [page.slug for page in snapshots]
-                existing_rows = (
+                completed_ingest = [
+                    pending_by_id[op_id]
+                    for op_id in request.completed_op_ids
+                    if pending_by_id[op_id].op == "ingest"
+                ]
+                later_retracts = (
+                    list(
+                        (
+                            await session.execute(
+                                select(WikiPendingOp)
+                                .where(
+                                    WikiPendingOp.tenant_id == scope.tenant_id,
+                                    WikiPendingOp.knowledge_base_id
+                                    == scope.knowledge_base_id,
+                                    WikiPendingOp.op == "retract",
+                                    WikiPendingOp.knowledge_id.in_(
+                                        [row.knowledge_id for row in completed_ingest]
+                                    ),
+                                )
+                                .with_for_update()
+                            )
+                        ).scalars()
+                    )
+                    if completed_ingest
+                    else []
+                )
+                auto_superseded = {
+                    ingest.id
+                    for ingest in completed_ingest
+                    if any(
+                        retract.knowledge_id == ingest.knowledge_id
+                        and retract.enqueued_at > ingest.enqueued_at
+                        for retract in later_retracts
+                    )
+                }
+                superseded_ids = {
+                    *request.superseded_op_ids,
+                    *auto_superseded,
+                }
+                completed_ids = [
+                    op_id
+                    for op_id in request.completed_op_ids
+                    if op_id not in superseded_ids
+                ]
+                terminal_ids = [*completed_ids, *superseded_ids]
+
+                superseded_slugs = {
+                    delta.slug
+                    for delta in request.contribution_deltas
+                    if delta.pending_op_id in superseded_ids
+                }
+                pages = [
+                    page
+                    for page in request.pages
+                    if page.slug not in superseded_slugs
+                    and not (set(page.contributor_op_ids) & superseded_ids)
+                ]
+                expected_by_slug = {
+                    expectation.slug: expectation
+                    for expectation in request.expected_pages
+                }
+                slugs = [page.slug for page in pages]
+                page_rows = (
                     list(
                         (
                             await session.execute(
@@ -1365,7 +1662,11 @@ class SqlAlchemyIngestStore:
                                     WikiPage.knowledge_base_id
                                     == scope.knowledge_base_id,
                                     WikiPage.slug.in_(slugs),
-                                    WikiPage.deleted_at.is_(None),
+                                )
+                                .order_by(
+                                    WikiPage.slug,
+                                    WikiPage.deleted_at.desc().nulls_last(),
+                                    WikiPage.id,
                                 )
                                 .with_for_update()
                             )
@@ -1374,58 +1675,157 @@ class SqlAlchemyIngestStore:
                     if slugs
                     else []
                 )
-                existing_by_slug = {row.slug: row for row in existing_rows}
-                persisted: list[tuple[WikiPage, ReducedPage]] = []
-                for reduced in snapshots:
-                    row = existing_by_slug.get(reduced.slug)
-                    expected_record = expected[reduced.slug]
-                    if expected_record is None:
-                        if row is not None:
-                            raise PageConflict("期望新建的页面已经存在")
+                rows_by_slug: dict[str, list[WikiPage]] = {}
+                for row in page_rows:
+                    if (
+                        row.tenant_id != scope.tenant_id
+                        or row.knowledge_base_id != scope.knowledge_base_id
+                    ):
+                        raise InvariantError("页面锁查询返回了越界记录")
+                    rows_by_slug.setdefault(row.slug, []).append(row)
+
+                selected_pages: list[tuple[WikiPage | None, object]] = []
+                for reduced in pages:
+                    candidates = rows_by_slug.get(reduced.slug, [])
+                    active = [row for row in candidates if row.deleted_at is None]
+                    if len(active) > 1:
+                        raise InvariantError("同一 scope 和 slug 存在多个活跃页面")
+                    expectation = expected_by_slug[reduced.slug]
+                    if expectation.page_id is None:
+                        if active:
+                            raise PageConflict("期望不存在的页面已经出现")
+                        row = (
+                            candidates[0]
+                            if candidates and not reduced.deleted
+                            else None
+                        )
                     else:
-                        if not isinstance(expected_record, ExistingPageRecord):
-                            raise InvariantError("expected_pages 快照类型无效")
+                        row = active[0] if active else None
                         if (
-                            expected_record.page.slug != reduced.slug
-                            or row is None
-                            or row.id != expected_record.page_id
-                            or row.version != expected_record.version
+                            row is None
+                            or row.id != expectation.page_id
+                            or row.version != expectation.version
                         ):
                             raise PageConflict("页面身份或版本已在模型计算期间变化")
                     if row is not None and row.page_type != reduced.page_type:
                         raise PageConflict("已有页面类型与结果 slug 类型不一致")
-                    values: dict[str, Any] = {
-                        "title": reduced.title,
-                        "page_type": reduced.page_type,
-                        "content": reduced.content,
-                        "summary": reduced.summary,
-                        "aliases": list(reduced.aliases),
-                        "source_refs": list(reduced.source_refs),
-                        "chunk_refs": list(reduced.chunk_refs),
-                        "status": "published",
-                    }
+                    selected_pages.append((row, reduced))
+
+                active_deltas = [
+                    delta
+                    for delta in request.contribution_deltas
+                    if delta.pending_op_id in completed_ids
+                ]
+                deleted_contributions = False
+                for delta in active_deltas:
+                    pending = pending_by_id[delta.pending_op_id]
+                    if pending.knowledge_id != delta.knowledge_id:
+                        raise InvariantError("贡献 delta 与 pending 来源不一致")
+                    records = [
+                        record
+                        for record in (delta.previous, delta.current)
+                        if record is not None
+                    ]
+                    if any(
+                        record.tenant_id != scope.tenant_id
+                        or record.knowledge_base_id != scope.knowledge_base_id
+                        for record in records
+                    ):
+                        raise InvariantError("贡献 delta 越出当前 scope")
+                    if delta.previous is not None:
+                        previous = delta.previous
+                        statement = delete(WikiPageContribution).where(
+                            WikiPageContribution.tenant_id == scope.tenant_id,
+                            WikiPageContribution.knowledge_base_id
+                            == scope.knowledge_base_id,
+                            WikiPageContribution.slug == previous.slug,
+                            WikiPageContribution.knowledge_id == previous.knowledge_id,
+                            WikiPageContribution.op_version == previous.op_version,
+                            WikiPageContribution.state == previous.state,
+                        )
+                        if previous.id is not None:
+                            statement = statement.where(
+                                WikiPageContribution.id == previous.id
+                            )
+                        result = await session.execute(statement)
+                        if result.rowcount != 1:
+                            raise InvariantError("previous contribution 已变化或不存在")
+                        deleted_contributions = True
+                if deleted_contributions:
+                    await session.flush()
+
+                for delta in active_deltas:
+                    current = delta.current
+                    if current is None:
+                        continue
+                    pending = pending_by_id[delta.pending_op_id]
+                    if current.op_version != pending.op_version:
+                        raise InvariantError(
+                            "current contribution 版本与 pending 不一致"
+                        )
+                    session.add(
+                        WikiPageContribution(
+                            tenant_id=scope.tenant_id,
+                            knowledge_base_id=scope.knowledge_base_id,
+                            slug=current.slug,
+                            knowledge_id=current.knowledge_id,
+                            op_version=current.op_version,
+                            page_type=current.page_type,
+                            state="active",
+                            title=current.title,
+                            content=current.content,
+                            summary=current.summary,
+                            aliases=list(current.aliases),
+                            chunk_refs=list(current.chunk_refs),
+                        )
+                    )
+                if any(delta.current is not None for delta in active_deltas):
+                    try:
+                        await session.flush()
+                    except IntegrityError as exc:
+                        raise InvariantError(
+                            "current active contribution 唯一性冲突"
+                        ) from exc
+
+                now = datetime.now(UTC)
+                persisted: list[tuple[WikiPage, object]] = []
+                for row, reduced in selected_pages:
                     if row is None:
+                        if reduced.deleted:
+                            continue
                         row = WikiPage(
                             tenant_id=scope.tenant_id,
                             knowledge_base_id=scope.knowledge_base_id,
                             slug=reduced.slug,
-                            status="draft",
-                            version=1,
                             title=reduced.title,
                             page_type=reduced.page_type,
+                            status="published",
                             content=reduced.content,
                             summary=reduced.summary,
                             aliases=list(reduced.aliases),
                             source_refs=list(reduced.source_refs),
                             chunk_refs=list(reduced.chunk_refs),
                             wiki_path=f"/{reduced.slug}",
+                            version=1,
                         )
                         session.add(row)
                     else:
-                        changed = any(
-                            getattr(row, key) != value for key, value in values.items()
+                        target_deleted_at = (
+                            row.deleted_at or now if reduced.deleted else None
                         )
-                        if changed:
+                        values = {
+                            "title": reduced.title,
+                            "content": reduced.content,
+                            "summary": reduced.summary,
+                            "aliases": list(reduced.aliases),
+                            "source_refs": list(reduced.source_refs),
+                            "chunk_refs": list(reduced.chunk_refs),
+                            "status": "published",
+                            "deleted_at": target_deleted_at,
+                        }
+                        if any(
+                            getattr(row, key) != value for key, value in values.items()
+                        ):
                             row.version += 1
                         for key, value in values.items():
                             setattr(row, key, value)
@@ -1437,62 +1837,133 @@ class SqlAlchemyIngestStore:
 
                 page_store = SqlAlchemyPageStore(session)
                 for row, reduced in persisted:
-                    await page_store.replace_page_links(
-                        scope, row, extract_wiki_links(reduced.content)
+                    targets = (
+                        [] if reduced.deleted else extract_wiki_links(reduced.content)
                     )
-                for row, _ in persisted:
-                    await session.execute(
-                        build_link_backfill_statement(scope, row.slug, row.id)
-                    )
-                for row, _ in persisted:
-                    row.status = "published"
+                    await page_store.replace_page_links(scope, row, targets)
+                    if reduced.deleted:
+                        await session.execute(
+                            update(WikiLink)
+                            .where(
+                                WikiLink.tenant_id == scope.tenant_id,
+                                WikiLink.knowledge_base_id == scope.knowledge_base_id,
+                                WikiLink.target_page_id == row.id,
+                            )
+                            .values(target_page_id=None)
+                        )
+                    else:
+                        await session.execute(
+                            build_link_backfill_statement(scope, row.slug, row.id)
+                        )
 
+                op_kinds = {row.op for row in pending_rows}
+                action = (
+                    "wiki_ingest_batch"
+                    if op_kinds == {"ingest"}
+                    else "wiki_retract_batch"
+                    if op_kinds == {"retract"}
+                    else "wiki_incremental_batch"
+                )
                 session.add(
                     WikiLogEntry(
                         tenant_id=scope.tenant_id,
                         knowledge_base_id=scope.knowledge_base_id,
-                        operation_id=operation_id,
-                        action="wiki_ingest_batch",
+                        operation_id=request.operation_id,
+                        action=action,
                         message=(
-                            f"完成 {len(completed_ids)} 个 Wiki 摄取操作，"
-                            f"释放 {len(failed_ids)} 个失败操作"
+                            f"完成 {len(completed_ids)} 个 Wiki 操作，"
+                            f"跳过 {len(superseded_ids)} 个过期操作"
                         ),
                         pages_affected=[
-                            {"slug": page.slug, "title": page.title}
-                            for page in snapshots
+                            {"slug": page.slug, "title": page.title} for page in pages
                         ],
                         actor_id=scope.actor_id,
                     )
                 )
-                for op_id in completed_ids:
+
+                for op_id in terminal_ids:
                     pending = pending_by_id[op_id]
                     released = await self._finalization.release(
                         session,
-                        FinalizationRequest(
-                            tenant_id=scope.tenant_id,
-                            knowledge_base_id=scope.knowledge_base_id,
-                            knowledge_id=pending.knowledge_id,
-                            attempt=pending.op_version,
+                        _finalization_request(
+                            scope,
+                            pending.knowledge_id,
+                            pending.op_version,
+                            pending.op,
                         ),
                     )
                     if not released:
                         raise InvariantError("finalization marker 不存在或已被释放")
-                deleted = await session.execute(
-                    delete(WikiPendingOp).where(
-                        WikiPendingOp.tenant_id == scope.tenant_id,
-                        WikiPendingOp.knowledge_base_id == scope.knowledge_base_id,
-                        WikiPendingOp.id.in_(completed_ids),
-                        WikiPendingOp.claim_token == token,
+                if terminal_ids:
+                    deleted = await session.execute(
+                        delete(WikiPendingOp).where(
+                            WikiPendingOp.tenant_id == scope.tenant_id,
+                            WikiPendingOp.knowledge_base_id == scope.knowledge_base_id,
+                            WikiPendingOp.id.in_(terminal_ids),
+                            WikiPendingOp.claim_token == request.claim_token,
+                        )
                     )
-                )
-                if deleted.rowcount != len(completed_ids):
-                    raise ClaimLost("完成操作的 claim 已失效")
-                for op_id in failed_ids:
-                    pending = pending_by_id[op_id]
-                    pending.fail_count += 1
+                    if deleted.rowcount != len(terminal_ids):
+                        raise ClaimLost("完成操作的 claim 已失效")
+
+                for failure in request.failures:
+                    pending = pending_by_id[failure.pending_op_id]
+                    next_fail_count = pending.fail_count + 1
+                    if next_fail_count >= 5:
+                        await session.execute(
+                            postgresql.insert(WikiDeadLetter)
+                            .values(
+                                id=uuid4(),
+                                pending_op_id=pending.id,
+                                tenant_id=scope.tenant_id,
+                                knowledge_base_id=scope.knowledge_base_id,
+                                knowledge_id=pending.knowledge_id,
+                                op=pending.op,
+                                op_version=pending.op_version,
+                                payload=_safe_dead_letter_payload(
+                                    pending.payload,
+                                    knowledge_id=pending.knowledge_id,
+                                ),
+                                fail_count=next_fail_count,
+                                last_error_code=failure.error_code.strip()[:128],
+                                last_error_summary=_safe_error_summary(
+                                    failure.error_summary
+                                ),
+                            )
+                            .on_conflict_do_nothing(
+                                constraint="uq_wiki_dead_letters_pending_op"
+                            )
+                        )
+                        released = await self._finalization.release(
+                            session,
+                            _finalization_request(
+                                scope,
+                                pending.knowledge_id,
+                                pending.op_version,
+                                pending.op,
+                            ),
+                        )
+                        if not released:
+                            raise InvariantError(
+                                "dead-letter finalization marker 不存在或已被释放"
+                            )
+                        deleted = await session.execute(
+                            delete(WikiPendingOp).where(
+                                WikiPendingOp.tenant_id == scope.tenant_id,
+                                WikiPendingOp.knowledge_base_id
+                                == scope.knowledge_base_id,
+                                WikiPendingOp.id == pending.id,
+                                WikiPendingOp.claim_token == request.claim_token,
+                            )
+                        )
+                        if deleted.rowcount != 1:
+                            raise ClaimLost("dead-letter 操作的 claim 已失效")
+                        continue
+                    pending.fail_count = next_fail_count
                     pending.claimed_at = None
                     pending.claim_token = None
-                await _cancel_claim_recovery(session, scope, token)
+
+                await _cancel_claim_recovery(session, scope, request.claim_token)
                 remaining = int(
                     (
                         await session.execute(
@@ -1505,7 +1976,7 @@ class SqlAlchemyIngestStore:
                     ).scalar_one()
                 )
                 if remaining:
-                    await _enqueue_follow_up(session, scope, operation_id)
+                    await _enqueue_follow_up(session, scope, request.operation_id)
                 await session.flush()
                 return True
 

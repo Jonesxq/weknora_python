@@ -11,7 +11,16 @@ from pydantic import ValidationError
 from sqlalchemy.dialects import postgresql
 
 from app.wiki.ingest import store as ingest_store
-from app.wiki.ingest.schemas import FinalizationRequest, ReducedPage, SourceKnowledge
+from app.wiki.ingest.schemas import (
+    BatchApplyRequest,
+    ContributionDelta,
+    FinalizationRequest,
+    OperationFailure,
+    PageExpectation,
+    ReducedPage,
+    SourceKnowledge,
+    StoredContributionRecord,
+)
 from app.wiki.ingest.store import (
     ClaimLost,
     EnqueueRecord,
@@ -32,13 +41,235 @@ from app.wiki.ingest.store import (
     build_dedup_candidate_statement,
 )
 from app.wiki.ingest.schemas import TopicCandidate
-from app.wiki.models import TaskOutbox, WikiPage, WikiPageContribution, WikiPendingOp
+from app.wiki.models import (
+    TaskOutbox,
+    WikiLogEntry,
+    WikiDeadLetter,
+    WikiPage,
+    WikiPageContribution,
+    WikiPendingOp,
+)
 from app.wiki.scope import WikiScope
 
 
 KB_ID = UUID("11111111-1111-1111-1111-111111111111")
 SCOPE = WikiScope(tenant_id=7, knowledge_base_id=KB_ID, actor_id="worker")
 NOW = datetime(2026, 7, 15, 12, tzinfo=UTC)
+
+
+def _batch_request(**updates) -> BatchApplyRequest:
+    values = {
+        "claim_token": uuid4(),
+        "pages": (),
+        "contribution_deltas": (),
+        "completed_op_ids": (uuid4(),),
+        "superseded_op_ids": (),
+        "failures": (),
+        "expected_pages": (),
+        "operation_id": uuid4(),
+    }
+    values.update(updates)
+    return BatchApplyRequest(**values)
+
+
+def test_validate_batch_request_returns_an_immutable_snapshot() -> None:
+    validator = getattr(ingest_store, "_validate_batch_request", None)
+    assert validator is not None
+    request = _batch_request()
+
+    assert validator(request) == request
+
+
+def _stored_contribution(
+    *, knowledge_id: str = "knowledge-1", version: str = "version-1"
+) -> StoredContributionRecord:
+    return StoredContributionRecord(
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        slug="entity/acme",
+        knowledge_id=knowledge_id,
+        op_version=version,
+        page_type="entity",
+        state="active",
+        title="Acme",
+        content="正文",
+        summary="摘要",
+    )
+
+
+def _result_page() -> ReducedPage:
+    return ReducedPage(
+        slug="entity/acme",
+        title="Acme",
+        page_type="entity",
+        content="正文",
+        summary="摘要",
+    )
+
+
+def test_validate_batch_request_requires_matching_page_expectation_slugs() -> None:
+    request = _batch_request(pages=(_result_page(),), expected_pages=())
+
+    with pytest.raises(InvariantError, match="expected_pages"):
+        ingest_store._validate_batch_request(request)
+
+
+def test_validate_batch_request_rejects_delta_outside_terminal_claim_set() -> None:
+    current = _stored_contribution()
+    request = _batch_request(
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=uuid4(),
+                action="add",
+                slug=current.slug,
+                knowledge_id=current.knowledge_id,
+                previous=None,
+                current=current,
+            ),
+        )
+    )
+
+    with pytest.raises(InvariantError, match="pending_op"):
+        ingest_store._validate_batch_request(request)
+
+
+def test_validate_batch_request_rejects_two_current_active_source_versions() -> None:
+    first_id, second_id = uuid4(), uuid4()
+    first = _stored_contribution(version="version-1")
+    second = _stored_contribution(version="version-2")
+    request = _batch_request(
+        completed_op_ids=(first_id, second_id),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=first_id,
+                action="add",
+                slug=first.slug,
+                knowledge_id=first.knowledge_id,
+                previous=None,
+                current=first,
+            ),
+            ContributionDelta(
+                pending_op_id=second_id,
+                action="add",
+                slug=second.slug,
+                knowledge_id=second.knowledge_id,
+                previous=None,
+                current=second,
+            ),
+        ),
+    )
+
+    with pytest.raises(InvariantError, match="current active"):
+        ingest_store._validate_batch_request(request)
+
+
+@pytest.mark.asyncio
+async def test_modern_apply_results_returns_idempotent_noop_for_same_scope_log() -> (
+    None
+):
+    operation_id = uuid4()
+    existing_log = WikiLogEntry(
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        operation_id=operation_id,
+        action="wiki_ingest_batch",
+        message="已完成",
+        pages_affected=[],
+        actor_id=SCOPE.actor_id,
+    )
+
+    class Result:
+        def scalar_one_or_none(self):
+            return existing_log
+
+    class Session:
+        def __init__(self) -> None:
+            self.begin_count = 0
+            self.execute_count = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def begin(self):
+            self.begin_count += 1
+            return self
+
+        async def execute(self, _statement):
+            self.execute_count += 1
+            return Result()
+
+    session = Session()
+    store = SqlAlchemyIngestStore(lambda: session, SqlFinalizationPort())  # type: ignore[arg-type]
+    request = _batch_request(operation_id=operation_id)
+
+    assert await store.apply_results(SCOPE, request) is False  # type: ignore[call-arg]
+    assert session.begin_count == 1
+    assert session.execute_count == 1
+
+
+@pytest.mark.asyncio
+async def test_modern_apply_results_rejects_an_incompletely_covered_claim() -> None:
+    token = uuid4()
+    requested_id, extra_id = uuid4(), uuid4()
+    pending_rows = [
+        WikiPendingOp(
+            id=op_id,
+            tenant_id=SCOPE.tenant_id,
+            knowledge_base_id=SCOPE.knowledge_base_id,
+            knowledge_id=f"knowledge-{index}",
+            op="ingest",
+            op_version="version-1",
+            payload={"knowledge_id": f"knowledge-{index}"},
+            fail_count=0,
+            enqueued_at=NOW,
+            claimed_at=NOW,
+            claim_token=token,
+        )
+        for index, op_id in enumerate((requested_id, extra_id), start=1)
+    ]
+
+    class Result:
+        def __init__(self, *, scalar=None, rows=()) -> None:
+            self.scalar = scalar
+            self.rows = list(rows)
+
+        def scalar_one_or_none(self):
+            return self.scalar
+
+        def scalars(self):
+            return self.rows
+
+    class Session:
+        def __init__(self) -> None:
+            self.statements = []
+            self.results = [Result(), Result(rows=pending_rows)]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def begin(self):
+            return self
+
+        async def execute(self, statement):
+            self.statements.append(statement)
+            return self.results.pop(0)
+
+    session = Session()
+    store = SqlAlchemyIngestStore(lambda: session, SqlFinalizationPort())  # type: ignore[arg-type]
+    request = _batch_request(
+        claim_token=token,
+        completed_op_ids=(requested_id,),
+    )
+
+    with pytest.raises(ClaimLost, match="完整覆盖"):
+        await store.apply_results(SCOPE, request)
+    assert "FOR UPDATE" in _sql(session.statements[1])
 
 
 def _sql(statement) -> str:
@@ -661,15 +892,22 @@ async def test_result_pages_require_completed_contributors(
 
 
 class _ScriptedResult:
-    def __init__(self, *, rows=(), scalar=None) -> None:
+    def __init__(self, *, rows=(), scalar=None, rowcount: int | None = None) -> None:
         self._rows = list(rows)
         self._scalar = scalar
+        self.rowcount = rowcount
 
     def scalars(self):
         return list(self._rows)
 
     def scalar_one_or_none(self):
         return self._scalar
+
+    def scalar_one(self):
+        return self._scalar
+
+    def all(self):
+        return list(self._rows)
 
 
 class _ScriptedSession:
@@ -678,6 +916,7 @@ class _ScriptedSession:
         self.statements = []
         self.events = events if events is not None else []
         self.rolled_back = False
+        self.added = []
 
     async def __aenter__(self):
         return self
@@ -706,6 +945,14 @@ class _ScriptedSession:
     async def flush(self) -> None:
         self.events.append("FLUSH")
         return None
+
+    def add(self, value) -> None:
+        self.added.append(value)
+        self.events.append(f"ADD:{type(value).__name__}")
+
+    def add_all(self, values) -> None:
+        for value in values:
+            self.add(value)
 
 
 class _OneSessionFactory:
@@ -835,6 +1082,567 @@ def _knowledge(version: str = "version-2") -> SourceKnowledge:
         knowledge_base_id=SCOPE.knowledge_base_id,
         title="Document",
         op_version=version,
+    )
+
+
+@pytest.mark.asyncio
+async def test_modern_apply_results_atomically_replaces_contribution_and_page() -> None:
+    token = uuid4()
+    pending = _pending(claimed=True)
+    pending.claim_token = token
+    old = _contribution(knowledge_id=pending.knowledge_id)
+    page = _page(sources=[pending.knowledge_id], chunks=["chunk:old"])
+    previous = _stored_contribution().model_copy(update={"id": old.id})
+    current = _stored_contribution(version=pending.op_version).model_copy(
+        update={
+            "content": "新贡献正文",
+            "summary": "新贡献摘要",
+            "chunk_refs": ("chunk:new",),
+        }
+    )
+    reduced = ReducedPage(
+        slug=page.slug,
+        title="新标题",
+        page_type="entity",
+        content="新聚合正文",
+        summary="新聚合摘要",
+        aliases=["New alias"],
+        source_refs=[pending.knowledge_id],
+        chunk_refs=["chunk:new"],
+        contributor_op_ids=[pending.id],
+    )
+    request = _batch_request(
+        claim_token=token,
+        pages=(reduced,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="replace",
+                slug=page.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=previous,
+                current=current,
+            ),
+        ),
+        completed_op_ids=(pending.id,),
+        expected_pages=(
+            PageExpectation(slug=page.slug, page_id=page.id, version=page.version),
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[page]),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(),
+            _ScriptedResult(),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=0),
+        ]
+    )
+    finalization = _RecordingFinalization(session.events)
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
+
+    assert await store.apply_results(SCOPE, request) is True
+
+    inserted = [
+        item for item in session.added if isinstance(item, WikiPageContribution)
+    ]
+    logs = [item for item in session.added if isinstance(item, WikiLogEntry)]
+    assert len(inserted) == 1
+    assert inserted[0].op_version == pending.op_version
+    assert inserted[0].state == "active"
+    assert page.version == 5
+    assert page.title == "新标题" and page.content == "新聚合正文"
+    assert page.source_refs == [pending.knowledge_id]
+    assert page.chunk_refs == ["chunk:new"]
+    assert len(logs) == 1 and logs[0].action == "wiki_ingest_batch"
+    assert [(kind, item.subtask_name) for kind, item in finalization.requests] == [
+        ("release", "wiki")
+    ]
+    contribution_delete = next(
+        statement
+        for statement in session.statements
+        if _sql(statement).startswith("DELETE FROM wiki_page_contributions")
+    )
+    assert "wiki_page_contributions.state" in _sql(contribution_delete)
+
+
+@pytest.mark.asyncio
+async def test_modern_apply_results_keeps_the_fourth_failure_pending() -> None:
+    token = uuid4()
+    pending = _pending(claimed=True)
+    pending.claim_token = token
+    pending.fail_count = 3
+    request = _batch_request(
+        claim_token=token,
+        completed_op_ids=(),
+        failures=(
+            OperationFailure(
+                pending_op_id=pending.id,
+                error_code="MODEL_TEMPORARY",
+                error_summary="模型暂时不可用",
+            ),
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=1),
+            _ScriptedResult(),
+        ]
+    )
+    finalization = _RecordingFinalization(session.events)
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
+
+    assert await store.apply_results(SCOPE, request) is True
+
+    assert pending.fail_count == 4
+    assert pending.claimed_at is None and pending.claim_token is None
+    assert finalization.requests == []
+    assert not any(type(item).__name__ == "WikiDeadLetter" for item in session.added)
+
+
+@pytest.mark.asyncio
+async def test_modern_apply_results_moves_the_fifth_failure_to_dead_letter() -> None:
+    token = uuid4()
+    pending = _pending(claimed=True)
+    pending.claim_token = token
+    pending.fail_count = 4
+    pending.payload = {
+        "knowledge_id": pending.knowledge_id,
+        "safe": {"attempt": 5},
+        "claim_token": str(token),
+        "traceback": "Traceback secret",
+        "chunk_text": "chunk raw text",
+        "nested": {"model_output": "raw output", "kept": True},
+    }
+    request = _batch_request(
+        claim_token=token,
+        completed_op_ids=(),
+        failures=(
+            OperationFailure(
+                pending_op_id=pending.id,
+                error_code="MODEL_PERMANENT",
+                error_summary=" 模型失败\r\n  Traceback raw stack ",
+            ),
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=0),
+        ]
+    )
+    finalization = _RecordingFinalization(session.events)
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
+
+    assert await store.apply_results(SCOPE, request) is True
+
+    dead_insert = next(
+        statement
+        for statement in session.statements
+        if _sql(statement).startswith("INSERT INTO wiki_dead_letters")
+    )
+    dead_sql = _sql(dead_insert)
+    params = dead_insert.compile(dialect=postgresql.dialect()).params
+    assert (
+        "ON CONFLICT ON CONSTRAINT uq_wiki_dead_letters_pending_op DO NOTHING"
+        in dead_sql
+    )
+    assert params["fail_count"] == 5
+    assert params["last_error_code"] == "MODEL_PERMANENT"
+    assert params["last_error_summary"] == "模型失败"
+    assert params["payload"] == {"knowledge_id": pending.knowledge_id}
+    assert [(kind, item.subtask_name) for kind, item in finalization.requests] == [
+        ("release", "wiki")
+    ]
+    pending_delete = next(
+        statement
+        for statement in session.statements
+        if _sql(statement).startswith("DELETE FROM wiki_pending_ops")
+    )
+    assert "wiki_pending_ops.claim_token" in _sql(pending_delete)
+
+
+@pytest.mark.asyncio
+async def test_list_dead_letters_returns_scoped_immutable_snapshots() -> None:
+    rows = [
+        WikiDeadLetter(
+            id=uuid4(),
+            pending_op_id=uuid4(),
+            tenant_id=SCOPE.tenant_id,
+            knowledge_base_id=SCOPE.knowledge_base_id,
+            knowledge_id=f"knowledge-{index}",
+            op="ingest",
+            op_version="version-1",
+            payload={"nested": {"attempt": index}},
+            fail_count=5,
+            last_error_code="MODEL_PERMANENT",
+            last_error_summary="重试耗尽",
+            dead_at=NOW + timedelta(seconds=index),
+        )
+        for index in (1, 2)
+    ]
+
+    class Rows:
+        def scalars(self):
+            return rows
+
+    class Session:
+        def __init__(self) -> None:
+            self.statement = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, statement):
+            self.statement = statement
+            return Rows()
+
+    session = Session()
+    store = SqlAlchemyIngestStore(lambda: session, SqlFinalizationPort())  # type: ignore[arg-type]
+
+    records = await store.list_dead_letters(SCOPE, limit=2)  # type: ignore[attr-defined]
+
+    assert [record.id for record in records] == [row.id for row in rows]
+    rows[0].payload["nested"]["attempt"] = 99
+    assert records[0].payload["nested"]["attempt"] == 1  # type: ignore[index]
+    with pytest.raises(FrozenInstanceError):
+        records[0].fail_count = 6  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        records[0].payload["new"] = True  # type: ignore[index]
+    sql = _sql(session.statement)
+    assert "wiki_dead_letters.tenant_id" in sql
+    assert "wiki_dead_letters.knowledge_base_id" in sql
+    assert "ORDER BY wiki_dead_letters.dead_at, wiki_dead_letters.id" in sql
+    assert "LIMIT" in sql
+
+
+@pytest.mark.asyncio
+async def test_release_claim_only_clears_the_owned_scoped_claim() -> None:
+    token = uuid4()
+    op_ids = [uuid4(), uuid4()]
+    session = _ScriptedSession([_ScriptedResult(rowcount=2)])
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), SqlFinalizationPort())  # type: ignore[arg-type]
+
+    await store.release_claim(SCOPE, op_ids, token)  # type: ignore[attr-defined]
+
+    assert len(session.statements) == 1
+    statement = session.statements[0]
+    sql = _sql(statement)
+    assert sql.startswith("UPDATE wiki_pending_ops")
+    assert "wiki_pending_ops.tenant_id" in sql
+    assert "wiki_pending_ops.knowledge_base_id" in sql
+    assert "wiki_pending_ops.id IN" in sql
+    assert "wiki_pending_ops.claim_token" in sql
+    assert "fail_count" not in sql
+    params = statement.compile(dialect=postgresql.dialect()).params
+    assert params["claimed_at"] is None
+    assert params["claim_token"] is None
+
+
+@pytest.mark.asyncio
+async def test_later_retract_supersedes_ingest_without_writing_its_slug() -> None:
+    token = uuid4()
+    ingest = _pending(claimed=True)
+    ingest.claim_token = token
+    retract = _pending(
+        knowledge_id=ingest.knowledge_id,
+        op="retract",
+        version="delete-1",
+    )
+    retract.enqueued_at = NOW + timedelta(seconds=1)
+    current = _stored_contribution(version=ingest.op_version)
+    page = _result_page()
+    request = _batch_request(
+        claim_token=token,
+        pages=(page,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=ingest.id,
+                action="add",
+                slug=current.slug,
+                knowledge_id=current.knowledge_id,
+                previous=None,
+                current=current,
+            ),
+        ),
+        completed_op_ids=(ingest.id,),
+        expected_pages=(PageExpectation(slug=page.slug),),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[ingest]),
+            _ScriptedResult(rows=[retract]),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=1),
+            _ScriptedResult(),
+        ]
+    )
+    finalization = _RecordingFinalization(session.events)
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
+
+    assert await store.apply_results(SCOPE, request) is True
+
+    assert not any(
+        isinstance(item, (WikiPage, WikiPageContribution)) for item in session.added
+    )
+    assert ingest.fail_count == 0
+    assert [(kind, item.subtask_name) for kind, item in finalization.requests] == [
+        ("release", "wiki")
+    ]
+    log = next(item for item in session.added if isinstance(item, WikiLogEntry))
+    assert "跳过 1" in log.message
+
+
+@pytest.mark.asyncio
+async def test_modern_retract_soft_deletes_page_and_clears_visible_links() -> None:
+    token = uuid4()
+    pending = _pending(op="retract", version="delete-1", claimed=True)
+    pending.claim_token = token
+    contribution = _contribution(knowledge_id=pending.knowledge_id)
+    contribution.state = "retract_pending"
+    previous = _stored_contribution().model_copy(
+        update={"id": contribution.id, "state": "retract_pending"}
+    )
+    page = _page(sources=[pending.knowledge_id], chunks=["chunk:knowledge-1"])
+    reduced = ReducedPage(
+        slug=page.slug,
+        title=page.title,
+        page_type="entity",
+        content=page.content,
+        summary=page.summary,
+        aliases=page.aliases,
+        contributor_op_ids=[pending.id],
+        deleted=True,
+    )
+    request = _batch_request(
+        claim_token=token,
+        pages=(reduced,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="retract",
+                slug=page.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=previous,
+                current=None,
+            ),
+        ),
+        completed_op_ids=(pending.id,),
+        expected_pages=(
+            PageExpectation(slug=page.slug, page_id=page.id, version=page.version),
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[page]),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(),
+            _ScriptedResult(),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=0),
+        ]
+    )
+    finalization = _RecordingFinalization(session.events)
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
+
+    assert await store.apply_results(SCOPE, request) is True
+
+    assert page.deleted_at is not None
+    assert page.source_refs == [] and page.chunk_refs == []
+    assert page.version == 5
+    link_sql = [
+        _sql(statement)
+        for statement in session.statements
+        if "wiki_links" in _sql(statement)
+    ]
+    assert link_sql[0].startswith("DELETE FROM wiki_links")
+    assert link_sql[1].startswith("UPDATE wiki_links")
+    log = next(item for item in session.added if isinstance(item, WikiLogEntry))
+    assert log.action == "wiki_retract_batch"
+    assert [(kind, item.subtask_name) for kind, item in finalization.requests] == [
+        ("release", "wiki-retract")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_modern_operation_id_reuse_across_scope_rolls_back() -> None:
+    foreign_log = WikiLogEntry(
+        tenant_id=SCOPE.tenant_id + 1,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        operation_id=uuid4(),
+        action="wiki_ingest_batch",
+        message="foreign",
+        pages_affected=[],
+    )
+    session = _ScriptedSession([_ScriptedResult(scalar=foreign_log)])
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), SqlFinalizationPort())  # type: ignore[arg-type]
+
+    with pytest.raises(InvariantError, match="其他 scope"):
+        await store.apply_results(
+            SCOPE, _batch_request(operation_id=foreign_log.operation_id)
+        )
+
+    assert session.rolled_back is True
+    assert len(session.statements) == 1
+
+
+@pytest.mark.asyncio
+async def test_modern_cas_conflict_rolls_back_before_contribution_writes() -> None:
+    token = uuid4()
+    pending = _pending(claimed=True)
+    pending.claim_token = token
+    page = _page(sources=[pending.knowledge_id])
+    reduced = _result_page()
+    request = _batch_request(
+        claim_token=token,
+        pages=(reduced,),
+        completed_op_ids=(pending.id,),
+        expected_pages=(
+            PageExpectation(slug=page.slug, page_id=page.id, version=page.version - 1),
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[page]),
+        ]
+    )
+    finalization = _RecordingFinalization(session.events)
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
+
+    with pytest.raises(ingest_store.PageConflict):
+        await store.apply_results(SCOPE, request)
+
+    assert session.rolled_back is True
+    assert session.added == []
+    assert finalization.requests == []
+    assert not any(
+        _sql(statement).startswith("DELETE FROM wiki_page_contributions")
+        for statement in session.statements
+    )
+
+
+@pytest.mark.asyncio
+async def test_modern_contribution_conflict_rolls_back_before_page_writes() -> None:
+    token = uuid4()
+    pending = _pending(claimed=True)
+    pending.claim_token = token
+    page = _page(sources=[pending.knowledge_id])
+    old = _contribution(knowledge_id=pending.knowledge_id)
+    previous = _stored_contribution().model_copy(update={"id": old.id})
+    current = _stored_contribution(version=pending.op_version)
+    reduced = _result_page()
+    request = _batch_request(
+        claim_token=token,
+        pages=(reduced,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="replace",
+                slug=page.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=previous,
+                current=current,
+            ),
+        ),
+        completed_op_ids=(pending.id,),
+        expected_pages=(
+            PageExpectation(slug=page.slug, page_id=page.id, version=page.version),
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[page]),
+            _ScriptedResult(rowcount=0),
+        ]
+    )
+    finalization = _RecordingFinalization(session.events)
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
+
+    with pytest.raises(InvariantError, match="previous contribution"):
+        await store.apply_results(SCOPE, request)
+
+    assert session.rolled_back is True
+    assert session.added == []
+    assert finalization.requests == []
+    assert page.version == 4
+
+
+@pytest.mark.asyncio
+async def test_modern_finalization_failure_rolls_back_and_stops_pending_delete() -> (
+    None
+):
+    token = uuid4()
+    pending = _pending(claimed=True)
+    pending.claim_token = token
+    page = _page(sources=[pending.knowledge_id])
+    reduced = ReducedPage(
+        slug=page.slug,
+        title="最终写入前失败",
+        page_type="entity",
+        content="无链接正文",
+        summary=page.summary,
+        source_refs=[pending.knowledge_id],
+        contributor_op_ids=[pending.id],
+    )
+    request = _batch_request(
+        claim_token=token,
+        pages=(reduced,),
+        completed_op_ids=(pending.id,),
+        expected_pages=(
+            PageExpectation(slug=page.slug, page_id=page.id, version=page.version),
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[page]),
+            _ScriptedResult(),
+            _ScriptedResult(),
+        ]
+    )
+    finalization = _RecordingFinalization(session.events, release_ok=False)
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
+
+    with pytest.raises(InvariantError, match="finalization"):
+        await store.apply_results(SCOPE, request)
+
+    assert session.rolled_back is True
+    assert len(finalization.requests) == 1
+    assert not any(
+        _sql(statement).startswith("DELETE FROM wiki_pending_ops")
+        for statement in session.statements
+    )
+    assert not any(
+        _sql(statement).startswith("INSERT INTO task_outbox")
+        for statement in session.statements
     )
 
 
