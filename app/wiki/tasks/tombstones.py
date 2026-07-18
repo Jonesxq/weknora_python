@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import heapq
+import inspect
 import math
 import time
 import unicodedata
 from collections.abc import Awaitable, Callable
-from typing import Protocol
+from typing import Protocol, TypeVar, cast
 
 from redis.asyncio import Redis
 
@@ -26,6 +29,7 @@ class _RedisTombstoneClient(Protocol):
 
 
 _RedisClientFactory = Callable[..., _RedisTombstoneClient]
+_Result = TypeVar("_Result")
 
 
 def _validate_ttl(ttl_seconds: int) -> None:
@@ -78,21 +82,26 @@ class MemoryTombstones:
         self._ttl_seconds = ttl_seconds
         self._clock = clock
         self._expires_at: dict[str, float] = {}
+        self._expiry_heap: list[tuple[float, str]] = []
 
     async def mark_deleted(self, scope: WikiScope, knowledge_id: str) -> None:
-        self._expires_at[tombstone_key(scope, knowledge_id)] = (
-            self._clock() + self._ttl_seconds
-        )
+        now = self._clock()
+        self._purge_expired(now)
+        key = tombstone_key(scope, knowledge_id)
+        expires_at = now + self._ttl_seconds
+        self._expires_at[key] = expires_at
+        heapq.heappush(self._expiry_heap, (expires_at, key))
 
     async def is_deleted(self, scope: WikiScope, knowledge_id: str) -> bool:
         key = tombstone_key(scope, knowledge_id)
-        expires_at = self._expires_at.get(key)
-        if expires_at is None:
-            return False
-        if self._clock() >= expires_at:
-            del self._expires_at[key]
-            return False
-        return True
+        self._purge_expired(self._clock())
+        return key in self._expires_at
+
+    def _purge_expired(self, now: float) -> None:
+        while self._expiry_heap and self._expiry_heap[0][0] <= now:
+            expires_at, key = heapq.heappop(self._expiry_heap)
+            if self._expires_at.get(key) == expires_at:
+                del self._expires_at[key]
 
 
 class RedisTombstones:
@@ -120,19 +129,27 @@ class RedisTombstones:
         )
 
     def _new_client(self) -> _RedisTombstoneClient:
-        return self._client_factory(
+        client = self._client_factory(
             self._url,
             decode_responses=True,
             socket_connect_timeout=self._socket_timeout,
             socket_timeout=self._socket_timeout,
         )
+        if inspect.isawaitable(client):
+            if inspect.iscoroutine(client):
+                client.close()
+            raise TypeError("client_factory 不能返回 awaitable")
+        for method_name in ("set", "get", "aclose"):
+            if not callable(getattr(client, method_name, None)):
+                raise TypeError(f"Redis 客户端缺少可调用的 {method_name}")
+        return client
 
     async def mark_deleted(self, scope: WikiScope, knowledge_id: str) -> None:
         key = tombstone_key(scope, knowledge_id)
 
         async def operation(client: _RedisTombstoneClient) -> None:
             written = await client.set(key, "1", ex=self._ttl_seconds)
-            if written is False or written is None:
+            if written is not True:
                 raise RuntimeError("写入删除墓碑失败")
 
         await self._with_client(operation)
@@ -151,16 +168,40 @@ class RedisTombstones:
         return await self._with_client(operation)
 
     async def _with_client(
-        self, operation: Callable[[_RedisTombstoneClient], Awaitable[object]]
-    ) -> object:
+        self, operation: Callable[[_RedisTombstoneClient], Awaitable[_Result]]
+    ) -> _Result:
         client = self._new_client()
+        primary_error: BaseException | None = None
+        result: _Result | None = None
         try:
             result = await operation(client)
-        except BaseException:
+        except BaseException as error:
+            primary_error = error
+
+        close_task = asyncio.create_task(client.aclose(), name="wiki-tombstone-close")
+        cleanup_cancelled = False
+        close_error: BaseException | None = None
+        while not close_task.done():
             try:
-                await client.aclose()
-            except BaseException:
-                pass
-            raise
-        await client.aclose()
-        return result
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:
+                cleanup_cancelled = True
+            except BaseException as error:
+                close_error = error
+        try:
+            close_task.result()
+        except BaseException as error:
+            close_error = error
+
+        if cleanup_cancelled or isinstance(primary_error, asyncio.CancelledError):
+            cancellation = asyncio.CancelledError()
+            if primary_error is not None and not isinstance(
+                primary_error, asyncio.CancelledError
+            ):
+                raise cancellation from primary_error
+            raise cancellation
+        if primary_error is not None:
+            raise primary_error
+        if close_error is not None:
+            raise close_error
+        return cast(_Result, result)

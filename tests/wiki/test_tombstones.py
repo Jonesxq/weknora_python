@@ -74,6 +74,57 @@ class FakeFactory:
         return client
 
 
+class SharedRedisState:
+    def __init__(self, clock: Clock) -> None:
+        self.clock = clock
+        self.values: dict[str, tuple[str, float]] = {}
+
+
+class StatefulFakeRedisClient(FakeRedisClient):
+    def __init__(self, state: SharedRedisState) -> None:
+        super().__init__()
+        self.state = state
+
+    async def set(self, key: str, value: str, *, ex: int) -> object:
+        self.calls.append(("set", key, value, ex))
+        self.state.values[key] = (value, self.state.clock() + ex)
+        return True
+
+    async def get(self, key: str) -> object:
+        self.calls.append(("get", key))
+        value = self.state.values.get(key)
+        if value is None or self.state.clock() >= value[1]:
+            self.state.values.pop(key, None)
+            return None
+        return value[0]
+
+
+class BlockingCloseClient(FakeRedisClient):
+    def __init__(self, *, get_result: object = None) -> None:
+        super().__init__(get_result=get_result)
+        self.close_started = asyncio.Event()
+        self.close_release = asyncio.Event()
+        self.close_finished = False
+
+    async def aclose(self) -> None:
+        self.closed += 1
+        self.close_started.set()
+        await self.close_release.wait()
+        self.close_finished = True
+
+
+async def _wait_for_close_start(client: BlockingCloseClient) -> None:
+    await asyncio.wait_for(client.close_started.wait(), timeout=1)
+
+
+def _pending_close_tasks() -> list[asyncio.Task[object]]:
+    return [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name() == "wiki-tombstone-close" and not task.done()
+    ]
+
+
 def test_key_uses_kb_identity_without_changing_knowledge_id() -> None:
     assert tombstone_key(scope(), "knowledge-1") == f"wiki:deleted:{KB_ID}:knowledge-1"
     assert tombstone_key(scope(tenant_id=8), "knowledge-1") == tombstone_key(
@@ -145,6 +196,31 @@ async def test_memory_uses_one_hour_default_ttl() -> None:
     assert await tombstones.is_deleted(scope(), "knowledge-1")
     clock.now = 3700.0
     assert not await tombstones.is_deleted(scope(), "knowledge-1")
+
+
+@pytest.mark.asyncio
+async def test_memory_purges_expired_entries_during_unrelated_write() -> None:
+    clock = Clock()
+    tombstones = MemoryTombstones(ttl_seconds=1, clock=clock)
+    for index in range(10_000):
+        await tombstones.mark_deleted(scope(), f"old-{index}")
+    clock.now = 101.0
+    await tombstones.mark_deleted(scope(), "current")
+    assert tombstones._expires_at == {tombstone_key(scope(), "current"): 102.0}
+
+
+@pytest.mark.asyncio
+async def test_memory_refresh_stale_heap_entry_does_not_delete_current_tombstone() -> (
+    None
+):
+    clock = Clock()
+    tombstones = MemoryTombstones(ttl_seconds=10, clock=clock)
+    await tombstones.mark_deleted(scope(), "knowledge-1")
+    clock.now = 105.0
+    await tombstones.mark_deleted(scope(), "knowledge-1")
+    clock.now = 110.0
+    await tombstones.mark_deleted(scope(), "other")
+    assert await tombstones.is_deleted(scope(), "knowledge-1")
 
 
 @pytest.mark.parametrize("ttl", [True, False, 0, -1, 1.0, "1"])
@@ -310,6 +386,130 @@ async def test_redis_propagates_close_failure_when_operation_succeeds() -> None:
     assert client.closed == 1
 
 
+@pytest.mark.asyncio
+async def test_redis_requires_exact_true_set_result() -> None:
+    for written in (False, None, 0, 1, "", object()):
+        factory = FakeFactory(lambda: FakeRedisClient(set_result=written))
+        with pytest.raises(RuntimeError, match="写入删除墓碑失败"):
+            await RedisTombstones(
+                "redis://example", client_factory=factory
+            ).mark_deleted(scope(), "knowledge-1")
+        assert factory.clients[0].closed == 1
+
+    accepted = FakeFactory(lambda: FakeRedisClient(set_result=True))
+    await RedisTombstones("redis://example", client_factory=accepted).mark_deleted(
+        scope(), "knowledge-1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_redis_cancellation_waits_for_close_and_leaves_no_close_task() -> None:
+    client = BlockingCloseClient()
+    factory = FakeFactory(lambda: client)
+    task = asyncio.create_task(
+        RedisTombstones("redis://example", client_factory=factory).mark_deleted(
+            scope(), "knowledge-1"
+        )
+    )
+    await _wait_for_close_start(client)
+    task.cancel()
+    task.cancel()
+    client.close_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+    assert client.close_finished
+    assert not _pending_close_tasks()
+
+
+@pytest.mark.asyncio
+async def test_redis_cancellation_preserves_primary_connection_error_as_cause() -> None:
+    client = BlockingCloseClient()
+    client.set_error = ConnectionError("primary")
+    task = asyncio.create_task(
+        RedisTombstones(
+            "redis://example", client_factory=FakeFactory(lambda: client)
+        ).mark_deleted(scope(), "knowledge-1")
+    )
+    await _wait_for_close_start(client)
+    task.cancel()
+    client.close_release.set()
+    with pytest.raises(asyncio.CancelledError) as error:
+        await asyncio.wait_for(task, timeout=1)
+    assert isinstance(error.value.__cause__, ConnectionError)
+    assert client.close_finished
+    assert not _pending_close_tasks()
+
+
+@pytest.mark.asyncio
+async def test_redis_operation_cancellation_survives_second_cancellation_during_close() -> (
+    None
+):
+    client = BlockingCloseClient()
+    client.get_error = asyncio.CancelledError()
+    task = asyncio.create_task(
+        RedisTombstones(
+            "redis://example", client_factory=FakeFactory(lambda: client)
+        ).is_deleted(scope(), "knowledge-1")
+    )
+    await _wait_for_close_start(client)
+    task.cancel()
+    client.close_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+    assert client.close_finished
+    assert not _pending_close_tasks()
+
+
+def test_redis_clients_share_backend_state_and_refresh_ttl_across_loops() -> None:
+    clock = Clock()
+    state = SharedRedisState(clock)
+    factory = FakeFactory(lambda: StatefulFakeRedisClient(state))
+    tombstones = RedisTombstones("redis://example", client_factory=factory)
+
+    async def mark() -> None:
+        await asyncio.wait_for(
+            tombstones.mark_deleted(scope(), "knowledge-1"), timeout=1
+        )
+
+    async def deleted() -> bool:
+        return await asyncio.wait_for(
+            tombstones.is_deleted(scope(), "knowledge-1"), timeout=1
+        )
+
+    asyncio.run(mark())
+    clock.now = 3699.0
+    asyncio.run(mark())
+    clock.now = 3700.0
+    assert asyncio.run(deleted())
+    clock.now = 7299.0
+    assert asyncio.run(deleted())
+    clock.now = 7300.0
+    assert not asyncio.run(deleted())
+    assert len({id(client) for client in factory.clients}) == len(factory.clients)
+
+
+@pytest.mark.asyncio
+async def test_redis_rejects_async_factory_without_runtime_warning(
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    async def async_factory(*args: object, **kwargs: object) -> FakeRedisClient:
+        return FakeRedisClient()
+
+    with pytest.raises(TypeError, match="client_factory 不能返回 awaitable"):
+        await RedisTombstones(
+            "redis://example", client_factory=async_factory
+        ).is_deleted(scope(), "knowledge-1")
+    assert not [warning for warning in recwarn if warning.category is RuntimeWarning]
+
+
+@pytest.mark.parametrize("client", [object(), object()])
+def test_redis_rejects_invalid_client_shape(client: object) -> None:
+    with pytest.raises(TypeError, match="Redis 客户端缺少"):
+        RedisTombstones(
+            "redis://example", client_factory=lambda *args, **kwargs: client
+        )._new_client()
+
+
 @pytest.mark.parametrize("url", ["", "   "])
 def test_redis_rejects_empty_url(url: str) -> None:
     with pytest.raises(ValueError):
@@ -330,7 +530,12 @@ def test_redis_accepts_function_client_factory() -> None:
 
 
 @pytest.mark.parametrize("ttl", [True, False, 0, -1, 1.0, "1"])
-@pytest.mark.parametrize("timeout", [True, False, 0, -1.0, math.nan, math.inf, "1"])
-def test_redis_rejects_invalid_constructor_bounds(ttl: object, timeout: object) -> None:
+def test_redis_rejects_invalid_ttl_with_valid_timeout(ttl: object) -> None:
     with pytest.raises((TypeError, ValueError)):
-        RedisTombstones("redis://example", ttl_seconds=ttl, socket_timeout=timeout)  # type: ignore[arg-type]
+        RedisTombstones("redis://example", ttl_seconds=ttl, socket_timeout=2.0)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("timeout", [True, False, 0, -1.0, math.nan, math.inf, "1"])
+def test_redis_rejects_invalid_timeout_with_valid_ttl(timeout: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        RedisTombstones("redis://example", ttl_seconds=3600, socket_timeout=timeout)  # type: ignore[arg-type]
