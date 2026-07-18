@@ -9,11 +9,13 @@ from uuid import UUID
 
 from pydantic import ValidationError
 from app.wiki.errors import WikiValidationError
+from app.wiki.ingest.ports import DedupModelPort
 from app.wiki.ingest.schemas import (
     DedupCandidateRequest,
     DedupOutput,
     DedupPageCandidate,
     DedupRequest,
+    ReducedPage,
     TopicCandidate,
 )
 from app.wiki.ingest.store import ExistingPageRecord
@@ -141,30 +143,45 @@ def _clusters(items: Sequence[TopicCandidate]) -> list[list[TopicCandidate]]:
 def _exact_target(
     item: TopicCandidate, record: ExistingPageRecord
 ) -> DedupPageCandidate:
-    page = record.page
     if (
-        not isinstance(record.page_id, UUID)
-        or not isinstance(record.version, int)
+        not isinstance(record, ExistingPageRecord)
+        or not isinstance(record.page_id, UUID)
+        or type(record.version) is not int
         or record.version < 1
     ):
         raise WikiValidationError("DEDUP_EXISTING_INVALID", "已有页面记录身份无效")
+    try:
+        page = ReducedPage.model_validate(
+            record.page.model_dump(mode="python", warnings=False)
+        )
+    except (ValidationError, TypeError, AttributeError, ValueError) as exc:
+        raise WikiValidationError(
+            "DEDUP_EXISTING_INVALID", "已有页面记录内容无效"
+        ) from exc
     if page.slug != item.slug or page.page_type != item.page_type:
         raise WikiValidationError(
             "DEDUP_EXISTING_INVALID", "已有页面与候选 slug 或类型不一致"
         )
-    return DedupPageCandidate(
-        slug=page.slug,
-        title=page.title,
-        page_type=page.page_type,
-        aliases=tuple(page.aliases),
-    )
+    try:
+        return DedupPageCandidate.model_validate(
+            {
+                "slug": page.slug,
+                "title": page.title,
+                "page_type": page.page_type,
+                "aliases": page.aliases,
+            }
+        )
+    except (ValidationError, TypeError, AttributeError, ValueError) as exc:
+        raise WikiValidationError(
+            "DEDUP_EXISTING_INVALID", "已有页面记录内容无效"
+        ) from exc
 
 
 async def deduplicate_candidates(
     scope: WikiScope,
     candidates: Sequence[TopicCandidate],
     store: DedupStorePort,
-    model,
+    model: DedupModelPort,
     *,
     limit: int = 20,
 ) -> tuple[list[TopicCandidate], dict[str, str]]:
@@ -179,9 +196,10 @@ async def deduplicate_candidates(
             raise ValueError("dedup 查询名称不能超过 64 个")
     clusters = _clusters(originals)
     exact = await store.find_existing_pages(scope, [item.slug for item in originals])
+    source_by_slug = {item.slug: item for item in originals}
     exact_targets: dict[str, DedupPageCandidate] = {}
     for slug, record in exact.items():
-        source = next((item for item in originals if item.slug == slug), None)
+        source = source_by_slug.get(slug)
         if source is None:
             raise WikiValidationError(
                 "DEDUP_EXISTING_INVALID", "已有页面不属于请求候选"
@@ -258,7 +276,15 @@ async def deduplicate_candidates(
             raise RuntimeError("dedup worker 未返回结果")
         allowed: list[DedupPageCandidate] = []
         seen: set[str] = set()
-        for target in found_targets:
+        for raw_target in found_targets:
+            try:
+                target = DedupPageCandidate.model_validate(
+                    raw_target.model_dump(mode="python", warnings=False)
+                )
+            except (ValidationError, TypeError, AttributeError, ValueError) as exc:
+                raise WikiValidationError(
+                    "DEDUP_TARGET_INVALID", "dedup 候选目标无效"
+                ) from exc
             if target.slug in seen:
                 continue
             seen.add(target.slug)

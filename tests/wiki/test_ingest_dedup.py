@@ -795,3 +795,45 @@ async def test_service_rejects_more_than_64_distinct_query_names() -> None:
         await deduplicate_candidates(
             SCOPE, [candidate], Store({}), Model(DedupOutput())
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [True, 1.5])
+async def test_exact_model_construct_invalid_record_is_domain_error(version) -> None:
+    class BadExactStore(Store):
+        async def find_existing_pages(self, _scope, _slugs):
+            page = ReducedPage.model_construct(
+                slug="entity/a",
+                title="",
+                page_type="entity",
+                content="",
+                summary="",
+                aliases=[],
+            )
+            return {
+                "entity/a": ExistingPageRecord(
+                    page_id=uuid4(), version=version, page=page
+                )
+            }
+
+    with pytest.raises(WikiValidationError, match="已有页面"):
+        await deduplicate_candidates(
+            SCOPE,
+            [TopicCandidate(name="A", slug="entity/a", page_type="entity")],
+            BadExactStore({}),
+            Model(DedupOutput()),
+        )
+
+
+@pytest.mark.asyncio
+async def test_fuzzy_model_construct_invalid_target_is_domain_error() -> None:
+    bad = DedupPageCandidate.model_construct(
+        slug="entity/db", title="", page_type="entity", aliases=()
+    )
+    with pytest.raises(WikiValidationError, match="候选目标无效"):
+        await deduplicate_candidates(
+            SCOPE,
+            [TopicCandidate(name="A", slug="entity/a", page_type="entity")],
+            Store({"entity/a": [bad]}),
+            Model(DedupOutput()),
+        )
