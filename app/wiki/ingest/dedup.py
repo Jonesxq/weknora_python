@@ -127,8 +127,12 @@ def validate_dedup_output(
     request: DedupRequest, output: DedupOutput
 ) -> dict[str, str | None]:
     try:
-        request = DedupRequest.model_validate(request.model_dump(mode="python"))
-        output = DedupOutput.model_validate(output.model_dump(mode="python"))
+        request = DedupRequest.model_validate(
+            request.model_dump(mode="python", warnings=False)
+        )
+        output = DedupOutput.model_validate(
+            output.model_dump(mode="python", warnings=False)
+        )
     except (ValidationError, TypeError, AttributeError, ValueError) as exc:
         raise WikiValidationError("DEDUP_OUTPUT_INVALID", "dedup 输出结构无效") from exc
     requested = {item.candidate.slug: item for item in request.candidates}

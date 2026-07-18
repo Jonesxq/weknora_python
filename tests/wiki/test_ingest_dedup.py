@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import warnings
 import pytest
 
 from app.wiki.errors import WikiValidationError
@@ -850,6 +851,51 @@ async def test_double_external_cancel_waits_for_worker_cleanup_barrier(
 
 
 @pytest.mark.asyncio
+async def test_runtime_error_parent_cancel_during_cleanup_prefers_cancel() -> None:
+    error = RuntimeError("boom")
+
+    class StoreWithCleanup(Store):
+        def __init__(self):
+            super().__init__({})
+            self.active = 0
+            self.cleanup = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def find_existing_pages(self, *_args):
+            return {}
+
+        async def find_dedup_candidates(self, _scope, candidate, limit=20):
+            self.active += 1
+            try:
+                if candidate.slug == "entity/item-0":
+                    raise error
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cleanup.set()
+                await self.release.wait()
+                raise
+            finally:
+                self.active -= 1
+
+    store = StoreWithCleanup()
+    task = asyncio.create_task(
+        deduplicate_candidates(SCOPE, _many_candidates(8), store, Model(DedupOutput()))
+    )
+    try:
+        await asyncio.wait_for(store.cleanup.wait(), 1)
+        task.cancel()
+        store.release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await asyncio.wait_for(task, 1)
+        assert caught.value.__cause__ is error and store.active == 0
+    finally:
+        store.release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_thousand_same_canonical_returns_one_accumulated_page() -> None:
     target = DedupPageCandidate(slug="entity/db", title="DB", page_type="entity")
 
@@ -873,13 +919,41 @@ async def test_thousand_same_canonical_returns_one_accumulated_page() -> None:
         )
         for index in range(1000)
     ]
+    from app.wiki.ingest import dedup
+
+    original_finalize = dedup._Accumulator.finalize
+    calls = 0
+
+    def counted_finalize(self):
+        nonlocal calls
+        calls += 1
+        return original_finalize(self)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(dedup._Accumulator, "finalize", counted_finalize)
     result, mapping = await deduplicate_candidates(
         SCOPE,
         candidates,
         Store({candidate.slug: [target] for candidate in candidates}),
         CanonicalModel(),
     )
-    assert len(result) == 1 and result[0].slug == "entity/db" and len(mapping) == 1000
+    monkeypatch.undo()
+    assert (
+        len(result) == 1
+        and result[0].slug == "entity/db"
+        and len(mapping) == 1000
+        and calls == 1
+    )
+    assert result[0].aliases[0] == "Name 0" and result[0].details == ""
+
+
+def test_forged_nested_output_snapshot_emits_no_warnings() -> None:
+    output = DedupOutput.model_construct(decisions=object())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(WikiValidationError, match="结构无效"):
+            validate_dedup_output(_request(), output)
+    assert caught == []
 
 
 @pytest.mark.asyncio

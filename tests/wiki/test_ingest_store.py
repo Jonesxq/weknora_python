@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from uuid import UUID, uuid4
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy.dialects import postgresql
 
 from app.wiki.ingest.schemas import FinalizationRequest, ReducedPage, SourceKnowledge
@@ -254,8 +255,9 @@ async def test_find_dedup_candidates_returns_detached_frozen_snapshots() -> None
         ("entity/a", ("A",)),
         ("entity/b", ("B",)),
     ]
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError) as exc:
         result[0].aliases += ("nope",)
+    assert exc.value.errors()[0]["type"] == "frozen_instance"
 
 
 @pytest.mark.asyncio
