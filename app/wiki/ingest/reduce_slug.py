@@ -183,7 +183,9 @@ def _apply_contribution_transitions(
     """先规划整个批次，再以集合语义统一应用 remove/add。"""
 
     unique_deltas = _stable_unique_deltas(deltas)
-    removals: dict[tuple[int, UUID, str, str, str], list[int]] = {}
+    removals: dict[tuple[int, UUID, str, str, str], StoredContributionRecord] = {}
+    removal_origins: dict[tuple[int, UUID, str, str, str], list[int]] = {}
+    removal_actions: dict[tuple[int, UUID, str, str, str], str] = {}
     additions: dict[tuple[int, UUID, str, str, str], StoredContributionRecord] = {}
     addition_origins: dict[tuple[int, UUID, str, str, str], list[int]] = {}
     current_by_source: dict[
@@ -192,7 +194,20 @@ def _apply_contribution_transitions(
 
     for index, delta in enumerate(unique_deltas):
         if delta.previous is not None:
-            removals.setdefault(_record_identity(delta.previous), []).append(index)
+            identity = _record_identity(delta.previous)
+            existing_previous = removals.get(identity)
+            if existing_previous is not None and (
+                _record_payload(existing_previous) != _record_payload(delta.previous)
+                or existing_previous.state != delta.previous.state
+                or removal_actions[identity] != delta.action
+            ):
+                _reject(
+                    "WIKI_REDUCE_PREVIOUS_CONFLICT",
+                    "同一 exact identity 存在冲突的 previous contribution",
+                )
+            removals.setdefault(identity, delta.previous)
+            removal_origins.setdefault(identity, []).append(index)
+            removal_actions.setdefault(identity, delta.action)
         if delta.current is None:
             continue
         identity = _record_identity(delta.current)
@@ -216,7 +231,7 @@ def _apply_contribution_transitions(
         current_by_source[source] = identity
 
     for identity in removals.keys() & additions.keys():
-        remove_origins = removals[identity]
+        remove_origins = removal_origins[identity]
         add_origins = addition_origins[identity]
         same_replace = (
             len(remove_origins) == 1

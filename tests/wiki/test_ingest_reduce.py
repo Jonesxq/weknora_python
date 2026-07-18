@@ -452,6 +452,72 @@ async def test_reduce_duplicate_identical_delta_is_idempotent() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reverse", [False, True])
+async def test_reduce_rejects_conflicting_previous_payload_regardless_of_order(
+    reverse: bool,
+) -> None:
+    model = RecordingModel()
+    previous_a = stored_contribution(
+        "doc-1", state="retract_pending", content="previous A"
+    )
+    previous_b = stored_contribution(
+        "doc-1", state="retract_pending", content="previous B"
+    )
+    first = contribution_delta(
+        "retract", "doc-1", pending_op_id=OP_A, previous=previous_a
+    )
+    second = contribution_delta(
+        "retract", "doc-1", pending_op_id=OP_B, previous=previous_b
+    )
+    deltas = [second, first] if reverse else [first, second]
+
+    with pytest.raises(WikiValidationError) as caught:
+        await reduce_slug("entity/shared", deltas, None, [], model)
+
+    assert caught.value.code == "WIKI_REDUCE_PREVIOUS_CONFLICT"
+    assert model.merge_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_reduce_rejects_conflicting_removal_action_and_state(
+    reverse: bool,
+) -> None:
+    model = RecordingModel()
+    active_previous = stored_contribution("doc-1", state="active")
+    pending_previous = active_previous.model_copy(update={"state": "retract_pending"})
+    stale = contribution_delta(
+        "retract_stale", "doc-1", pending_op_id=OP_A, previous=active_previous
+    )
+    retract = contribution_delta(
+        "retract", "doc-1", pending_op_id=OP_B, previous=pending_previous
+    )
+    deltas = [retract, stale] if reverse else [stale, retract]
+
+    with pytest.raises(WikiValidationError) as caught:
+        await reduce_slug("entity/shared", deltas, None, [], model)
+
+    assert caught.value.code == "WIKI_REDUCE_PREVIOUS_CONFLICT"
+    assert model.merge_requests == []
+
+
+@pytest.mark.asyncio
+async def test_reduce_duplicate_same_previous_removal_is_idempotent() -> None:
+    model = RecordingModel()
+    previous = stored_contribution("doc-1", state="retract_pending")
+    deltas = [
+        contribution_delta("retract", "doc-1", pending_op_id=OP_A, previous=previous),
+        contribution_delta("retract", "doc-1", pending_op_id=OP_B, previous=previous),
+    ]
+
+    page = await reduce_slug("entity/shared", deltas, None, [], model)
+
+    assert page.deleted is True
+    assert page.contributor_op_ids == [OP_A, OP_B]
+    assert model.merge_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse", [False, True])
 async def test_reduce_rejects_add_and_retract_for_same_identity_regardless_of_order(
     reverse: bool,
 ) -> None:
