@@ -641,8 +641,8 @@ def _finalization_request(
     )
 
 
-def _retract_scope_lock_key(scope: WikiScope) -> int:
-    identity = f"wiki-retract:{scope.tenant_id}:{scope.knowledge_base_id}".encode(
+def _enqueue_scope_lock_key(scope: WikiScope) -> int:
+    identity = f"wiki-enqueue:{scope.tenant_id}:{scope.knowledge_base_id}".encode(
         "ascii"
     )
     return int.from_bytes(hashlib.sha256(identity).digest()[:8], "big", signed=True)
@@ -740,6 +740,9 @@ class SqlAlchemyIngestStore:
             raise ValueError("知识条目、payload 与 WikiScope 不一致")
         async with self._session_factory() as session:
             async with session.begin():
+                await session.execute(
+                    select(func.pg_advisory_xact_lock(_enqueue_scope_lock_key(scope)))
+                )
                 await self._cancel_unclaimed_ingest(
                     session,
                     scope,
@@ -771,7 +774,7 @@ class SqlAlchemyIngestStore:
         async with self._session_factory() as session:
             async with session.begin():
                 await session.execute(
-                    select(func.pg_advisory_xact_lock(_retract_scope_lock_key(scope)))
+                    select(func.pg_advisory_xact_lock(_enqueue_scope_lock_key(scope)))
                 )
                 await self._cancel_unclaimed_ingest(session, scope, knowledge_id)
                 contributions = list(

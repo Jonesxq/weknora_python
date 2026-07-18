@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from collections.abc import Sequence
@@ -838,6 +839,82 @@ def _knowledge(version: str = "version-2") -> SourceKnowledge:
 
 
 @pytest.mark.asyncio
+async def test_ingest_and_retract_share_scope_lock_before_reads_across_sources() -> (
+    None
+):
+    ingest_sessions: list[_ScriptedSession] = []
+    ingest_calls = []
+    for version in ("version-1", "version-2"):
+        pending = _pending(knowledge_id="knowledge-a", version=version)
+        session = _ScriptedSession(
+            [
+                _ScriptedResult(rows=[]),
+                _ScriptedResult(scalar=pending.id),
+                _ScriptedResult(),
+                _ScriptedResult(scalar=pending),
+                _ScriptedResult(scalar=_outbox()),
+            ]
+        )
+        store = SqlAlchemyIngestStore(
+            _OneSessionFactory(session), _RecordingFinalization(session.events)
+        )  # type: ignore[arg-type]
+        knowledge = _knowledge(version).model_copy(update={"id": "knowledge-a"})
+        ingest_sessions.append(session)
+        ingest_calls.append(
+            store.enqueue_ingest(
+                SCOPE,
+                knowledge,
+                {"knowledge_id": "knowledge-a"},
+                delay_seconds=0,
+            )
+        )
+
+    retract_pending = _pending(
+        knowledge_id="knowledge-b", op="retract", version="delete-1"
+    )
+    retract_session = _ScriptedSession(
+        [
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(scalar=retract_pending.id),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=retract_pending),
+            _ScriptedResult(scalar=_outbox()),
+        ]
+    )
+    retract_store = SqlAlchemyIngestStore(
+        _OneSessionFactory(retract_session),
+        _RecordingFinalization(retract_session.events),
+    )  # type: ignore[arg-type]
+
+    await asyncio.gather(
+        *ingest_calls,
+        retract_store.enqueue_retract(
+            SCOPE,
+            "knowledge-b",
+            "delete-1",
+            {"knowledge_id": "knowledge-b"},
+            delay_seconds=0,
+        ),
+    )
+
+    sessions = [*ingest_sessions, retract_session]
+    first_sql = [_sql(session.statements[0]) for session in sessions]
+    assert all("pg_advisory_xact_lock" in sql for sql in first_sql)
+    lock_values = [
+        tuple(
+            session.statements[0].compile(dialect=postgresql.dialect()).params.values()
+        )
+        for session in sessions
+    ]
+    assert lock_values[0] == lock_values[1] == lock_values[2]
+    assert all(
+        _sql(session.statements[1]).startswith("SELECT wiki_pending_ops.")
+        for session in sessions
+    )
+
+
+@pytest.mark.asyncio
 async def test_enqueue_ingest_releases_and_deletes_only_old_unclaimed_versions() -> (
     None
 ):
@@ -865,10 +942,12 @@ async def test_enqueue_ingest_releases_and_deletes_only_old_unclaimed_versions()
 
     assert result.id == new.id and result.deduplicated is False
     first_sql = _sql(session.statements[0])
-    assert "wiki_pending_ops.claimed_at IS NULL" in first_sql
-    assert "wiki_pending_ops.op_version !=" in first_sql
-    assert "FOR UPDATE" in first_sql
-    delete_sql = _sql(session.statements[1])
+    assert "pg_advisory_xact_lock" in first_sql
+    pending_sql = _sql(session.statements[1])
+    assert "wiki_pending_ops.claimed_at IS NULL" in pending_sql
+    assert "wiki_pending_ops.op_version !=" in pending_sql
+    assert "FOR UPDATE" in pending_sql
+    delete_sql = _sql(session.statements[2])
     assert delete_sql.startswith("DELETE FROM wiki_pending_ops")
     assert "wiki_pending_ops.claimed_at IS NULL" in delete_sql
     assert [(kind, request.attempt) for kind, request in finalization.requests] == [
@@ -919,7 +998,9 @@ async def test_enqueue_ingest_release_failure_rolls_back_before_new_insert() -> 
         await store.enqueue_ingest(SCOPE, _knowledge(), {"knowledge_id": "knowledge-1"})
 
     assert session.rolled_back is True
-    assert len(session.statements) == 1
+    assert len(session.statements) == 2
+    assert "pg_advisory_xact_lock" in _sql(session.statements[0])
+    assert _sql(session.statements[1]).startswith("SELECT wiki_pending_ops.")
 
 
 @pytest.mark.asyncio
