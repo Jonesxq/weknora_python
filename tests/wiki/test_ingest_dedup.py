@@ -558,7 +558,7 @@ def test_validate_rejects_runtime_cross_type_and_summary_before_whitelist(
             ),
         )
     )
-    with pytest.raises(WikiValidationError, match="类型"):
+    with pytest.raises(WikiValidationError, match="结构无效"):
         validate_dedup_output(forged, output)
 
 
@@ -775,3 +775,23 @@ async def test_fixed_workers_drain_on_external_cancellation() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert store.active == 0
+
+
+@pytest.mark.parametrize("bad", [None, object()])
+def test_validate_bad_runtime_output_is_domain_error(bad: object) -> None:
+    with pytest.raises(WikiValidationError, match="结构无效"):
+        validate_dedup_output(_request(), bad)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_service_rejects_more_than_64_distinct_query_names() -> None:
+    candidate = TopicCandidate(
+        name="Base",
+        slug="entity/base",
+        page_type="entity",
+        aliases=[f"Alias {index}" for index in range(64)],
+    )
+    with pytest.raises(ValueError, match="64"):
+        await deduplicate_candidates(
+            SCOPE, [candidate], Store({}), Model(DedupOutput())
+        )

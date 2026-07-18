@@ -7,15 +7,28 @@ from collections.abc import Sequence
 from typing import Protocol
 from uuid import UUID
 
+from pydantic import ValidationError
 from app.wiki.errors import WikiValidationError
-from app.wiki.ingest.schemas import DedupCandidateRequest, DedupOutput, DedupPageCandidate, DedupRequest, TopicCandidate
+from app.wiki.ingest.schemas import (
+    DedupCandidateRequest,
+    DedupOutput,
+    DedupPageCandidate,
+    DedupRequest,
+    TopicCandidate,
+)
 from app.wiki.ingest.store import ExistingPageRecord
 from app.wiki.scope import WikiScope
 
+_MAX_DEDUP_QUERY_NAMES = 64
+
 
 class DedupStorePort(Protocol):
-    async def find_existing_pages(self, scope: WikiScope, slugs: Sequence[str]) -> dict[str, ExistingPageRecord]: ...
-    async def find_dedup_candidates(self, scope: WikiScope, candidate: TopicCandidate, limit: int = 20) -> list[DedupPageCandidate]: ...
+    async def find_existing_pages(
+        self, scope: WikiScope, slugs: Sequence[str]
+    ) -> dict[str, ExistingPageRecord]: ...
+    async def find_dedup_candidates(
+        self, scope: WikiScope, candidate: TopicCandidate, limit: int = 20
+    ) -> list[DedupPageCandidate]: ...
 
 
 def _name(value: str) -> str:
@@ -38,46 +51,75 @@ def _combine(items: Sequence[TopicCandidate]) -> TopicCandidate:
     if any(item.page_type != first.page_type for item in items):
         raise WikiValidationError("DEDUP_TYPE_CONFLICT", "同一去重簇的类型不一致")
     return TopicCandidate(
-        name=first.name, slug=first.slug, page_type=first.page_type,
-        aliases=_unique([*first.aliases, *[value for item in items[1:] for value in (item.name, *item.aliases)]]),
+        name=first.name,
+        slug=first.slug,
+        page_type=first.page_type,
+        aliases=_unique(
+            [
+                *first.aliases,
+                *[value for item in items[1:] for value in (item.name, *item.aliases)],
+            ]
+        ),
         description="\n\n".join(_unique([item.description for item in items])),
         details="\n\n".join(_unique([item.details for item in items])),
     )
 
 
-def validate_dedup_output(request: DedupRequest, output: DedupOutput) -> dict[str, str | None]:
+def validate_dedup_output(
+    request: DedupRequest, output: DedupOutput
+) -> dict[str, str | None]:
+    try:
+        request = DedupRequest.model_validate(request.model_dump(mode="python"))
+        output = DedupOutput.model_validate(output.model_dump(mode="python"))
+    except (ValidationError, TypeError, AttributeError, ValueError) as exc:
+        raise WikiValidationError("DEDUP_OUTPUT_INVALID", "dedup 输出结构无效") from exc
     requested = {item.candidate.slug: item for item in request.candidates}
     generated = set(requested)
     decisions = {decision.candidate_slug: decision for decision in output.decisions}
     if len(decisions) != len(output.decisions) or set(decisions) != set(requested):
-        raise WikiValidationError("DEDUP_OUTPUT_INVALID", "dedup 输出必须完整且恰好覆盖请求候选")
+        raise WikiValidationError(
+            "DEDUP_OUTPUT_INVALID", "dedup 输出必须完整且恰好覆盖请求候选"
+        )
     result: dict[str, str | None] = {}
     for slug, decision in decisions.items():
         canonical = decision.canonical_slug
         if canonical is not None:
             if canonical in generated:
-                raise WikiValidationError("DEDUP_OUTPUT_INVALID", "canonical_slug 不能指向 generated 候选")
-            allowed = {target.slug: target for target in requested[slug].allowed_targets}
+                raise WikiValidationError(
+                    "DEDUP_OUTPUT_INVALID", "canonical_slug 不能指向 generated 候选"
+                )
+            allowed = {
+                target.slug: target for target in requested[slug].allowed_targets
+            }
             target = allowed.get(canonical)
             if target is None:
-                raise WikiValidationError("DEDUP_OUTPUT_INVALID", "canonical_slug 不在 allowed targets 中")
-            if target.page_type != requested[slug].candidate.page_type or target.slug.startswith("summary/"):
-                raise WikiValidationError("DEDUP_OUTPUT_INVALID", "canonical_slug 类型不合法")
+                raise WikiValidationError(
+                    "DEDUP_OUTPUT_INVALID", "canonical_slug 不在 allowed targets 中"
+                )
+            if target.page_type != requested[
+                slug
+            ].candidate.page_type or target.slug.startswith("summary/"):
+                raise WikiValidationError(
+                    "DEDUP_OUTPUT_INVALID", "canonical_slug 类型不合法"
+                )
         result[slug] = canonical
     return result
 
 
 def _clusters(items: Sequence[TopicCandidate]) -> list[list[TopicCandidate]]:
     parent = list(range(len(items)))
+
     def find(index: int) -> int:
         while parent[index] != index:
             parent[index] = parent[parent[index]]
             index = parent[index]
         return index
+
     def union(left: int, right: int) -> None:
         left, right = find(left), find(right)
         if left != right:
             parent[max(left, right)] = min(left, right)
+
     slugs: dict[str, int] = {}
     names: dict[tuple[str, str], int] = {}
     for index, item in enumerate(items):
@@ -96,44 +138,92 @@ def _clusters(items: Sequence[TopicCandidate]) -> list[list[TopicCandidate]]:
     return list(grouped.values())
 
 
-def _exact_target(item: TopicCandidate, record: ExistingPageRecord) -> DedupPageCandidate:
+def _exact_target(
+    item: TopicCandidate, record: ExistingPageRecord
+) -> DedupPageCandidate:
     page = record.page
-    if not isinstance(record.page_id, UUID) or not isinstance(record.version, int) or record.version < 1:
+    if (
+        not isinstance(record.page_id, UUID)
+        or not isinstance(record.version, int)
+        or record.version < 1
+    ):
         raise WikiValidationError("DEDUP_EXISTING_INVALID", "已有页面记录身份无效")
     if page.slug != item.slug or page.page_type != item.page_type:
-        raise WikiValidationError("DEDUP_EXISTING_INVALID", "已有页面与候选 slug 或类型不一致")
-    return DedupPageCandidate(slug=page.slug, title=page.title, page_type=page.page_type, aliases=tuple(page.aliases))
+        raise WikiValidationError(
+            "DEDUP_EXISTING_INVALID", "已有页面与候选 slug 或类型不一致"
+        )
+    return DedupPageCandidate(
+        slug=page.slug,
+        title=page.title,
+        page_type=page.page_type,
+        aliases=tuple(page.aliases),
+    )
 
 
-async def deduplicate_candidates(scope: WikiScope, candidates: Sequence[TopicCandidate], store: DedupStorePort, model, *, limit: int = 20) -> tuple[list[TopicCandidate], dict[str, str]]:
+async def deduplicate_candidates(
+    scope: WikiScope,
+    candidates: Sequence[TopicCandidate],
+    store: DedupStorePort,
+    model,
+    *,
+    limit: int = 20,
+) -> tuple[list[TopicCandidate], dict[str, str]]:
     if type(limit) is not int or not 1 <= limit <= 20:
         raise ValueError("dedup limit 必须在 1 到 20 之间")
     originals = [item.model_copy(deep=True) for item in candidates]
+    for item in originals:
+        if (
+            len({_name(value) for value in (item.name, *item.aliases) if _name(value)})
+            > _MAX_DEDUP_QUERY_NAMES
+        ):
+            raise ValueError("dedup 查询名称不能超过 64 个")
     clusters = _clusters(originals)
     exact = await store.find_existing_pages(scope, [item.slug for item in originals])
     exact_targets: dict[str, DedupPageCandidate] = {}
     for slug, record in exact.items():
         source = next((item for item in originals if item.slug == slug), None)
         if source is None:
-            raise WikiValidationError("DEDUP_EXISTING_INVALID", "已有页面不属于请求候选")
+            raise WikiValidationError(
+                "DEDUP_EXISTING_INVALID", "已有页面不属于请求候选"
+            )
         exact_targets[slug] = _exact_target(source, record)
-    merged: list[TopicCandidate] = []
     mapping: dict[str, str] = {}
     targets: dict[str, DedupPageCandidate] = {}
     undecided: list[TopicCandidate] = []
     for cluster in clusters:
-        anchors = {exact_targets[item.slug].slug: exact_targets[item.slug] for item in cluster if item.slug in exact_targets}
+        anchors = {
+            exact_targets[item.slug].slug: exact_targets[item.slug]
+            for item in cluster
+            if item.slug in exact_targets
+        }
         if len(anchors) > 1:
-            raise WikiValidationError("DEDUP_AMBIGUOUS_EXACT", "同一候选簇命中多个已有页面")
+            raise WikiValidationError(
+                "DEDUP_AMBIGUOUS_EXACT", "同一候选簇命中多个已有页面"
+            )
         item = _combine(cluster)
         if anchors:
             target = next(iter(anchors.values()))
             targets[target.slug] = target
-            item = TopicCandidate(name=target.title, slug=target.slug, page_type=target.page_type, aliases=_unique([*target.aliases, *[v for candidate in cluster for v in (candidate.name, *candidate.aliases)]]), description=item.description, details=item.details)
+            item = TopicCandidate(
+                name=target.title,
+                slug=target.slug,
+                page_type=target.page_type,
+                aliases=_unique(
+                    [
+                        *target.aliases,
+                        *[
+                            v
+                            for candidate in cluster
+                            for v in (candidate.name, *candidate.aliases)
+                        ],
+                    ]
+                ),
+                description=item.description,
+                details=item.details,
+            )
             for candidate in cluster:
                 mapping[candidate.slug] = target.slug
         else:
-            merged.append(item)
             for candidate in cluster:
                 mapping[candidate.slug] = item.slug
             undecided.append(item)
@@ -146,6 +236,7 @@ async def deduplicate_candidates(scope: WikiScope, candidates: Sequence[TopicCan
     worker_count = min(8, len(undecided))
     for _ in range(worker_count):
         queue.put_nowait(None)
+
     async def worker() -> None:
         while True:
             work = await queue.get()
@@ -153,6 +244,7 @@ async def deduplicate_candidates(scope: WikiScope, candidates: Sequence[TopicCan
                 return
             index, item = work
             results[index] = await store.find_dedup_candidates(scope, item, limit)
+
     workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
     try:
         await asyncio.gather(*workers)
@@ -170,17 +262,27 @@ async def deduplicate_candidates(scope: WikiScope, candidates: Sequence[TopicCan
             if target.slug in seen:
                 continue
             seen.add(target.slug)
-            if target.slug in generated or target.page_type != item.page_type or target.slug.startswith("summary/"):
-                raise WikiValidationError("DEDUP_TARGET_INVALID", "dedup 候选目标不合法")
+            if (
+                target.slug in generated
+                or target.page_type != item.page_type
+                or target.slug.startswith("summary/")
+            ):
+                raise WikiValidationError(
+                    "DEDUP_TARGET_INVALID", "dedup 候选目标不合法"
+                )
             allowed.append(target)
             targets[target.slug] = target
             if len(allowed) == limit:
                 break
         if allowed:
-            requests.append(DedupCandidateRequest(candidate=item, allowed_targets=tuple(allowed)))
+            requests.append(
+                DedupCandidateRequest(candidate=item, allowed_targets=tuple(allowed))
+            )
     if requests:
         request = DedupRequest(candidates=tuple(requests))
-        for slug, canonical in validate_dedup_output(request, await model.resolve_duplicates(request)).items():
+        for slug, canonical in validate_dedup_output(
+            request, await model.resolve_duplicates(request)
+        ).items():
             if canonical is not None:
                 mapping[slug] = canonical
     output: list[TopicCandidate] = []
@@ -189,11 +291,41 @@ async def deduplicate_candidates(scope: WikiScope, candidates: Sequence[TopicCan
         representative = _combine(cluster)
         final = mapping[cluster[0].slug]
         target = targets.get(final)
-        current = TopicCandidate(name=target.title, slug=target.slug, page_type=target.page_type, aliases=_unique([*target.aliases, *[v for c in cluster for v in (c.name, *c.aliases)]]), description=representative.description, details=representative.details) if target else representative.model_copy(deep=True)
+        current = (
+            TopicCandidate(
+                name=target.title,
+                slug=target.slug,
+                page_type=target.page_type,
+                aliases=_unique(
+                    [
+                        *target.aliases,
+                        *[v for c in cluster for v in (c.name, *c.aliases)],
+                    ]
+                ),
+                description=representative.description,
+                details=representative.details,
+            )
+            if target
+            else representative.model_copy(deep=True)
+        )
         if final in positions:
             old = output[positions[final]]
-            output[positions[final]] = TopicCandidate(name=old.name, slug=old.slug, page_type=old.page_type, aliases=_unique([*old.aliases, *current.aliases]), description="\n\n".join(_unique([old.description, current.description])), details="\n\n".join(_unique([old.details, current.details])))
+            output[positions[final]] = TopicCandidate(
+                name=old.name,
+                slug=old.slug,
+                page_type=old.page_type,
+                aliases=_unique([*old.aliases, *current.aliases]),
+                description="\n\n".join(
+                    _unique([old.description, current.description])
+                ),
+                details="\n\n".join(_unique([old.details, current.details])),
+            )
         else:
             positions[final] = len(output)
             output.append(current)
-    return output, {item.slug: mapping[mapping[item.slug]] if mapping[item.slug] in mapping else mapping[item.slug] for item in originals}
+    return output, {
+        item.slug: mapping[mapping[item.slug]]
+        if mapping[item.slug] in mapping
+        else mapping[item.slug]
+        for item in originals
+    }

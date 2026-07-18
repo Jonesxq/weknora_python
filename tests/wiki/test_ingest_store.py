@@ -38,9 +38,7 @@ NOW = datetime(2026, 7, 15, 12, tzinfo=UTC)
 
 
 def _sql(statement) -> str:
-    return " ".join(
-        str(statement.compile(dialect=postgresql.dialect())).split()
-    )
+    return " ".join(str(statement.compile(dialect=postgresql.dialect())).split())
 
 
 def test_claim_pending_sql_is_scoped_ordered_and_skip_locked() -> None:
@@ -62,7 +60,9 @@ def test_claim_pending_sql_is_scoped_ordered_and_skip_locked() -> None:
 def test_dedup_candidate_sql_is_scoped_index_equivalent_and_limited() -> None:
     statement = build_dedup_candidate_statement(
         SCOPE,
-        TopicCandidate(name="Acme", slug="entity/acme", page_type="entity", aliases=["ACME Corp"]),
+        TopicCandidate(
+            name="Acme", slug="entity/acme", page_type="entity", aliases=["ACME Corp"]
+        ),
         limit=20,
     )
     sql = _sql(statement)
@@ -86,32 +86,55 @@ def test_dedup_candidate_sql_is_scoped_index_equivalent_and_limited() -> None:
     assert "least(" not in sql.lower()
 
 
-def test_dedup_single_name_sql_has_no_least_and_aliases_do_not_add_empty_query() -> None:
-    sql = _sql(build_dedup_candidate_statement(
-        SCOPE, TopicCandidate(name="Acme", slug="entity/acme", page_type="entity", aliases=[])
-    ))
+def test_dedup_single_name_sql_has_no_least_and_aliases_do_not_add_empty_query() -> (
+    None
+):
+    sql = _sql(
+        build_dedup_candidate_statement(
+            SCOPE,
+            TopicCandidate(
+                name="Acme", slug="entity/acme", page_type="entity", aliases=[]
+            ),
+        )
+    )
     assert "LEAST" not in sql
     assert sql.count(" <-> ") == 2  # select distance + KNN order
 
 
 def _dedup_row(**updates) -> WikiPage:
     values = {
-        "id": uuid4(), "tenant_id": SCOPE.tenant_id, "knowledge_base_id": KB_ID,
-        "slug": "entity/db", "title": "Database", "page_type": "entity",
-        "status": "published", "deleted_at": None, "aliases": ["DB"],
+        "id": uuid4(),
+        "tenant_id": SCOPE.tenant_id,
+        "knowledge_base_id": KB_ID,
+        "slug": "entity/db",
+        "title": "Database",
+        "page_type": "entity",
+        "status": "published",
+        "deleted_at": None,
+        "aliases": ["DB"],
     }
     values.update(updates)
     return WikiPage(**values)
 
 
 class _DedupSession:
-    def __init__(self, rows): self.rows = rows
-    async def __aenter__(self): return self
-    async def __aexit__(self, *_args): return None
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
     async def execute(self, _statement):
         class Result:
-            def __init__(self, rows): self.rows = rows
-            def all(self): return [(row, float(index)) for index, row in enumerate(self.rows)]
+            def __init__(self, rows):
+                self.rows = rows
+
+            def all(self):
+                return [(row, float(index)) for index, row in enumerate(self.rows)]
+
         return Result(self.rows)
 
 
@@ -120,26 +143,43 @@ class _QuerySession:
         self.batches = list(batches)
         self.calls = 0
 
-    async def __aenter__(self): return self
-    async def __aexit__(self, *_args): return None
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
     async def execute(self, _statement):
         batch = self.batches[self.calls]
         self.calls += 1
+
         class Result:
-            def __init__(self, rows): self.rows = rows
-            def all(self): return self.rows
+            def __init__(self, rows):
+                self.rows = rows
+
+            def all(self):
+                return self.rows
+
         return Result(batch)
 
 
 class _RowLike(Sequence[object]):
-    def __init__(self, page: WikiPage, distance: object): self.values = (page, distance)
-    def __getitem__(self, index): return self.values[index]
-    def __len__(self): return 2
+    def __init__(self, page: WikiPage, distance: object):
+        self.values = (page, distance)
+
+    def __getitem__(self, index):
+        return self.values[index]
+
+    def __len__(self):
+        return 2
 
 
 @pytest.mark.asyncio
 async def test_dedup_query_aggregates_min_distance_and_global_top_limit() -> None:
-    main = [(_dedup_row(slug=f"entity/main-{index}"), float(index + 1)) for index in range(20)]
+    main = [
+        (_dedup_row(slug=f"entity/main-{index}"), float(index + 1))
+        for index in range(20)
+    ]
     alias_best = _dedup_row(slug="entity/alias-best")
     duplicate = main[5][0]
     row_like = _RowLike(alias_best, 0.01)
@@ -147,7 +187,10 @@ async def test_dedup_query_aggregates_min_distance_and_global_top_limit() -> Non
     session = _QuerySession([main, [row_like, _RowLike(duplicate, 0.1)]])
     store = SqlAlchemyIngestStore(lambda: session, SqlFinalizationPort())  # type: ignore[arg-type]
     result = await store.find_dedup_candidates(
-        SCOPE, TopicCandidate(name="Main", slug="entity/new", page_type="entity", aliases=["Alias"])
+        SCOPE,
+        TopicCandidate(
+            name="Main", slug="entity/new", page_type="entity", aliases=["Alias"]
+        ),
     )
     assert result[0].slug == "entity/alias-best"
     assert "entity/main-19" not in [item.slug for item in result]
@@ -157,65 +200,116 @@ async def test_dedup_query_aggregates_min_distance_and_global_top_limit() -> Non
 @pytest.mark.asyncio
 @pytest.mark.parametrize("distance", [None, "bad", float("nan"), float("inf"), -0.1])
 async def test_dedup_query_rejects_invalid_distance(distance) -> None:
-    store = SqlAlchemyIngestStore(lambda: _QuerySession([[(_dedup_row(), distance)]]), SqlFinalizationPort())  # type: ignore[arg-type]
+    store = SqlAlchemyIngestStore(
+        lambda: _QuerySession([[(_dedup_row(), distance)]]), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
     with pytest.raises(InvariantError):
-        await store.find_dedup_candidates(SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity"))
+        await store.find_dedup_candidates(
+            SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity")
+        )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad", [[_dedup_row()], [(_dedup_row(), 1.0, "extra")], [(object(), 1.0)]])
+@pytest.mark.parametrize(
+    "bad", [[_dedup_row()], [(_dedup_row(), 1.0, "extra")], [(object(), 1.0)]]
+)
 async def test_dedup_query_rejects_bad_result_shape(bad) -> None:
     store = SqlAlchemyIngestStore(lambda: _QuerySession([bad]), SqlFinalizationPort())  # type: ignore[arg-type]
     with pytest.raises(InvariantError):
-        await store.find_dedup_candidates(SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity"))
+        await store.find_dedup_candidates(
+            SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity")
+        )
 
 
 @pytest.mark.asyncio
 async def test_dedup_query_validates_late_alias_batch_after_limit_is_full() -> None:
     first = [(_dedup_row(slug=f"entity/{index}"), float(index)) for index in range(20)]
     bad = _dedup_row(slug="entity/bad", tenant_id=99)
-    store = SqlAlchemyIngestStore(lambda: _QuerySession([first, [(bad, 1.0)]]), SqlFinalizationPort())  # type: ignore[arg-type]
+    store = SqlAlchemyIngestStore(
+        lambda: _QuerySession([first, [(bad, 1.0)]]), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
     with pytest.raises(InvariantError):
-        await store.find_dedup_candidates(SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity", aliases=["B"]))
+        await store.find_dedup_candidates(
+            SCOPE,
+            TopicCandidate(
+                name="A", slug="entity/new", page_type="entity", aliases=["B"]
+            ),
+        )
 
 
 @pytest.mark.asyncio
 async def test_find_dedup_candidates_returns_detached_frozen_snapshots() -> None:
-    first, second = _dedup_row(slug="entity/a", aliases=["A"]), _dedup_row(slug="entity/b", aliases=["B"])
-    store = SqlAlchemyIngestStore(lambda: _DedupSession([first, second]), SqlFinalizationPort())  # type: ignore[arg-type]
-    result = await store.find_dedup_candidates(SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity"))
+    first, second = (
+        _dedup_row(slug="entity/a", aliases=["A"]),
+        _dedup_row(slug="entity/b", aliases=["B"]),
+    )
+    store = SqlAlchemyIngestStore(
+        lambda: _DedupSession([first, second]), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
+    result = await store.find_dedup_candidates(
+        SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity")
+    )
     first.aliases.append("mutated")
-    assert [(item.slug, item.aliases) for item in result] == [("entity/a", ("A",)), ("entity/b", ("B",))]
+    assert [(item.slug, item.aliases) for item in result] == [
+        ("entity/a", ("A",)),
+        ("entity/b", ("B",)),
+    ]
     with pytest.raises(Exception):
         result[0].aliases += ("nope",)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("updates", [
-    {"tenant_id": 8}, {"knowledge_base_id": uuid4()}, {"deleted_at": NOW},
-    {"status": "draft"}, {"page_type": "concept", "slug": "concept/db"},
-])
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"tenant_id": 8},
+        {"knowledge_base_id": uuid4()},
+        {"deleted_at": NOW},
+        {"status": "draft"},
+        {"page_type": "concept", "slug": "concept/db"},
+    ],
+)
 async def test_find_dedup_candidates_rejects_polluted_rows(updates) -> None:
-    store = SqlAlchemyIngestStore(lambda: _DedupSession([_dedup_row(**updates)]), SqlFinalizationPort())  # type: ignore[arg-type]
+    store = SqlAlchemyIngestStore(
+        lambda: _DedupSession([_dedup_row(**updates)]), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
     with pytest.raises(InvariantError):
-        await store.find_dedup_candidates(SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity"))
+        await store.find_dedup_candidates(
+            SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity")
+        )
 
 
 @pytest.mark.asyncio
 async def test_find_dedup_candidates_rejects_overflow_and_dirty_aliases() -> None:
-    overflow = SqlAlchemyIngestStore(lambda: _DedupSession([_dedup_row(slug=f"entity/{index}") for index in range(2)]), SqlFinalizationPort())  # type: ignore[arg-type]
+    overflow = SqlAlchemyIngestStore(
+        lambda: _DedupSession(
+            [_dedup_row(slug=f"entity/{index}") for index in range(2)]
+        ),
+        SqlFinalizationPort(),
+    )  # type: ignore[arg-type]
     with pytest.raises(InvariantError):
-        await overflow.find_dedup_candidates(SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity"), limit=1)
-    dirty = SqlAlchemyIngestStore(lambda: _DedupSession([_dedup_row(aliases=["", "A", "A"])]), SqlFinalizationPort())  # type: ignore[arg-type]
+        await overflow.find_dedup_candidates(
+            SCOPE,
+            TopicCandidate(name="A", slug="entity/new", page_type="entity"),
+            limit=1,
+        )
+    dirty = SqlAlchemyIngestStore(
+        lambda: _DedupSession([_dedup_row(aliases=["", "A", "A"])]),
+        SqlFinalizationPort(),
+    )  # type: ignore[arg-type]
     with pytest.raises(InvariantError):
-        await dirty.find_dedup_candidates(SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity"))
+        await dirty.find_dedup_candidates(
+            SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity")
+        )
 
 
 @pytest.mark.parametrize("limit", [True, 0, 21])
 def test_dedup_candidate_statement_rejects_invalid_limit(limit: int) -> None:
     with pytest.raises(ValueError):
         build_dedup_candidate_statement(
-            SCOPE, TopicCandidate(name="Acme", slug="entity/acme", page_type="entity"), limit=limit
+            SCOPE,
+            TopicCandidate(name="Acme", slug="entity/acme", page_type="entity"),
+            limit=limit,
         )
 
 
@@ -232,7 +326,10 @@ def test_claim_outbox_sql_excludes_sent_and_future_events() -> None:
     assert "task_outbox.available_at <=" in sql
     assert "task_outbox.claimed_at IS NULL" in sql
     assert "task_outbox.claimed_at <" in sql
-    assert "ORDER BY task_outbox.available_at, task_outbox.created_at, task_outbox.id" in sql
+    assert (
+        "ORDER BY task_outbox.available_at, task_outbox.created_at, task_outbox.id"
+        in sql
+    )
     assert "FOR UPDATE SKIP LOCKED" in sql
 
 
@@ -256,11 +353,19 @@ def test_outbox_dedup_is_stable_scoped_sha256() -> None:
     assert len(key) == 64
     int(key, 16)
     variants = {
-        build_outbox_dedup_key(8, KB_ID, "wiki.batch.trigger", "knowledge-1", "version-1"),
-        build_outbox_dedup_key(7, uuid4(), "wiki.batch.trigger", "knowledge-1", "version-1"),
+        build_outbox_dedup_key(
+            8, KB_ID, "wiki.batch.trigger", "knowledge-1", "version-1"
+        ),
+        build_outbox_dedup_key(
+            7, uuid4(), "wiki.batch.trigger", "knowledge-1", "version-1"
+        ),
         build_outbox_dedup_key(7, KB_ID, "other", "knowledge-1", "version-1"),
-        build_outbox_dedup_key(7, KB_ID, "wiki.batch.trigger", "knowledge-2", "version-1"),
-        build_outbox_dedup_key(7, KB_ID, "wiki.batch.trigger", "knowledge-1", "version-2"),
+        build_outbox_dedup_key(
+            7, KB_ID, "wiki.batch.trigger", "knowledge-2", "version-1"
+        ),
+        build_outbox_dedup_key(
+            7, KB_ID, "wiki.batch.trigger", "knowledge-1", "version-2"
+        ),
     }
     assert key not in variants
     assert len(variants) == 5
@@ -275,11 +380,12 @@ def test_finalization_sql_uses_named_conflict_and_strict_release_identity() -> N
         subtask_name="wiki",
     )
     register_sql = _sql(build_finalization_register_statement(request))
-    release_sql = _sql(
-        build_finalization_release_statement(request, released_at=NOW)
-    )
+    release_sql = _sql(build_finalization_release_statement(request, released_at=NOW))
 
-    assert "ON CONFLICT ON CONSTRAINT uq_wiki_finalization_markers_attempt DO NOTHING" in register_sql
+    assert (
+        "ON CONFLICT ON CONSTRAINT uq_wiki_finalization_markers_attempt DO NOTHING"
+        in register_sql
+    )
     assert "RETURNING wiki_finalization_markers.id" in register_sql
     for column in (
         "tenant_id",

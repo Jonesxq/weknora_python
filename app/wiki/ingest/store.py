@@ -14,14 +14,30 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import Select, Text, cast, delete, func, literal_column, or_, select, update
+from sqlalchemy import (
+    Select,
+    Text,
+    cast,
+    delete,
+    func,
+    literal_column,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.exc import IntegrityError
 
 from app.wiki.domain import extract_wiki_links
 from app.wiki.ingest.ports import FinalizationPort
-from app.wiki.ingest.schemas import DedupPageCandidate, FinalizationRequest, ReducedPage, SourceKnowledge, TopicCandidate
+from app.wiki.ingest.schemas import (
+    DedupPageCandidate,
+    FinalizationRequest,
+    ReducedPage,
+    SourceKnowledge,
+    TopicCandidate,
+)
 from app.wiki.models import (
     TaskOutbox,
     WikiFinalizationMarker,
@@ -34,6 +50,8 @@ from app.wiki.sql_page_store import (
     SqlAlchemyPageStore,
     build_link_backfill_statement,
 )
+
+_MAX_DEDUP_QUERY_NAMES = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,16 +199,30 @@ def _dedup_limit(limit: int) -> int:
 
 def _dedup_names_expression():
     """与 ix_wiki_pages_dedup_names_trgm 完全相同的索引表达式。"""
-    return func.lower(WikiPage.title).op("||")(literal_column("' '")).op("||")(
-        func.lower(func.coalesce(cast(WikiPage.aliases, Text), literal_column("''")))
+    return (
+        func.lower(WikiPage.title)
+        .op("||")(literal_column("' '"))
+        .op("||")(
+            func.lower(
+                func.coalesce(cast(WikiPage.aliases, Text), literal_column("''"))
+            )
+        )
     )
 
 
 def build_dedup_candidate_statement(
-    scope: WikiScope, candidate: TopicCandidate, limit: int = 20, *, query_name: str | None = None
+    scope: WikiScope,
+    candidate: TopicCandidate,
+    limit: int = 20,
+    *,
+    query_name: str | None = None,
 ) -> Select[tuple[WikiPage, float]]:
     """构造限定范围的 pg_trgm 候选页查询。"""
     checked_limit = _dedup_limit(limit)
+    try:
+        candidate = TopicCandidate.model_validate(candidate.model_dump(mode="python"))
+    except (ValidationError, TypeError, AttributeError, ValueError) as exc:
+        raise ValueError("dedup candidate 无效") from exc
     query = query_name if query_name is not None else candidate.name
     if not isinstance(query, str) or not query.strip():
         raise ValueError("dedup query_name 不能为空")
@@ -317,15 +349,17 @@ def build_finalization_release_statement(
 
 
 class SqlFinalizationPort:
-    async def register(self, session: AsyncSession, request: FinalizationRequest) -> bool:
+    async def register(
+        self, session: AsyncSession, request: FinalizationRequest
+    ) -> bool:
         result = await session.execute(build_finalization_register_statement(request))
         return result.scalar_one_or_none() is not None
 
-    async def release(self, session: AsyncSession, request: FinalizationRequest) -> bool:
+    async def release(
+        self, session: AsyncSession, request: FinalizationRequest
+    ) -> bool:
         result = await session.execute(
-            build_finalization_release_statement(
-                request, released_at=datetime.now(UTC)
-            )
+            build_finalization_release_statement(request, released_at=datetime.now(UTC))
         )
         return result.scalar_one_or_none() is not None
 
@@ -363,6 +397,8 @@ def _outbox_record(row: TaskOutbox) -> OutboxEventRecord:
 
 
 def _dedup_candidate_record(row: WikiPage) -> DedupPageCandidate:
+    if type(row.aliases) is not list:
+        raise InvariantError("dedup 页面 aliases 必须是 JSON 数组")
     try:
         return DedupPageCandidate(
             slug=row.slug,
@@ -470,9 +506,7 @@ async def _enqueue_follow_up(
             },
             available_at=datetime.now(UTC) + timedelta(seconds=5),
         )
-        .on_conflict_do_nothing(
-            constraint="uq_task_outbox_scope_event_dedup"
-        )
+        .on_conflict_do_nothing(constraint="uq_task_outbox_scope_event_dedup")
     )
 
 
@@ -506,9 +540,7 @@ async def _enqueue_claim_recovery(
             },
             available_at=available_at,
         )
-        .on_conflict_do_nothing(
-            constraint="uq_task_outbox_scope_event_dedup"
-        )
+        .on_conflict_do_nothing(constraint="uq_task_outbox_scope_event_dedup")
     )
 
 
@@ -770,17 +802,27 @@ class SqlAlchemyIngestStore:
             cleaned = " ".join(name.split())
             if cleaned and cleaned not in names:
                 names.append(cleaned)
+        if len(names) > _MAX_DEDUP_QUERY_NAMES:
+            raise ValueError("dedup 查询名称不能超过 64 个")
         async with self._session_factory() as session:
             rows: list[tuple[WikiPage, object]] = []
             for name in names:
-                result = await session.execute(build_dedup_candidate_statement(scope, candidate, limit, query_name=name))
+                result = await session.execute(
+                    build_dedup_candidate_statement(
+                        scope, candidate, limit, query_name=name
+                    )
+                )
                 found = list(result.all())
                 if len(found) > limit:
                     raise InvariantError("dedup 查询返回超过 limit 的候选")
                 rows.extend(found)
         merged: dict[str, tuple[WikiPage, float]] = {}
         for result_row in rows:
-            if isinstance(result_row, (str, bytes)) or not isinstance(result_row, Sequence) or len(result_row) != 2:
+            if (
+                isinstance(result_row, (str, bytes))
+                or not isinstance(result_row, Sequence)
+                or len(result_row) != 2
+            ):
                 raise InvariantError("dedup 查询返回行形状无效")
             row, distance = result_row
             if not isinstance(row, WikiPage):
@@ -793,14 +835,29 @@ class SqlAlchemyIngestStore:
                 or row.page_type != candidate.page_type
             ):
                 raise InvariantError("dedup 查询返回越界页面")
-            if not isinstance(distance, Real) or isinstance(distance, bool) or not math.isfinite(float(distance)) or float(distance) < 0:
+            if (
+                not isinstance(distance, Real)
+                or isinstance(distance, bool)
+                or not math.isfinite(float(distance))
+                or float(distance) < 0
+            ):
                 raise InvariantError("dedup 查询返回无效距离")
             old = merged.get(row.slug)
-            if old is not None and (old[0].id != row.id or old[0].title != row.title or old[0].page_type != row.page_type or old[0].aliases != row.aliases):
+            if old is not None and (
+                old[0].id != row.id
+                or old[0].title != row.title
+                or old[0].page_type != row.page_type
+                or old[0].aliases != row.aliases
+            ):
                 raise InvariantError("dedup 查询返回冲突页面")
             if old is None or float(distance) < old[1]:
                 merged[row.slug] = (row, float(distance))
-        return [_dedup_candidate_record(row) for _, (row, _) in sorted(merged.items(), key=lambda item: (item[1][1], item[0]))[:limit]]
+        return [
+            _dedup_candidate_record(row)
+            for _, (row, _) in sorted(
+                merged.items(), key=lambda item: (item[1][1], item[0])
+            )[:limit]
+        ]
 
     async def apply_results(
         self,
@@ -859,21 +916,25 @@ class SqlAlchemyIngestStore:
                 pending_by_id = {row.id: row for row in pending_rows}
 
                 slugs = [page.slug for page in snapshots]
-                existing_rows = list(
-                    (
-                        await session.execute(
-                            select(WikiPage)
-                            .where(
-                                WikiPage.tenant_id == scope.tenant_id,
-                                WikiPage.knowledge_base_id
-                                == scope.knowledge_base_id,
-                                WikiPage.slug.in_(slugs),
-                                WikiPage.deleted_at.is_(None),
+                existing_rows = (
+                    list(
+                        (
+                            await session.execute(
+                                select(WikiPage)
+                                .where(
+                                    WikiPage.tenant_id == scope.tenant_id,
+                                    WikiPage.knowledge_base_id
+                                    == scope.knowledge_base_id,
+                                    WikiPage.slug.in_(slugs),
+                                    WikiPage.deleted_at.is_(None),
+                                )
+                                .with_for_update()
                             )
-                            .with_for_update()
-                        )
-                    ).scalars()
-                ) if slugs else []
+                        ).scalars()
+                    )
+                    if slugs
+                    else []
+                )
                 existing_by_slug = {row.slug: row for row in existing_rows}
                 persisted: list[tuple[WikiPage, ReducedPage]] = []
                 for reduced in snapshots:
@@ -922,7 +983,9 @@ class SqlAlchemyIngestStore:
                         )
                         session.add(row)
                     else:
-                        changed = any(getattr(row, key) != value for key, value in values.items())
+                        changed = any(
+                            getattr(row, key) != value for key, value in values.items()
+                        )
                         if changed:
                             row.version += 1
                         for key, value in values.items():
@@ -1014,8 +1077,7 @@ class SqlAlchemyIngestStore:
                     await session.execute(
                         select(func.count(WikiPendingOp.id)).where(
                             WikiPendingOp.tenant_id == scope.tenant_id,
-                            WikiPendingOp.knowledge_base_id
-                            == scope.knowledge_base_id,
+                            WikiPendingOp.knowledge_base_id == scope.knowledge_base_id,
                         )
                     )
                 ).scalar_one()
