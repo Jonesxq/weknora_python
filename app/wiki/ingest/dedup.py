@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Protocol
 from uuid import UUID
 
@@ -22,6 +23,61 @@ from app.wiki.ingest.store import ExistingPageRecord
 from app.wiki.scope import WikiScope
 
 _MAX_DEDUP_QUERY_NAMES = 64
+
+
+async def _cancel_and_drain_workers(tasks: Sequence[asyncio.Task[object]]) -> bool:
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    drain = asyncio.gather(*tasks, return_exceptions=True)
+    cancelled_again = False
+    while not drain.done():
+        try:
+            await asyncio.shield(drain)
+        except asyncio.CancelledError:
+            cancelled_again = True
+    await asyncio.shield(drain)
+    return cancelled_again
+
+
+@dataclass
+class _Accumulator:
+    slug: str
+    title: str
+    page_type: str
+    aliases: list[str] = field(default_factory=list)
+    alias_seen: set[str] = field(default_factory=set)
+    descriptions: list[str] = field(default_factory=list)
+    description_seen: set[str] = field(default_factory=set)
+    details: list[str] = field(default_factory=list)
+    details_seen: set[str] = field(default_factory=set)
+
+    def add(self, candidate: TopicCandidate, *, include_name: bool) -> None:
+        for value in ((candidate.name,) if include_name else ()) + tuple(
+            candidate.aliases
+        ):
+            value = value.strip()
+            if value and value not in self.alias_seen:
+                self.alias_seen.add(value)
+                self.aliases.append(value)
+        for value, parts, seen in (
+            (candidate.description, self.descriptions, self.description_seen),
+            (candidate.details, self.details, self.details_seen),
+        ):
+            value = value.strip()
+            if value and value not in seen:
+                seen.add(value)
+                parts.append(value)
+
+    def finalize(self) -> TopicCandidate:
+        return TopicCandidate(
+            name=self.title,
+            slug=self.slug,
+            page_type=self.page_type,
+            aliases=self.aliases,
+            description="\n\n".join(self.descriptions),
+            details="\n\n".join(self.details),
+        )
 
 
 class DedupStorePort(Protocol):
@@ -266,10 +322,10 @@ async def deduplicate_candidates(
     workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
     try:
         await asyncio.gather(*workers)
-    except BaseException:
-        for task in workers:
-            task.cancel()
-        await asyncio.gather(*workers, return_exceptions=True)
+    except BaseException as original:
+        cancelled_again = await _cancel_and_drain_workers(workers)
+        if cancelled_again and not isinstance(original, asyncio.CancelledError):
+            raise asyncio.CancelledError from original
         raise
     for item, found_targets in zip(undecided, results, strict=True):
         if found_targets is None:
@@ -311,44 +367,26 @@ async def deduplicate_candidates(
         ).items():
             if canonical is not None:
                 mapping[slug] = canonical
-    output: list[TopicCandidate] = []
-    positions: dict[str, int] = {}
+    resolved_groups: dict[str, _Accumulator] = {}
+    final_order: list[str] = []
     for cluster in clusters:
         representative = _combine(cluster)
         final = mapping[cluster[0].slug]
         target = targets.get(final)
-        current = (
-            TopicCandidate(
-                name=target.title,
-                slug=target.slug,
-                page_type=target.page_type,
-                aliases=_unique(
-                    [
-                        *target.aliases,
-                        *[v for c in cluster for v in (c.name, *c.aliases)],
-                    ]
-                ),
-                description=representative.description,
-                details=representative.details,
+        group = resolved_groups.get(final)
+        if group is None:
+            group = _Accumulator(
+                final,
+                target.title if target else representative.name,
+                target.page_type if target else representative.page_type,
             )
-            if target
-            else representative.model_copy(deep=True)
-        )
-        if final in positions:
-            old = output[positions[final]]
-            output[positions[final]] = TopicCandidate(
-                name=old.name,
-                slug=old.slug,
-                page_type=old.page_type,
-                aliases=_unique([*old.aliases, *current.aliases]),
-                description="\n\n".join(
-                    _unique([old.description, current.description])
-                ),
-                details="\n\n".join(_unique([old.details, current.details])),
-            )
-        else:
-            positions[final] = len(output)
-            output.append(current)
+            if target:
+                group.aliases.extend(target.aliases)
+                group.alias_seen.update(target.aliases)
+            resolved_groups[final] = group
+            final_order.append(final)
+        group.add(representative, include_name=target is not None)
+    output = [resolved_groups[slug].finalize() for slug in final_order]
     return output, {
         item.slug: mapping[mapping[item.slug]]
         if mapping[item.slug] in mapping
