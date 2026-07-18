@@ -6,6 +6,7 @@ from collections.abc import Iterable, Mapping
 import copy
 import os
 import re
+from types import MappingProxyType
 from typing import Any, Literal, Self
 from uuid import UUID
 
@@ -38,23 +39,34 @@ class _FrozenValueModel(BaseModel):
 class _FrozenMapping(Mapping[str, tuple[str, ...]]):
     """可深拷贝且不继承 dict 的只读映射。"""
 
-    __slots__ = ("_items",)
+    __slots__ = ("_items", "_lookup")
 
     def __init__(self, values: Mapping[str, tuple[str, ...]] | Iterable[tuple[str, tuple[str, ...]]]) -> None:
         source = values.items() if isinstance(values, Mapping) else values
-        self._items = tuple((key, tuple(value)) for key, value in source)
+        items = tuple((key, tuple(value)) for key, value in source)
+        object.__setattr__(self, "_items", items)
+        object.__setattr__(self, "_lookup", MappingProxyType(dict(items)))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("citation refs 映射不可修改")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("citation refs 映射不可修改")
 
     def __getitem__(self, key: str) -> tuple[str, ...]:
-        for stored_key, value in self._items:
-            if stored_key == key:
-                return value
-        raise KeyError(key)
+        return self._lookup[key]
 
     def __iter__(self):  # type: ignore[no-untyped-def]
         return (key for key, _ in self._items)
 
     def __len__(self) -> int:
         return len(self._items)
+
+    def items(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        return self._items
+
+    def _iter_pairs(self) -> Iterable[tuple[str, tuple[str, ...]]]:
+        return iter(self._items)
 
     def __deepcopy__(self, memo: dict[int, object]) -> Self:
         return type(self)(copy.deepcopy(self._items, memo))
@@ -501,6 +513,8 @@ class CitationBatchOutput(_FrozenValueModel):
 
     @field_serializer("refs_by_slug")
     def serialize_refs_by_slug(self, value: Mapping[str, tuple[str, ...]]) -> dict[str, tuple[str, ...]]:
+        if isinstance(value, _FrozenMapping):
+            return dict(value._iter_pairs())
         return dict(value)
 
     @field_validator("refs_by_slug")

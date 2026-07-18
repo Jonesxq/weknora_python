@@ -716,3 +716,24 @@ def test_incremental_frozen_dtos_keep_json_and_deep_copy_contracts() -> None:
     assert copied_output.refs_by_slug is not output.refs_by_slug
     assert copied_output.model_dump() == output.model_dump()
     assert json.loads(output.model_dump_json()) == {"refs_by_slug": {"entity/acme": ["c001"]}, "supplemental_candidates": []}
+
+
+def test_citation_mapping_items_preserve_pair_order_for_linear_dumps() -> None:
+    output = CitationBatchOutput(
+        refs_by_slug={
+            "entity/first": ["c001"],
+            "entity/second": ["c002"],
+            "entity/third": ["c003"],
+        }
+    )
+
+    assert tuple(output.refs_by_slug.items()) == (
+        ("entity/first", ("c001",)),
+        ("entity/second", ("c002",)),
+        ("entity/third", ("c003",)),
+    )
+    assert dict(output.refs_by_slug) == {
+        "entity/first": ("c001",),
+        "entity/second": ("c002",),
+        "entity/third": ("c003",),
+    }

@@ -21,6 +21,7 @@ from app.wiki.ingest.ports import (
 )
 from app.wiki.ingest.schemas import (
     CitationBatchChunk,
+    CitationBatchOutput,
     CitationBatchRequest,
     DedupCandidateRequest,
     DedupPageCandidate,
@@ -532,8 +533,14 @@ def test_fake_citation_mappings_are_deeply_isolated() -> None:
     second = asyncio.run(model.classify_chunks(request)).refs_by_slug
 
     assert len({id(dataset_refs), id(model_refs), id(first), id(second)}) == 4
-    with pytest.raises(AttributeError):
-        first._values["entity/acme"] = ("c999",)  # type: ignore[attr-defined]
+    before_dump = CitationBatchOutput(refs_by_slug=first).model_dump()
+    with pytest.raises((AttributeError, TypeError)):
+        first._items = (("bad/key", ("bad",)),)  # type: ignore[attr-defined]
+    with pytest.raises((AttributeError, TypeError)):
+        first._lookup = {}  # type: ignore[attr-defined]
+    with pytest.raises(TypeError):
+        first._lookup["entity/acme"] = ("c999",)  # type: ignore[attr-defined]
+    assert CitationBatchOutput(refs_by_slug=first).model_dump() == before_dump
     assert dataset_refs == {"entity/acme": ("c001",)}
     assert model_refs == {"entity/acme": ("c001",)}
     assert second == {"entity/acme": ("c001",)}
