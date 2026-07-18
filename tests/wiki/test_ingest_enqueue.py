@@ -57,12 +57,12 @@ class MemorySource:
 
 
 class MemoryStore:
-    def __init__(self) -> None:
+    def __init__(self, events: list[str] | None = None) -> None:
         self.pending_id = uuid4()
         self.outbox_id = uuid4()
         self.calls: list[tuple[WikiScope, SourceKnowledge, dict[str, object]]] = []
         self.retract_calls: list[tuple[WikiScope, str, str, dict[str, object]]] = []
-        self.events: list[str] = []
+        self.events = events if events is not None else []
         self.error: BaseException | None = None
 
     async def enqueue_ingest(
@@ -112,9 +112,11 @@ class MemoryStore:
 
 
 class MemoryTombstones:
-    def __init__(self, *, deleted: bool = False) -> None:
+    def __init__(
+        self, *, deleted: bool = False, events: list[str] | None = None
+    ) -> None:
         self.deleted = deleted
-        self.events: list[str] = []
+        self.events = events if events is not None else []
         self.error: BaseException | None = None
 
     async def mark_deleted(self, scope: WikiScope, knowledge_id: str) -> None:
@@ -180,19 +182,28 @@ async def test_ingest_tombstone_skips_before_reading_source_body_or_store() -> N
 @pytest.mark.asyncio
 async def test_retract_marks_tombstone_before_store_without_reading_source() -> None:
     source = MemorySource()
-    store = MemoryStore()
-    tombstones = MemoryTombstones()
+    events: list[str] = []
+    store = MemoryStore(events)
+    tombstones = MemoryTombstones(events=events)
     service = WikiEnqueueService(source, store, tombstones)  # type: ignore[arg-type]
 
     result = await service.enqueue_retract(SCOPE, " knowledge-1 ", " version-2 ")
 
     assert result.pending_op_id == store.pending_id
     assert tombstones.deleted is True
-    assert tombstones.events == ["tombstone_mark"]
+    assert events == ["tombstone_mark", "store_retract"]
     assert store.retract_calls == [
         (SCOPE, "knowledge-1", "version-2", {"knowledge_id": "knowledge-1"})
     ]
     assert source.calls == []
+
+
+def test_retract_order_assertion_rejects_reversed_substitute() -> None:
+    with pytest.raises(AssertionError):
+        assert ["store_retract", "tombstone_mark"] == [
+            "tombstone_mark",
+            "store_retract",
+        ]
 
 
 @pytest.mark.asyncio
@@ -202,8 +213,9 @@ async def test_retract_marks_tombstone_before_store_without_reading_source() -> 
 async def test_retract_tombstone_failure_or_cancellation_never_calls_store(
     error: BaseException,
 ) -> None:
-    store = MemoryStore()
-    tombstones = MemoryTombstones()
+    events: list[str] = []
+    store = MemoryStore(events)
+    tombstones = MemoryTombstones(events=events)
     tombstones.error = error
 
     with pytest.raises(type(error)):
@@ -212,6 +224,7 @@ async def test_retract_tombstone_failure_or_cancellation_never_calls_store(
         )  # type: ignore[arg-type]
 
     assert store.retract_calls == []
+    assert events == ["tombstone_mark"]
 
 
 @pytest.mark.asyncio

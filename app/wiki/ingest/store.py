@@ -344,6 +344,18 @@ def build_outbox_dedup_key(
     return hashlib.sha256(canonical.encode("ascii")).hexdigest()
 
 
+def build_operation_outbox_identity(op: str, knowledge_id: str) -> str:
+    """编码不受前缀碰撞影响的 Wiki 操作身份。"""
+
+    if type(op) is not str or op not in {"ingest", "retract"}:
+        raise ValueError("outbox op 必须是 ingest 或 retract")
+    return json.dumps(
+        [op, knowledge_id],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
 def build_finalization_register_statement(request: FinalizationRequest):
     return (
         postgresql.insert(WikiFinalizationMarker)
@@ -963,7 +975,7 @@ class SqlAlchemyIngestStore:
         delay_seconds: int,
     ) -> EnqueueRecord:
         event_type = "wiki.batch.trigger"
-        dedup_identity = knowledge_id if op == "ingest" else f"{op}:{knowledge_id}"
+        dedup_identity = build_operation_outbox_identity(op, knowledge_id)
         dedup_key = build_outbox_dedup_key(
             scope.tenant_id,
             scope.knowledge_base_id,

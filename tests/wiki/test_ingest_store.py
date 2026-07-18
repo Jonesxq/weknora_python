@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy.dialects import postgresql
 
+from app.wiki.ingest import store as ingest_store
 from app.wiki.ingest.schemas import FinalizationRequest, ReducedPage, SourceKnowledge
 from app.wiki.ingest.store import (
     ClaimLost,
@@ -372,6 +373,48 @@ def test_outbox_dedup_is_stable_scoped_sha256() -> None:
     }
     assert key not in variants
     assert len(variants) == 5
+
+
+def test_operation_outbox_identity_is_canonical_stable_and_strict() -> None:
+    ingest = ingest_store.build_operation_outbox_identity("ingest", "retract:doc")
+    retract = ingest_store.build_operation_outbox_identity("retract", "doc")
+    special = ingest_store.build_operation_outbox_identity("ingest", "文档:一")
+
+    assert ingest == '["ingest","retract:doc"]'
+    assert retract == '["retract","doc"]'
+    assert special == '["ingest","\\u6587\\u6863:\\u4e00"]'
+    assert special == ingest_store.build_operation_outbox_identity("ingest", "文档:一")
+    for invalid in ("", "INGEST", "delete", True, None):
+        with pytest.raises(ValueError, match="op"):
+            ingest_store.build_operation_outbox_identity(  # type: ignore[attr-defined,arg-type]
+                invalid, "doc"
+            )
+
+
+def test_operation_outbox_identity_prevents_prefix_collision() -> None:
+    ingest_key = build_outbox_dedup_key(
+        7,
+        KB_ID,
+        "wiki.batch.trigger",
+        ingest_store.build_operation_outbox_identity("ingest", "retract:doc"),
+        "version-1",
+    )
+    retract_key = build_outbox_dedup_key(
+        7,
+        KB_ID,
+        "wiki.batch.trigger",
+        ingest_store.build_operation_outbox_identity("retract", "doc"),
+        "version-1",
+    )
+
+    assert ingest_key != retract_key
+    assert ingest_key == build_outbox_dedup_key(
+        7,
+        KB_ID,
+        "wiki.batch.trigger",
+        ingest_store.build_operation_outbox_identity("ingest", "retract:doc"),
+        "version-1",
+    )
 
 
 def test_finalization_sql_uses_named_conflict_and_strict_release_identity() -> None:
