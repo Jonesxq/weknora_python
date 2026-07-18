@@ -25,11 +25,12 @@ from app.wiki.ingest.store import (
     build_outbox_dedup_key,
     _cancel_claim_recovery,
     _enqueue_follow_up,
+    _finalization_request,
     _pending_record,
     build_dedup_candidate_statement,
 )
 from app.wiki.ingest.schemas import TopicCandidate
-from app.wiki.models import WikiPage, WikiPendingOp
+from app.wiki.models import TaskOutbox, WikiPage, WikiPageContribution, WikiPendingOp
 from app.wiki.scope import WikiScope
 
 
@@ -613,3 +614,537 @@ async def test_result_pages_require_completed_contributors(
             failed_op_ids=failed_ids,
             expected_pages={page.slug: None},
         )
+
+
+class _ScriptedResult:
+    def __init__(self, *, rows=(), scalar=None) -> None:
+        self._rows = list(rows)
+        self._scalar = scalar
+
+    def scalars(self):
+        return list(self._rows)
+
+    def scalar_one_or_none(self):
+        return self._scalar
+
+
+class _ScriptedSession:
+    def __init__(self, results, events: list[str] | None = None) -> None:
+        self.results = list(results)
+        self.statements = []
+        self.events = events if events is not None else []
+        self.rolled_back = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, *_args):
+        if exc_type is not None:
+            self.rolled_back = True
+        return None
+
+    def begin(self):
+        return self
+
+    async def execute(self, statement):
+        self.statements.append(statement)
+        sql = _sql(statement)
+        self.events.append(sql)
+        if "pg_advisory_xact_lock" in sql:
+            return _ScriptedResult()
+        if not self.results:
+            raise AssertionError(f"unexpected SQL: {sql}")
+        result = self.results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    async def flush(self) -> None:
+        self.events.append("FLUSH")
+        return None
+
+
+class _OneSessionFactory:
+    def __init__(self, session: _ScriptedSession) -> None:
+        self.session = session
+
+    def __call__(self):
+        return self.session
+
+
+class _RecordingFinalization:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        registered: bool = True,
+        release_ok: bool = True,
+    ) -> None:
+        self.events = events
+        self.registered = registered
+        self.release_ok = release_ok
+        self.requests: list[tuple[str, FinalizationRequest]] = []
+
+    async def register(self, _session, request: FinalizationRequest) -> bool:
+        self.events.append(f"finalization.register:{request.attempt}")
+        self.requests.append(("register", request))
+        return self.registered
+
+    async def release(self, _session, request: FinalizationRequest) -> bool:
+        self.events.append(f"finalization.release:{request.attempt}")
+        self.requests.append(("release", request))
+        return self.release_ok
+
+
+def _pending(
+    *,
+    knowledge_id: str = "knowledge-1",
+    op: str = "ingest",
+    version: str = "version-1",
+    claimed: bool = False,
+) -> WikiPendingOp:
+    return WikiPendingOp(
+        id=uuid4(),
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        knowledge_id=knowledge_id,
+        op=op,
+        op_version=version,
+        payload={"knowledge_id": knowledge_id},
+        fail_count=0,
+        enqueued_at=NOW,
+        claimed_at=NOW if claimed else None,
+        claim_token=uuid4() if claimed else None,
+    )
+
+
+def _outbox() -> TaskOutbox:
+    return TaskOutbox(
+        id=uuid4(),
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        event_type="wiki.batch.trigger",
+        dedup_key="a" * 64,
+        payload={"tenant_id": SCOPE.tenant_id},
+        available_at=NOW,
+    )
+
+
+def _contribution(
+    *,
+    knowledge_id: str,
+    slug: str = "entity/acme",
+    version: str = "version-1",
+    page_type: str = "entity",
+    refs: list[str] | None = None,
+) -> WikiPageContribution:
+    return WikiPageContribution(
+        id=uuid4(),
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        slug=slug,
+        knowledge_id=knowledge_id,
+        op_version=version,
+        page_type=page_type,
+        state="active",
+        title="Acme",
+        content=f"content:{knowledge_id}",
+        summary=f"summary:{knowledge_id}",
+        aliases=[knowledge_id],
+        chunk_refs=refs or [f"chunk:{knowledge_id}"],
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def _page(
+    *,
+    slug: str = "entity/acme",
+    page_type: str = "entity",
+    sources: list[str] | None = None,
+    chunks: list[str] | None = None,
+) -> WikiPage:
+    return WikiPage(
+        id=uuid4(),
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        slug=slug,
+        title="Stable title",
+        page_type=page_type,
+        status="published",
+        content="Stable [[entity/linked]] content",
+        summary="Stable summary",
+        aliases=["Stable alias"],
+        source_refs=sources or [],
+        chunk_refs=chunks or [],
+        version=4,
+        created_at=NOW,
+        updated_at=NOW,
+        deleted_at=None,
+    )
+
+
+def _knowledge(version: str = "version-2") -> SourceKnowledge:
+    return SourceKnowledge(
+        id="knowledge-1",
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        title="Document",
+        op_version=version,
+    )
+
+
+@pytest.mark.asyncio
+async def test_enqueue_ingest_releases_and_deletes_only_old_unclaimed_versions() -> (
+    None
+):
+    old = _pending(version="version-1")
+    new = _pending(version="version-2")
+    outbox = _outbox()
+    events: list[str] = []
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(rows=[old]),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=new.id),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=new),
+            _ScriptedResult(scalar=outbox),
+        ],
+        events,
+    )
+    finalization = _RecordingFinalization(events)
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
+
+    result = await store.enqueue_ingest(
+        SCOPE, _knowledge(), {"knowledge_id": "knowledge-1"}, delay_seconds=0
+    )
+
+    assert result.id == new.id and result.deduplicated is False
+    first_sql = _sql(session.statements[0])
+    assert "wiki_pending_ops.claimed_at IS NULL" in first_sql
+    assert "wiki_pending_ops.op_version !=" in first_sql
+    assert "FOR UPDATE" in first_sql
+    delete_sql = _sql(session.statements[1])
+    assert delete_sql.startswith("DELETE FROM wiki_pending_ops")
+    assert "wiki_pending_ops.claimed_at IS NULL" in delete_sql
+    assert [(kind, request.attempt) for kind, request in finalization.requests] == [
+        ("release", "version-1"),
+        ("register", "version-2"),
+    ]
+    assert events.index("finalization.release:version-1") < events.index(
+        "finalization.register:version-2"
+    )
+
+
+@pytest.mark.asyncio
+async def test_enqueue_ingest_duplicate_does_not_insert_release_or_emit_outbox() -> (
+    None
+):
+    pending = _pending(version="version-2")
+    outbox = _outbox()
+    events: list[str] = []
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(scalar=pending),
+            _ScriptedResult(scalar=outbox),
+        ],
+        events,
+    )
+    finalization = _RecordingFinalization(events, registered=False)
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
+
+    result = await store.enqueue(
+        SCOPE, _knowledge(), {"knowledge_id": "knowledge-1"}, delay_seconds=0
+    )
+
+    assert result.id == pending.id and result.deduplicated is True
+    assert not any(sql.startswith("INSERT INTO wiki_pending_ops") for sql in events)
+    assert not any(sql.startswith("INSERT INTO task_outbox") for sql in events)
+    assert [kind for kind, _request in finalization.requests] == ["register"]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_ingest_release_failure_rolls_back_before_new_insert() -> None:
+    events: list[str] = []
+    session = _ScriptedSession([_ScriptedResult(rows=[_pending()])], events)
+    finalization = _RecordingFinalization(events, release_ok=False)
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
+
+    with pytest.raises(InvariantError, match="finalization"):
+        await store.enqueue_ingest(SCOPE, _knowledge(), {"knowledge_id": "knowledge-1"})
+
+    assert session.rolled_back is True
+    assert len(session.statements) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload,delay",
+    [({"knowledge_id": "knowledge-1"}, True), ([], 0), ({}, 0)],
+)
+async def test_enqueue_ingest_rejects_invalid_payload_and_delay_before_session(
+    payload, delay
+) -> None:
+    class ExplodingFactory:
+        def __call__(self):
+            raise AssertionError("invalid boundary must not open a session")
+
+    store = SqlAlchemyIngestStore(ExplodingFactory(), SqlFinalizationPort())  # type: ignore[arg-type]
+    with pytest.raises((TypeError, ValueError)):
+        await store.enqueue_ingest(SCOPE, _knowledge(), payload, delay_seconds=delay)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_retract_removes_only_target_refs_and_keeps_visible_page() -> (
+    None
+):
+    target = _contribution(knowledge_id="knowledge-1", refs=["chunk:a"])
+    remaining = _contribution(knowledge_id="knowledge-2", refs=["chunk:b"])
+    page = _page(sources=["knowledge-1", "knowledge-2"], chunks=["chunk:a", "chunk:b"])
+    pending = _pending(op="retract", version="delete-1")
+    outbox = _outbox()
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[target]),
+            _ScriptedResult(scalar=page),
+            _ScriptedResult(rows=[remaining]),
+            _ScriptedResult(scalar=pending.id),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=pending),
+            _ScriptedResult(scalar=outbox),
+        ]
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), _RecordingFinalization(session.events)
+    )  # type: ignore[arg-type]
+    before = (page.title, page.content, page.summary, list(page.aliases), page.status)
+
+    result = await store.enqueue_retract(
+        SCOPE,
+        "knowledge-1",
+        "delete-1",
+        {"knowledge_id": "knowledge-1"},
+        delay_seconds=0,
+    )
+
+    assert result.id == pending.id and result.deduplicated is False
+    assert target.state == "retract_pending"
+    assert page.source_refs == ["knowledge-2"]
+    assert page.chunk_refs == ["chunk:b"]
+    assert page.version == 5 and page.deleted_at is None
+    assert (page.title, page.content, page.summary, page.aliases, page.status) == before
+    assert not any("wiki_links" in _sql(statement) for statement in session.statements)
+    first_page_select = next(
+        index
+        for index, event in enumerate(session.events)
+        if event.startswith("SELECT wiki_pages.")
+    )
+    assert session.events.index("FLUSH") < first_page_select
+
+
+@pytest.mark.asyncio
+async def test_enqueue_retract_unique_source_soft_deletes_and_clears_links() -> None:
+    target = _contribution(knowledge_id="knowledge-1", refs=["chunk:a"])
+    page = _page(sources=["knowledge-1"], chunks=["chunk:a"])
+    pending = _pending(op="retract", version="delete-1")
+    outbox = _outbox()
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[target]),
+            _ScriptedResult(scalar=page),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=pending.id),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=pending),
+            _ScriptedResult(scalar=outbox),
+        ]
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), _RecordingFinalization(session.events)
+    )  # type: ignore[arg-type]
+
+    await store.enqueue_retract(
+        SCOPE,
+        "knowledge-1",
+        "delete-1",
+        {"knowledge_id": "knowledge-1"},
+        delay_seconds=0,
+    )
+
+    assert target.state == "retract_pending"
+    assert page.deleted_at is not None
+    assert page.source_refs == [] and page.chunk_refs == []
+    assert page.version == 5
+    link_sql = [
+        _sql(statement)
+        for statement in session.statements
+        if "wiki_links" in _sql(statement)
+    ]
+    assert link_sql[0].startswith("DELETE FROM wiki_links")
+    assert link_sql[1].startswith("UPDATE wiki_links")
+    assert all("wiki_links.tenant_id" in sql for sql in link_sql)
+
+
+@pytest.mark.asyncio
+async def test_enqueue_retract_repeat_and_no_contributions_only_return_pending() -> (
+    None
+):
+    pending = _pending(op="retract", version="delete-1")
+    outbox = _outbox()
+    events: list[str] = []
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(scalar=pending),
+            _ScriptedResult(scalar=outbox),
+        ],
+        events,
+    )
+    finalization = _RecordingFinalization(events, registered=False)
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
+
+    result = await store.enqueue_retract(
+        SCOPE, "knowledge-1", "delete-1", {"knowledge_id": "knowledge-1"}
+    )
+
+    assert result.id == pending.id and result.deduplicated is True
+    assert "pg_advisory_xact_lock" in _sql(session.statements[0])
+    assert len(session.statements) == 5
+    assert not any(sql.startswith("INSERT") for sql in events)
+
+
+def test_finalization_identity_distinguishes_retract_from_ingest() -> None:
+    ingest = _finalization_request(SCOPE, "knowledge-1", "version-1", "ingest")
+    retract = _finalization_request(SCOPE, "knowledge-1", "version-1", "retract")
+
+    assert ingest.subtask_name == "wiki"
+    assert retract.subtask_name == "wiki-retract"
+    assert ingest != retract
+
+
+@pytest.mark.asyncio
+async def test_enqueue_retract_keeps_claimed_ingest_and_releases_unclaimed() -> None:
+    unclaimed = _pending(version="version-1")
+    pending = _pending(op="retract", version="delete-1")
+    outbox = _outbox()
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(rows=[unclaimed]),
+            _ScriptedResult(),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(scalar=pending.id),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=pending),
+            _ScriptedResult(scalar=outbox),
+        ]
+    )
+    finalization = _RecordingFinalization(session.events)
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
+
+    await store.enqueue_retract(
+        SCOPE, "knowledge-1", "delete-1", {"knowledge_id": "knowledge-1"}
+    )
+
+    select_sql = next(
+        _sql(statement)
+        for statement in session.statements
+        if _sql(statement).startswith("SELECT wiki_pending_ops.")
+    )
+    assert "wiki_pending_ops.claimed_at IS NULL" in select_sql
+    assert "FOR UPDATE" in select_sql
+    assert ("release", "version-1") in [
+        (kind, request.attempt) for kind, request in finalization.requests
+    ]
+    assert any(
+        _sql(statement).startswith("DELETE FROM wiki_pending_ops")
+        for statement in session.statements
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("problem", ["missing", "scope", "type", "refs"])
+async def test_enqueue_retract_dirty_or_missing_page_rolls_back(problem: str) -> None:
+    target = _contribution(knowledge_id="knowledge-1")
+    page = _page(sources=["knowledge-1"], chunks=["chunk:knowledge-1"])
+    if problem == "scope":
+        page.tenant_id = SCOPE.tenant_id + 1
+    elif problem == "type":
+        page.page_type = "concept"
+    elif problem == "refs":
+        page.source_refs = ["polluted"]
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[target]),
+            _ScriptedResult(scalar=None if problem == "missing" else page),
+            _ScriptedResult(rows=[]),
+        ]
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), _RecordingFinalization(session.events)
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(InvariantError):
+        await store.enqueue_retract(
+            SCOPE, "knowledge-1", "delete-1", {"knowledge_id": "knowledge-1"}
+        )
+
+    assert session.rolled_back is True
+
+
+@pytest.mark.asyncio
+async def test_enqueue_retract_locks_slugs_in_stable_order() -> None:
+    second = _contribution(knowledge_id="knowledge-1", slug="entity/z")
+    first = _contribution(knowledge_id="knowledge-1", slug="entity/a")
+    page_a = _page(
+        slug="entity/a", sources=["knowledge-1"], chunks=["chunk:knowledge-1"]
+    )
+    page_z = _page(
+        slug="entity/z", sources=["knowledge-1"], chunks=["chunk:knowledge-1"]
+    )
+    pending = _pending(op="retract", version="delete-1")
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[second, first]),
+            _ScriptedResult(scalar=page_a),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=page_z),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=pending.id),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=pending),
+            _ScriptedResult(scalar=_outbox()),
+        ]
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), _RecordingFinalization(session.events)
+    )  # type: ignore[arg-type]
+
+    await store.enqueue_retract(
+        SCOPE, "knowledge-1", "delete-1", {"knowledge_id": "knowledge-1"}
+    )
+
+    page_selects = [
+        statement
+        for statement in session.statements
+        if _sql(statement).startswith("SELECT wiki_pages.")
+    ]
+    assert [
+        statement.compile(dialect=postgresql.dialect()).params["slug_1"]
+        for statement in page_selects
+    ] == [
+        "entity/a",
+        "entity/z",
+    ]

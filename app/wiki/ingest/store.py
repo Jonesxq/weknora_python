@@ -31,18 +31,22 @@ from sqlalchemy.exc import IntegrityError
 
 from app.wiki.domain import extract_wiki_links
 from app.wiki.ingest.ports import FinalizationPort
+from app.wiki.ingest.retract import project_active_refs
 from app.wiki.ingest.schemas import (
     DedupPageCandidate,
     FinalizationRequest,
     ReducedPage,
     SourceKnowledge,
+    StoredContributionRecord,
     TopicCandidate,
 )
 from app.wiki.models import (
     TaskOutbox,
     WikiFinalizationMarker,
     WikiLogEntry,
+    WikiLink,
     WikiPage,
+    WikiPageContribution,
     WikiPendingOp,
 )
 from app.wiki.scope import WikiScope
@@ -137,6 +141,25 @@ class IngestStore(Protocol):
         self,
         scope: WikiScope,
         knowledge: SourceKnowledge,
+        payload: dict[str, object],
+        *,
+        delay_seconds: int = 30,
+    ) -> EnqueueRecord: ...
+
+    async def enqueue_ingest(
+        self,
+        scope: WikiScope,
+        knowledge: SourceKnowledge,
+        payload: dict[str, object],
+        *,
+        delay_seconds: int = 30,
+    ) -> EnqueueRecord: ...
+
+    async def enqueue_retract(
+        self,
+        scope: WikiScope,
+        knowledge_id: str,
+        op_version: str,
         payload: dict[str, object],
         *,
         delay_seconds: int = 30,
@@ -566,6 +589,96 @@ async def _cancel_claim_recovery(
     )
 
 
+def _validate_enqueue_boundary(
+    scope: WikiScope,
+    knowledge_id: str,
+    op_version: str,
+    payload: dict[str, object],
+    delay_seconds: int,
+) -> tuple[str, str, dict[str, object]]:
+    if not isinstance(scope, WikiScope):
+        raise TypeError("scope 必须是 WikiScope")
+    if not isinstance(knowledge_id, str) or not knowledge_id.strip():
+        raise ValueError("knowledge_id 不能为空")
+    if not isinstance(op_version, str) or not op_version.strip():
+        raise ValueError("op_version 不能为空")
+    if type(payload) is not dict:
+        raise TypeError("payload 必须是 dict")
+    checked_id = knowledge_id.strip()
+    checked_version = op_version.strip()
+    if payload.get("knowledge_id") != checked_id:
+        raise ValueError("payload 与知识条目标识不一致")
+    if type(delay_seconds) is not int:
+        raise TypeError("delay_seconds 必须是整数")
+    if delay_seconds < 0:
+        raise ValueError("delay_seconds 不能小于 0")
+    return checked_id, checked_version, deepcopy(payload)
+
+
+def _finalization_request(
+    scope: WikiScope, knowledge_id: str, op_version: str, op: str
+) -> FinalizationRequest:
+    if op not in {"ingest", "retract"}:
+        raise ValueError("finalization op 无效")
+    return FinalizationRequest(
+        tenant_id=scope.tenant_id,
+        knowledge_base_id=scope.knowledge_base_id,
+        knowledge_id=knowledge_id,
+        attempt=op_version,
+        subtask_name="wiki" if op == "ingest" else "wiki-retract",
+    )
+
+
+def _retract_scope_lock_key(scope: WikiScope) -> int:
+    identity = f"wiki-retract:{scope.tenant_id}:{scope.knowledge_base_id}".encode(
+        "ascii"
+    )
+    return int.from_bytes(hashlib.sha256(identity).digest()[:8], "big", signed=True)
+
+
+def _validate_pending_row(
+    row: WikiPendingOp, scope: WikiScope, knowledge_id: str
+) -> None:
+    if (
+        not isinstance(row, WikiPendingOp)
+        or row.tenant_id != scope.tenant_id
+        or row.knowledge_base_id != scope.knowledge_base_id
+        or row.knowledge_id != knowledge_id
+        or row.op != "ingest"
+        or row.claimed_at is not None
+        or not isinstance(row.op_version, str)
+        or not row.op_version.strip()
+    ):
+        raise InvariantError("旧 pending-op 的 scope 或身份无效")
+
+
+def _contribution_record(row: WikiPageContribution) -> StoredContributionRecord:
+    if not isinstance(row, WikiPageContribution):
+        raise InvariantError("贡献查询返回了无效记录")
+    try:
+        return StoredContributionRecord(
+            id=row.id,
+            tenant_id=row.tenant_id,
+            knowledge_base_id=row.knowledge_base_id,
+            slug=row.slug,
+            knowledge_id=row.knowledge_id,
+            op_version=row.op_version,
+            page_type=row.page_type,
+            state=row.state,
+            title=row.title,
+            content=row.content,
+            summary=row.summary,
+            aliases=tuple(row.aliases) if type(row.aliases) is list else row.aliases,
+            chunk_refs=(
+                tuple(row.chunk_refs)
+                if type(row.chunk_refs) is list
+                else row.chunk_refs
+            ),
+        )
+    except (ValidationError, TypeError, ValueError) as exc:
+        raise InvariantError("贡献查询返回了脏数据") from exc
+
+
 class SqlAlchemyIngestStore:
     """每个公开操作使用独立短 session 的 PostgreSQL 摄取仓储。"""
 
@@ -585,98 +698,355 @@ class SqlAlchemyIngestStore:
         *,
         delay_seconds: int = 30,
     ) -> EnqueueRecord:
-        if delay_seconds < 0:
-            raise ValueError("delay_seconds 不能小于 0")
+        """兼容阶段二调用方的 ingest 入队别名。"""
+
+        return await self.enqueue_ingest(
+            scope, knowledge, payload, delay_seconds=delay_seconds
+        )
+
+    async def enqueue_ingest(
+        self,
+        scope: WikiScope,
+        knowledge: SourceKnowledge,
+        payload: dict[str, object],
+        *,
+        delay_seconds: int = 30,
+    ) -> EnqueueRecord:
+        if not isinstance(knowledge, SourceKnowledge):
+            raise TypeError("knowledge 必须是 SourceKnowledge")
+        knowledge_id, op_version, checked_payload = _validate_enqueue_boundary(
+            scope,
+            knowledge.id,
+            knowledge.op_version,
+            payload,
+            delay_seconds,
+        )
         if (
             knowledge.tenant_id != scope.tenant_id
             or knowledge.knowledge_base_id != scope.knowledge_base_id
-            or payload.get("knowledge_id") != knowledge.id
         ):
             raise ValueError("知识条目、payload 与 WikiScope 不一致")
+        async with self._session_factory() as session:
+            async with session.begin():
+                await self._cancel_unclaimed_ingest(
+                    session,
+                    scope,
+                    knowledge_id,
+                    excluding_op_version=op_version,
+                )
+                return await self._enqueue_operation(
+                    session,
+                    scope,
+                    knowledge_id,
+                    "ingest",
+                    op_version,
+                    checked_payload,
+                    delay_seconds,
+                )
+
+    async def enqueue_retract(
+        self,
+        scope: WikiScope,
+        knowledge_id: str,
+        op_version: str,
+        payload: dict[str, object],
+        *,
+        delay_seconds: int = 30,
+    ) -> EnqueueRecord:
+        knowledge_id, op_version, checked_payload = _validate_enqueue_boundary(
+            scope, knowledge_id, op_version, payload, delay_seconds
+        )
+        async with self._session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    select(func.pg_advisory_xact_lock(_retract_scope_lock_key(scope)))
+                )
+                await self._cancel_unclaimed_ingest(session, scope, knowledge_id)
+                contributions = list(
+                    (
+                        await session.execute(
+                            select(WikiPageContribution)
+                            .where(
+                                WikiPageContribution.tenant_id == scope.tenant_id,
+                                WikiPageContribution.knowledge_base_id
+                                == scope.knowledge_base_id,
+                                WikiPageContribution.knowledge_id == knowledge_id,
+                                WikiPageContribution.state == "active",
+                            )
+                            .order_by(
+                                WikiPageContribution.slug,
+                                WikiPageContribution.id,
+                            )
+                            .with_for_update()
+                        )
+                    ).scalars()
+                )
+                by_slug: dict[str, list[StoredContributionRecord]] = {}
+                now = datetime.now(UTC)
+                for row in contributions:
+                    record = _contribution_record(row)
+                    if (
+                        record.tenant_id != scope.tenant_id
+                        or record.knowledge_base_id != scope.knowledge_base_id
+                        or record.knowledge_id != knowledge_id
+                        or record.state != "active"
+                    ):
+                        raise InvariantError("活动贡献的 scope 或来源身份无效")
+                    by_slug.setdefault(record.slug, []).append(record)
+                    row.state = "retract_pending"
+                    row.updated_at = now
+
+                await session.flush()
+                for slug in sorted(by_slug):
+                    page = (
+                        await session.execute(
+                            select(WikiPage)
+                            .where(
+                                WikiPage.tenant_id == scope.tenant_id,
+                                WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                                WikiPage.slug == slug,
+                                WikiPage.deleted_at.is_(None),
+                            )
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    remaining_rows = list(
+                        (
+                            await session.execute(
+                                select(WikiPageContribution)
+                                .where(
+                                    WikiPageContribution.tenant_id == scope.tenant_id,
+                                    WikiPageContribution.knowledge_base_id
+                                    == scope.knowledge_base_id,
+                                    WikiPageContribution.slug == slug,
+                                    WikiPageContribution.state == "active",
+                                )
+                                .order_by(
+                                    WikiPageContribution.knowledge_id,
+                                    WikiPageContribution.op_version,
+                                    WikiPageContribution.id,
+                                )
+                                .with_for_update()
+                            )
+                        ).scalars()
+                    )
+                    remaining = [_contribution_record(row) for row in remaining_rows]
+                    self._validate_retract_page(
+                        scope, slug, page, [*by_slug[slug], *remaining]
+                    )
+                    source_refs, chunk_refs = project_active_refs(remaining)
+                    if remaining:
+                        if (
+                            page.source_refs != source_refs
+                            or page.chunk_refs != chunk_refs
+                        ):
+                            page.source_refs = source_refs
+                            page.chunk_refs = chunk_refs
+                            page.version += 1
+                            page.updated_at = now
+                    else:
+                        page.source_refs = []
+                        page.chunk_refs = []
+                        page.deleted_at = now
+                        page.updated_at = now
+                        page.version += 1
+                        await session.execute(
+                            delete(WikiLink).where(
+                                WikiLink.tenant_id == scope.tenant_id,
+                                WikiLink.knowledge_base_id == scope.knowledge_base_id,
+                                WikiLink.source_page_id == page.id,
+                            )
+                        )
+                        await session.execute(
+                            update(WikiLink)
+                            .where(
+                                WikiLink.tenant_id == scope.tenant_id,
+                                WikiLink.knowledge_base_id == scope.knowledge_base_id,
+                                WikiLink.target_page_id == page.id,
+                            )
+                            .values(target_page_id=None)
+                        )
+                await session.flush()
+                return await self._enqueue_operation(
+                    session,
+                    scope,
+                    knowledge_id,
+                    "retract",
+                    op_version,
+                    checked_payload,
+                    delay_seconds,
+                )
+
+    async def _cancel_unclaimed_ingest(
+        self,
+        session: AsyncSession,
+        scope: WikiScope,
+        knowledge_id: str,
+        *,
+        excluding_op_version: str | None = None,
+    ) -> None:
+        statement = select(WikiPendingOp).where(
+            WikiPendingOp.tenant_id == scope.tenant_id,
+            WikiPendingOp.knowledge_base_id == scope.knowledge_base_id,
+            WikiPendingOp.knowledge_id == knowledge_id,
+            WikiPendingOp.op == "ingest",
+            WikiPendingOp.claimed_at.is_(None),
+        )
+        if excluding_op_version is not None:
+            statement = statement.where(
+                WikiPendingOp.op_version != excluding_op_version
+            )
+        rows = list(
+            (
+                await session.execute(
+                    statement.order_by(
+                        WikiPendingOp.op_version, WikiPendingOp.id
+                    ).with_for_update()
+                )
+            ).scalars()
+        )
+        for row in rows:
+            _validate_pending_row(row, scope, knowledge_id)
+            released = await self._finalization.release(
+                session,
+                _finalization_request(scope, knowledge_id, row.op_version, "ingest"),
+            )
+            if not released:
+                raise InvariantError("finalization marker 不存在或已被释放")
+        if rows:
+            result = await session.execute(
+                delete(WikiPendingOp).where(
+                    WikiPendingOp.tenant_id == scope.tenant_id,
+                    WikiPendingOp.knowledge_base_id == scope.knowledge_base_id,
+                    WikiPendingOp.knowledge_id == knowledge_id,
+                    WikiPendingOp.op == "ingest",
+                    WikiPendingOp.claimed_at.is_(None),
+                    WikiPendingOp.id.in_([row.id for row in rows]),
+                )
+            )
+            rowcount = getattr(result, "rowcount", None)
+            if rowcount is not None and rowcount != len(rows):
+                raise InvariantError("取消旧 pending-op 时行数不一致")
+
+    @staticmethod
+    def _validate_retract_page(
+        scope: WikiScope,
+        slug: str,
+        page: WikiPage | None,
+        active_before: Sequence[StoredContributionRecord],
+    ) -> None:
+        if page is None:
+            raise InvariantError("活动贡献缺少对应的活动页面")
+        page_types = {record.page_type for record in active_before}
+        if (
+            page.tenant_id != scope.tenant_id
+            or page.knowledge_base_id != scope.knowledge_base_id
+            or page.slug != slug
+            or page.deleted_at is not None
+            or page_types != {page.page_type}
+            or type(page.source_refs) is not list
+            or type(page.chunk_refs) is not list
+        ):
+            raise InvariantError("活动页面的 scope、类型或 refs 无效")
+        expected_sources, expected_chunks = project_active_refs(active_before)
+        if page.source_refs != expected_sources or page.chunk_refs != expected_chunks:
+            raise InvariantError("活动页面 refs 与贡献投影不一致")
+
+    async def _enqueue_operation(
+        self,
+        session: AsyncSession,
+        scope: WikiScope,
+        knowledge_id: str,
+        op: str,
+        op_version: str,
+        payload: dict[str, object],
+        delay_seconds: int,
+    ) -> EnqueueRecord:
         event_type = "wiki.batch.trigger"
+        dedup_identity = knowledge_id if op == "ingest" else f"{op}:{knowledge_id}"
         dedup_key = build_outbox_dedup_key(
             scope.tenant_id,
             scope.knowledge_base_id,
             event_type,
-            knowledge.id,
-            knowledge.op_version,
+            dedup_identity,
+            op_version,
         )
-        now = datetime.now(UTC)
-        async with self._session_factory() as session:
-            async with session.begin():
-                registered = await self._finalization.register(
-                    session, FinalizationRequest.from_knowledge(scope, knowledge)
-                )
-                inserted_id: UUID | None = None
-                if registered:
-                    inserted = await session.execute(
-                        postgresql.insert(WikiPendingOp)
-                        .values(
-                            tenant_id=scope.tenant_id,
-                            knowledge_base_id=scope.knowledge_base_id,
-                            knowledge_id=knowledge.id,
-                            op="ingest",
-                            op_version=knowledge.op_version,
-                            payload=dict(payload),
-                        )
-                        .on_conflict_do_nothing(
-                            constraint="uq_wiki_pending_ops_version"
-                        )
-                        .returning(WikiPendingOp.id)
-                    )
-                    inserted_id = inserted.scalar_one_or_none()
-                    await session.execute(
-                        postgresql.insert(TaskOutbox)
-                        .values(
-                            tenant_id=scope.tenant_id,
-                            knowledge_base_id=scope.knowledge_base_id,
-                            event_type=event_type,
-                            dedup_key=dedup_key,
-                            payload={
-                                "tenant_id": scope.tenant_id,
-                                "knowledge_base_id": str(scope.knowledge_base_id),
-                            },
-                            available_at=now + timedelta(seconds=delay_seconds),
-                        )
-                        .on_conflict_do_nothing(
-                            constraint="uq_task_outbox_scope_event_dedup"
-                        )
-                    )
-                pending = (
-                    await session.execute(
-                        select(WikiPendingOp).where(
-                            WikiPendingOp.tenant_id == scope.tenant_id,
-                            WikiPendingOp.knowledge_base_id == scope.knowledge_base_id,
-                            WikiPendingOp.knowledge_id == knowledge.id,
-                            WikiPendingOp.op == "ingest",
-                            WikiPendingOp.op_version == knowledge.op_version,
-                        )
-                    )
-                ).scalar_one_or_none()
-                outbox = (
-                    await session.execute(
-                        select(TaskOutbox).where(
-                            TaskOutbox.tenant_id == scope.tenant_id,
-                            TaskOutbox.knowledge_base_id == scope.knowledge_base_id,
-                            TaskOutbox.event_type == event_type,
-                            TaskOutbox.dedup_key == dedup_key,
-                        )
-                    )
-                ).scalar_one_or_none()
-                return EnqueueRecord(
-                    id=pending.id if pending is not None else None,
+        registered = await self._finalization.register(
+            session, _finalization_request(scope, knowledge_id, op_version, op)
+        )
+        inserted_id: UUID | None = None
+        if registered:
+            inserted = await session.execute(
+                postgresql.insert(WikiPendingOp)
+                .values(
                     tenant_id=scope.tenant_id,
                     knowledge_base_id=scope.knowledge_base_id,
-                    knowledge_id=knowledge.id,
-                    op_version=knowledge.op_version,
-                    payload=(
-                        deepcopy(pending.payload)
-                        if pending is not None
-                        else deepcopy(payload)
-                    ),
-                    outbox_event_id=outbox.id if outbox is not None else None,
-                    deduplicated=not registered or inserted_id is None,
+                    knowledge_id=knowledge_id,
+                    op=op,
+                    op_version=op_version,
+                    payload=deepcopy(payload),
                 )
+                .on_conflict_do_nothing(constraint="uq_wiki_pending_ops_version")
+                .returning(WikiPendingOp.id)
+            )
+            inserted_id = inserted.scalar_one_or_none()
+            await session.execute(
+                postgresql.insert(TaskOutbox)
+                .values(
+                    tenant_id=scope.tenant_id,
+                    knowledge_base_id=scope.knowledge_base_id,
+                    event_type=event_type,
+                    dedup_key=dedup_key,
+                    payload={
+                        "tenant_id": scope.tenant_id,
+                        "knowledge_base_id": str(scope.knowledge_base_id),
+                    },
+                    available_at=datetime.now(UTC) + timedelta(seconds=delay_seconds),
+                )
+                .on_conflict_do_nothing(constraint="uq_task_outbox_scope_event_dedup")
+            )
+        pending = (
+            await session.execute(
+                select(WikiPendingOp).where(
+                    WikiPendingOp.tenant_id == scope.tenant_id,
+                    WikiPendingOp.knowledge_base_id == scope.knowledge_base_id,
+                    WikiPendingOp.knowledge_id == knowledge_id,
+                    WikiPendingOp.op == op,
+                    WikiPendingOp.op_version == op_version,
+                )
+            )
+        ).scalar_one_or_none()
+        outbox = (
+            await session.execute(
+                select(TaskOutbox).where(
+                    TaskOutbox.tenant_id == scope.tenant_id,
+                    TaskOutbox.knowledge_base_id == scope.knowledge_base_id,
+                    TaskOutbox.event_type == event_type,
+                    TaskOutbox.dedup_key == dedup_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if pending is not None and (
+            pending.tenant_id != scope.tenant_id
+            or pending.knowledge_base_id != scope.knowledge_base_id
+            or pending.knowledge_id != knowledge_id
+            or pending.op != op
+            or pending.op_version != op_version
+            or type(pending.payload) is not dict
+        ):
+            raise InvariantError("pending-op 快照的 scope 或身份无效")
+        return EnqueueRecord(
+            id=pending.id if pending is not None else None,
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            knowledge_id=knowledge_id,
+            op_version=op_version,
+            payload=(
+                deepcopy(pending.payload) if pending is not None else deepcopy(payload)
+            ),
+            outbox_event_id=outbox.id if outbox is not None else None,
+            deduplicated=not registered or inserted_id is None,
+        )
 
     async def claim_pending(
         self, scope: WikiScope, limit: int, claim_timeout: timedelta | int
