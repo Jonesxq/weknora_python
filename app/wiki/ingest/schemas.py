@@ -394,6 +394,7 @@ class ReducedPage(_StrictModel):
     source_refs: list[str] = Field(default_factory=list)
     chunk_refs: list[str] = Field(default_factory=list)
     contributor_op_ids: list[UUID] = Field(default_factory=list)
+    deleted: bool = False
 
     @field_validator("slug")
     @classmethod
@@ -412,6 +413,8 @@ class ReducedPage(_StrictModel):
     def validate_page_type_prefix(self) -> Self:
         if not self.slug.startswith(f"{self.page_type}/"):
             raise ValueError("slug 前缀必须与 page_type 一致")
+        if self.deleted and (self.source_refs or self.chunk_refs):
+            raise ValueError("删除页面的 source_refs 和 chunk_refs 必须为空")
         return self
 
 
@@ -458,6 +461,7 @@ class _FrozenReducedPage(_FrozenValueModel):
     source_refs: tuple[str, ...] = ()
     chunk_refs: tuple[str, ...] = ()
     contributor_op_ids: tuple[UUID, ...] = ()
+    deleted: bool = False
 
     @field_validator("slug")
     @classmethod
@@ -476,6 +480,8 @@ class _FrozenReducedPage(_FrozenValueModel):
     def validate_page_type_prefix(self) -> Self:
         if not self.slug.startswith(f"{self.page_type}/"):
             raise ValueError("slug 前缀必须与 page_type 一致")
+        if self.deleted and (self.source_refs or self.chunk_refs):
+            raise ValueError("删除页面的 source_refs 和 chunk_refs 必须为空")
         return self
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from uuid import UUID
 
 import pytest
@@ -7,15 +8,18 @@ import pytest
 from app.wiki.errors import WikiValidationError
 from app.wiki.ingest.reduce_slug import reduce_slug
 from app.wiki.ingest.schemas import (
+    ContributionDelta,
     PageMergeOutput,
     PageMergeRequest,
     ReducedPage,
     SlugUpdate,
+    StoredContributionRecord,
 )
 
 
 OP_A = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 OP_B = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+KB_ID = UUID("11111111-1111-1111-1111-111111111111")
 
 
 class RecordingModel:
@@ -73,6 +77,346 @@ def existing_page(**overrides: object) -> ReducedPage:
     return ReducedPage.model_validate(values)
 
 
+def test_reduced_page_deleted_requires_empty_refs() -> None:
+    with pytest.raises(ValueError, match="删除页面"):
+        existing_page(
+            deleted=True,
+            source_refs=["knowledge-old"],
+            chunk_refs=["chunk-old"],
+        )
+
+
+def stored_contribution(
+    knowledge_id: str,
+    *,
+    slug: str = "entity/shared",
+    op_version: str = "v1",
+    page_type: str = "entity",
+    state: str = "active",
+    title: str | None = None,
+    content: str | None = None,
+    summary: str | None = None,
+    aliases: tuple[str, ...] = (),
+    chunk_refs: tuple[str, ...] = (),
+) -> StoredContributionRecord:
+    return StoredContributionRecord(
+        tenant_id=1,
+        knowledge_base_id=KB_ID,
+        slug=slug,
+        knowledge_id=knowledge_id,
+        op_version=op_version,
+        page_type=page_type,
+        state=state,
+        title=title or f"{knowledge_id} title",
+        content=content or f"{knowledge_id} content",
+        summary=summary or f"{knowledge_id} summary",
+        aliases=aliases,
+        chunk_refs=chunk_refs,
+    )
+
+
+def contribution_delta(
+    action: str,
+    knowledge_id: str,
+    *,
+    pending_op_id: UUID = OP_A,
+    previous: StoredContributionRecord | None = None,
+    current: StoredContributionRecord | None = None,
+    slug: str = "entity/shared",
+) -> ContributionDelta:
+    return ContributionDelta(
+        pending_op_id=pending_op_id,
+        action=action,
+        slug=slug,
+        knowledge_id=knowledge_id,
+        previous=previous,
+        current=current,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reduce_topic_retracts_one_source_and_merges_only_remaining_active() -> (
+    None
+):
+    model = RecordingModel()
+    doc_1 = stored_contribution(
+        "doc-1",
+        state="retract_pending",
+        aliases=("removed alias",),
+        chunk_refs=("removed chunk",),
+    )
+    doc_2 = stored_contribution(
+        "doc-2",
+        aliases=("remaining alias",),
+        chunk_refs=("remaining chunk",),
+    )
+    delta = contribution_delta("retract", "doc-1", previous=doc_1)
+
+    page = await reduce_slug(
+        "entity/shared",
+        [delta],
+        existing_page(slug="entity/shared"),
+        [doc_2],
+        model,
+    )
+
+    assert page.deleted is False
+    assert page.source_refs == ["doc-2"]
+    assert page.chunk_refs == ["remaining chunk"]
+    assert page.aliases == ["remaining alias"]
+    assert len(model.merge_requests) == 1
+    assert [item.knowledge_id for item in model.merge_requests[0].contributions] == [
+        "doc-2"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reduce_summary_retract_without_remaining_contributions_deletes_page() -> (
+    None
+):
+    model = RecordingModel()
+    previous = stored_contribution(
+        "doc-1",
+        slug="summary/doc-1",
+        page_type="summary",
+        state="retract_pending",
+    )
+    delta = contribution_delta(
+        "retract",
+        "doc-1",
+        previous=previous,
+        slug="summary/doc-1",
+    )
+    old = existing_page(
+        slug="summary/doc-1",
+        title="Doc 1",
+        page_type="summary",
+        source_refs=["doc-1"],
+        chunk_refs=[],
+    )
+
+    page = await reduce_slug("summary/doc-1", [delta], old, [], model)
+
+    assert page.deleted is True
+    assert page.aliases == []
+    assert page.source_refs == []
+    assert page.chunk_refs == []
+    assert page.contributor_op_ids == [OP_A]
+    assert model.merge_requests == []
+
+
+@pytest.mark.asyncio
+async def test_reduce_summary_with_one_active_contribution_replaces_without_model() -> (
+    None
+):
+    model = RecordingModel()
+    current = stored_contribution(
+        "doc-1",
+        slug="summary/doc-1",
+        op_version="v2",
+        page_type="summary",
+        title="New summary title",
+        content="New summary body",
+        summary="New headline",
+        aliases=("summary alias",),
+        chunk_refs=("summary chunk",),
+    )
+    delta = contribution_delta(
+        "add",
+        "doc-1",
+        current=current,
+        slug="summary/doc-1",
+    )
+    deleted_page = existing_page(
+        slug="summary/doc-1",
+        page_type="summary",
+        deleted=True,
+        source_refs=[],
+        chunk_refs=[],
+    )
+
+    page = await reduce_slug("summary/doc-1", [delta], deleted_page, [], model)
+
+    assert page == ReducedPage(
+        slug="summary/doc-1",
+        title="New summary title",
+        page_type="summary",
+        content="New summary body",
+        summary="New headline",
+        aliases=["summary alias"],
+        source_refs=["doc-1"],
+        chunk_refs=["summary chunk"],
+        contributor_op_ids=[OP_A],
+        deleted=False,
+    )
+    assert model.merge_requests == []
+
+
+@pytest.mark.asyncio
+async def test_reduce_summary_rejects_multiple_active_contributions() -> None:
+    model = RecordingModel()
+    doc_1 = stored_contribution("doc-1", slug="summary/doc-1", page_type="summary")
+    older_doc_1 = stored_contribution(
+        "doc-1", slug="summary/doc-1", op_version="v0", page_type="summary"
+    )
+    delta = contribution_delta("add", "doc-1", current=doc_1, slug="summary/doc-1")
+
+    with pytest.raises(WikiValidationError, match="恰好一份"):
+        await reduce_slug("summary/doc-1", [delta], None, [older_doc_1], model)
+
+    assert model.merge_requests == []
+
+
+@pytest.mark.asyncio
+async def test_reduce_applies_all_delta_actions_without_modifying_inputs() -> None:
+    model = RecordingModel()
+    keep = stored_contribution("doc-keep", aliases=("keep",))
+    old_replace = stored_contribution("doc-replace", aliases=("old",))
+    new_replace = stored_contribution(
+        "doc-replace", op_version="v2", aliases=("replacement",)
+    )
+    stale = stored_contribution("doc-stale")
+    retract_active = stored_contribution("doc-retract")
+    retract_pending = retract_active.model_copy(update={"state": "retract_pending"})
+    added = stored_contribution("doc-add", aliases=("added",))
+    active = [retract_active, stale, old_replace, keep]
+    deltas = [
+        contribution_delta(
+            "replace",
+            "doc-replace",
+            pending_op_id=OP_A,
+            previous=old_replace,
+            current=new_replace,
+        ),
+        contribution_delta(
+            "retract_stale",
+            "doc-stale",
+            pending_op_id=OP_B,
+            previous=stale,
+        ),
+        contribution_delta(
+            "retract",
+            "doc-retract",
+            pending_op_id=OP_A,
+            previous=retract_pending,
+        ),
+        contribution_delta("add", "doc-add", pending_op_id=OP_B, current=added),
+    ]
+    deltas_before = [delta.model_dump() for delta in deltas]
+    active_before = [record.model_dump() for record in active]
+
+    page = await reduce_slug(
+        "entity/shared", deltas, existing_page(slug="entity/shared"), active, model
+    )
+
+    assert [item.knowledge_id for item in model.merge_requests[0].contributions] == [
+        "doc-add",
+        "doc-keep",
+        "doc-replace",
+    ]
+    assert page.source_refs == ["doc-add", "doc-keep", "doc-replace"]
+    assert page.aliases == ["added", "keep", "replacement"]
+    assert page.contributor_op_ids == [OP_A, OP_B]
+    assert [delta.model_dump() for delta in deltas] == deltas_before
+    assert [record.model_dump() for record in active] == active_before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "delta_slug",
+        "record_slug",
+        "record_knowledge",
+        "record_type",
+        "previous_slug",
+        "previous_type",
+        "active_slug",
+        "active_type",
+        "active_state",
+        "mixed_scope",
+    ],
+)
+async def test_reduce_rejects_polluted_delta_or_active_target(case: str) -> None:
+    model = RecordingModel()
+    current = stored_contribution("doc-1")
+    delta = contribution_delta("add", "doc-1", current=current)
+    active: list[StoredContributionRecord] = []
+    if case == "delta_slug":
+        delta = delta.model_copy(update={"slug": "entity/other"})
+    elif case == "record_slug":
+        current = current.model_copy(update={"slug": "entity/other"})
+        delta = delta.model_copy(update={"current": current})
+    elif case == "record_knowledge":
+        current = current.model_copy(update={"knowledge_id": "doc-other"})
+        delta = delta.model_copy(update={"current": current})
+    elif case == "record_type":
+        current = current.model_copy(update={"page_type": "concept"})
+        delta = delta.model_copy(update={"current": current})
+    elif case in {"previous_slug", "previous_type"}:
+        previous = stored_contribution("doc-1")
+        replacement = stored_contribution("doc-1", op_version="v2")
+        delta = contribution_delta(
+            "replace", "doc-1", previous=previous, current=replacement
+        )
+        field = "slug" if case == "previous_slug" else "page_type"
+        value = "entity/other" if case == "previous_slug" else "concept"
+        delta = delta.model_copy(
+            update={"previous": previous.model_copy(update={field: value})}
+        )
+    elif case == "active_slug":
+        active = [
+            stored_contribution("doc-2").model_copy(update={"slug": "entity/other"})
+        ]
+    elif case == "active_type":
+        active = [
+            stored_contribution("doc-2").model_copy(update={"page_type": "concept"})
+        ]
+    elif case == "active_state":
+        active = [
+            stored_contribution("doc-2").model_copy(update={"state": "retract_pending"})
+        ]
+    else:
+        active = [
+            stored_contribution("doc-2").model_copy(
+                update={
+                    "knowledge_base_id": UUID("22222222-2222-2222-2222-222222222222")
+                }
+            )
+        ]
+
+    with pytest.raises(WikiValidationError):
+        await reduce_slug("entity/shared", [delta], None, active, model)
+
+    assert model.merge_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "expected",
+    [RuntimeError("merge failed"), asyncio.CancelledError("merge cancelled")],
+)
+async def test_reduce_contribution_model_failure_propagates_without_polluting_inputs(
+    expected: BaseException,
+) -> None:
+    model = RecordingModel()
+    model.error = expected  # type: ignore[assignment]
+    current = stored_contribution("doc-1")
+    delta = contribution_delta("add", "doc-1", current=current)
+    old = existing_page(slug="entity/shared")
+    delta_before = delta.model_dump()
+    current_before = current.model_dump()
+    old_before = old.model_dump()
+
+    with pytest.raises(type(expected)) as caught:
+        await reduce_slug("entity/shared", [delta], old, [], model)
+
+    assert caught.value is expected
+    assert delta.model_dump() == delta_before
+    assert current.model_dump() == current_before
+    assert old.model_dump() == old_before
+
+
 @pytest.mark.asyncio
 async def test_reduce_summary_replaces_page_without_model_call() -> None:
     model = RecordingModel()
@@ -106,7 +450,9 @@ async def test_reduce_summary_replaces_page_without_model_call() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reduce_summary_replaces_existing_page_without_inheriting_metadata() -> None:
+async def test_reduce_summary_replaces_existing_page_without_inheriting_metadata() -> (
+    None
+):
     model = RecordingModel()
     update = SlugUpdate(
         pending_op_id=OP_A,
