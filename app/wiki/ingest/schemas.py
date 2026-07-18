@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-import copy
+from collections.abc import Iterable, Mapping
 import os
 import re
 from typing import Any, Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from app.wiki.scope import WikiScope
 
@@ -29,60 +28,29 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
 
-class _FrozenList(list[Any]):
-    """保留 JSON 数组序列化语义的只读列表。"""
+class _FrozenValueModel(BaseModel):
+    """阶段三跨字段 DTO 的不可变边界。"""
 
-    def _immutable(self, *args: object, **kwargs: object) -> None:
-        raise TypeError("增量摄取 DTO 集合不可原地修改")
-
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    __iadd__ = _immutable
-    __imul__ = _immutable
-    append = _immutable
-    clear = _immutable
-    extend = _immutable
-    insert = _immutable
-    pop = _immutable
-    remove = _immutable
-    reverse = _immutable
-    sort = _immutable
-
-    def __deepcopy__(self, memo: dict[int, object]) -> Self:
-        return type(self)(copy.deepcopy(list(self), memo))
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-class _FrozenDict(dict[str, Any]):
-    """保留 JSON 对象序列化语义的只读字典。"""
+class _FrozenMapping(Mapping[str, tuple[str, ...]]):
+    """可深拷贝且不继承 dict 的只读映射。"""
 
-    def _immutable(self, *args: object, **kwargs: object) -> None:
-        raise TypeError("增量摄取 DTO 映射不可原地修改")
+    def __init__(self, values: Mapping[str, tuple[str, ...]]) -> None:
+        self._values = dict(values)
 
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    __ior__ = _immutable
-    clear = _immutable
-    pop = _immutable
-    popitem = _immutable
-    setdefault = _immutable
-    update = _immutable
+    def __getitem__(self, key: str) -> tuple[str, ...]:
+        return self._values[key]
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
 
     def __deepcopy__(self, memo: dict[int, object]) -> Self:
-        return type(self)(copy.deepcopy(dict(self), memo))
-
-
-class _InvariantModel(_StrictModel):
-    """新增跨字段 DTO 的赋值边界：校验失败时恢复原字段值。"""
-
-    def __setattr__(self, name: str, value: object) -> None:
-        old_value = self.__dict__.get(name)
-        had_value = name in self.__dict__
-        try:
-            super().__setattr__(name, value)
-        except ValidationError:
-            if had_value:
-                object.__setattr__(self, name, old_value)
-            raise
+        return self
 
 
 def _normalize_slug(value: str, allowed_prefixes: tuple[str, ...]) -> str:
@@ -395,7 +363,79 @@ class ReducedPage(_StrictModel):
         return self
 
 
-class CitationBatchChunk(_InvariantModel):
+class _FrozenTopicCandidate(_FrozenValueModel):
+    name: str
+    slug: str
+    page_type: TopicPageType
+    aliases: tuple[str, ...] = ()
+    description: str = ""
+    details: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("name 不能为空")
+        return value
+
+    @field_validator("slug")
+    @classmethod
+    def normalize_slug(cls, value: str) -> str:
+        return _normalize_slug(value, ("entity", "concept"))
+
+    @field_validator("aliases")
+    @classmethod
+    def normalize_aliases(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(_stable_clean_strings(list(value)))
+
+    @model_validator(mode="after")
+    def validate_page_type_prefix(self) -> Self:
+        if not self.slug.startswith(f"{self.page_type}/"):
+            raise ValueError("slug 前缀必须与 page_type 一致")
+        return self
+
+
+class _FrozenReducedPage(_FrozenValueModel):
+    slug: str
+    title: str
+    page_type: IngestPageType
+    content: str
+    summary: str
+    aliases: tuple[str, ...] = ()
+    source_refs: tuple[str, ...] = ()
+    chunk_refs: tuple[str, ...] = ()
+    contributor_op_ids: tuple[UUID, ...] = ()
+
+    @field_validator("slug")
+    @classmethod
+    def normalize_slug(cls, value: str) -> str:
+        return _normalize_slug(value, ("summary", "entity", "concept"))
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("页面标题不能为空")
+        return value
+
+    @model_validator(mode="after")
+    def validate_page_type_prefix(self) -> Self:
+        if not self.slug.startswith(f"{self.page_type}/"):
+            raise ValueError("slug 前缀必须与 page_type 一致")
+        return self
+
+
+def _snapshot_topic(value: TopicCandidate | _FrozenTopicCandidate | dict[str, Any]) -> object:
+    return value.model_dump() if isinstance(value, TopicCandidate) else value
+
+
+def _snapshot_page(value: ReducedPage | _FrozenReducedPage | dict[str, Any]) -> object:
+    return value.model_dump() if isinstance(value, ReducedPage) else value
+
+
+class CitationBatchChunk(_FrozenValueModel):
     alias: str
     text: str
 
@@ -416,11 +456,16 @@ class CitationBatchChunk(_InvariantModel):
         return value
 
 
-class CitationBatchRequest(_InvariantModel):
+class CitationBatchRequest(_FrozenValueModel):
     knowledge_id: str
     batch_index: int = Field(ge=0)
-    candidates: list[TopicCandidate]
-    chunks: list[CitationBatchChunk] = Field(min_length=1)
+    candidates: tuple[_FrozenTopicCandidate, ...]
+    chunks: tuple[CitationBatchChunk, ...] = Field(min_length=1)
+
+    @field_validator("candidates", mode="before")
+    @classmethod
+    def snapshot_candidates(cls, value: object) -> object:
+        return [_snapshot_topic(item) for item in value] if isinstance(value, (list, tuple)) else value
 
     @field_validator("knowledge_id")
     @classmethod
@@ -430,11 +475,6 @@ class CitationBatchRequest(_InvariantModel):
             raise ValueError("知识标识不能为空")
         return value
 
-    @field_validator("chunks")
-    @classmethod
-    def freeze_chunks(cls, value: list[CitationBatchChunk]) -> list[CitationBatchChunk]:
-        return _FrozenList(value)
-
     @model_validator(mode="after")
     def validate_unique_aliases(self) -> Self:
         aliases = [chunk.alias for chunk in self.chunks]
@@ -443,33 +483,42 @@ class CitationBatchRequest(_InvariantModel):
         return self
 
 
-class CitationBatchOutput(_InvariantModel):
-    refs_by_slug: dict[str, list[str]] = Field(default_factory=dict)
-    supplemental_candidates: list[TopicCandidate] = Field(default_factory=list)
+class CitationBatchOutput(_FrozenValueModel):
+    refs_by_slug: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
+    supplemental_candidates: tuple[_FrozenTopicCandidate, ...] = ()
+
+    @field_validator("supplemental_candidates", mode="before")
+    @classmethod
+    def snapshot_supplemental_candidates(cls, value: object) -> object:
+        return [_snapshot_topic(item) for item in value] if isinstance(value, (list, tuple)) else value
+
+    @field_serializer("refs_by_slug")
+    def serialize_refs_by_slug(self, value: Mapping[str, tuple[str, ...]]) -> dict[str, tuple[str, ...]]:
+        return dict(value)
 
     @field_validator("refs_by_slug")
     @classmethod
-    def normalize_refs(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
-        result: dict[str, list[str]] = {}
+    def normalize_refs(cls, value: Mapping[str, tuple[str, ...]]) -> Mapping[str, tuple[str, ...]]:
+        result: dict[str, tuple[str, ...]] = {}
         for slug, aliases in value.items():
             normalized_slug = _normalize_slug(slug, ("entity", "concept"))
             if normalized_slug in result:
                 raise ValueError("citation refs 的 slug 不能重复")
-            cleaned = _strict_clean_strings(aliases, "citation ref alias")
+            cleaned = _strict_clean_strings(list(aliases), "citation ref alias")
             if not cleaned:
                 raise ValueError("citation refs 不能包含空 alias 列表")
             for alias in cleaned:
                 if not re.fullmatch(r"c\d{3}", alias):
                     raise ValueError("citation ref alias 必须是 c 加三位数字")
-            result[normalized_slug] = _FrozenList(cleaned)
-        return _FrozenDict(result)
+            result[normalized_slug] = tuple(cleaned)
+        return _FrozenMapping(result)
 
 
-class DedupPageCandidate(_InvariantModel):
+class DedupPageCandidate(_FrozenValueModel):
     slug: str
     title: str
     page_type: TopicPageType
-    aliases: list[str] = Field(default_factory=list)
+    aliases: tuple[str, ...] = ()
 
     @field_validator("slug")
     @classmethod
@@ -486,8 +535,8 @@ class DedupPageCandidate(_InvariantModel):
 
     @field_validator("aliases")
     @classmethod
-    def normalize_aliases(cls, value: list[str]) -> list[str]:
-        return _FrozenList(_strict_clean_strings(value, "dedup aliases"))
+    def normalize_aliases(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(_strict_clean_strings(list(value), "dedup aliases"))
 
     @model_validator(mode="after")
     def validate_page_type_prefix(self) -> Self:
@@ -496,14 +545,14 @@ class DedupPageCandidate(_InvariantModel):
         return self
 
 
-class DedupCandidateRequest(_InvariantModel):
-    candidate: TopicCandidate
-    allowed_targets: list[DedupPageCandidate] = Field(max_length=20)
+class DedupCandidateRequest(_FrozenValueModel):
+    candidate: _FrozenTopicCandidate
+    allowed_targets: tuple[DedupPageCandidate, ...] = Field(max_length=20)
 
-    @field_validator("allowed_targets")
+    @field_validator("candidate", mode="before")
     @classmethod
-    def freeze_targets(cls, value: list[DedupPageCandidate]) -> list[DedupPageCandidate]:
-        return _FrozenList(value)
+    def snapshot_candidate(cls, value: object) -> object:
+        return _snapshot_topic(value) if isinstance(value, TopicCandidate) else value
 
     @model_validator(mode="after")
     def validate_targets(self) -> Self:
@@ -515,13 +564,8 @@ class DedupCandidateRequest(_InvariantModel):
         return self
 
 
-class DedupRequest(_InvariantModel):
-    candidates: list[DedupCandidateRequest] = Field(default_factory=list)
-
-    @field_validator("candidates")
-    @classmethod
-    def freeze_candidates(cls, value: list[DedupCandidateRequest]) -> list[DedupCandidateRequest]:
-        return _FrozenList(value)
+class DedupRequest(_FrozenValueModel):
+    candidates: tuple[DedupCandidateRequest, ...] = ()
 
     @model_validator(mode="after")
     def validate_candidate_slugs(self) -> Self:
@@ -531,7 +575,7 @@ class DedupRequest(_InvariantModel):
         return self
 
 
-class DedupDecision(_InvariantModel):
+class DedupDecision(_FrozenValueModel):
     candidate_slug: str
     canonical_slug: str | None = None
 
@@ -543,13 +587,8 @@ class DedupDecision(_InvariantModel):
         return _normalize_slug(value, ("entity", "concept"))
 
 
-class DedupOutput(_InvariantModel):
-    decisions: list[DedupDecision] = Field(default_factory=list)
-
-    @field_validator("decisions")
-    @classmethod
-    def freeze_decisions(cls, value: list[DedupDecision]) -> list[DedupDecision]:
-        return _FrozenList(value)
+class DedupOutput(_FrozenValueModel):
+    decisions: tuple[DedupDecision, ...] = ()
 
     @model_validator(mode="after")
     def validate_decision_slugs(self) -> Self:
@@ -563,7 +602,7 @@ ContributionAction = Literal["add", "replace", "retract_stale", "retract"]
 ContributionState = Literal["active", "retract_pending"]
 
 
-class StoredContributionRecord(_InvariantModel):
+class StoredContributionRecord(_FrozenValueModel):
     id: UUID | None = None
     tenant_id: int = Field(gt=0)
     knowledge_base_id: UUID
@@ -575,8 +614,8 @@ class StoredContributionRecord(_InvariantModel):
     title: str
     content: str
     summary: str
-    aliases: list[str] = Field(default_factory=list)
-    chunk_refs: list[str] = Field(default_factory=list)
+    aliases: tuple[str, ...] = ()
+    chunk_refs: tuple[str, ...] = ()
 
     @field_validator("slug")
     @classmethod
@@ -593,8 +632,8 @@ class StoredContributionRecord(_InvariantModel):
 
     @field_validator("aliases", "chunk_refs")
     @classmethod
-    def normalize_arrays(cls, value: list[str]) -> list[str]:
-        return _FrozenList(_strict_clean_strings(value, "贡献数组"))
+    def normalize_arrays(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(_strict_clean_strings(list(value), "贡献数组"))
 
     @model_validator(mode="after")
     def validate_page_type_prefix(self) -> Self:
@@ -603,7 +642,7 @@ class StoredContributionRecord(_InvariantModel):
         return self
 
 
-class ContributionDelta(_InvariantModel):
+class ContributionDelta(_FrozenValueModel):
     pending_op_id: UUID
     action: ContributionAction
     slug: str
@@ -647,7 +686,7 @@ class ContributionDelta(_InvariantModel):
         return self
 
 
-class OperationFailure(_InvariantModel):
+class OperationFailure(_FrozenValueModel):
     pending_op_id: UUID
     error_code: str
     error_summary: str
@@ -669,7 +708,7 @@ class OperationFailure(_InvariantModel):
         return value
 
 
-class PageExpectation(_InvariantModel):
+class PageExpectation(_FrozenValueModel):
     slug: str
     page_id: UUID | None = None
     version: int | None = Field(default=None, ge=1)
@@ -686,27 +725,20 @@ class PageExpectation(_InvariantModel):
         return self
 
 
-class BatchApplyRequest(_InvariantModel):
+class BatchApplyRequest(_FrozenValueModel):
     claim_token: UUID
-    pages: list[ReducedPage]
-    contribution_deltas: list[ContributionDelta]
-    completed_op_ids: list[UUID]
-    superseded_op_ids: list[UUID]
-    failures: list[OperationFailure]
-    expected_pages: list[PageExpectation]
+    pages: tuple[_FrozenReducedPage, ...]
+    contribution_deltas: tuple[ContributionDelta, ...]
+    completed_op_ids: tuple[UUID, ...]
+    superseded_op_ids: tuple[UUID, ...]
+    failures: tuple[OperationFailure, ...]
+    expected_pages: tuple[PageExpectation, ...]
     operation_id: UUID
 
-    @field_validator(
-        "pages",
-        "contribution_deltas",
-        "completed_op_ids",
-        "superseded_op_ids",
-        "failures",
-        "expected_pages",
-    )
+    @field_validator("pages", mode="before")
     @classmethod
-    def freeze_collections(cls, value: list[Any]) -> list[Any]:
-        return _FrozenList(value)
+    def snapshot_pages(cls, value: object) -> object:
+        return [_snapshot_page(item) for item in value] if isinstance(value, (list, tuple)) else value
 
     @model_validator(mode="after")
     def validate_batch_identities(self) -> Self:

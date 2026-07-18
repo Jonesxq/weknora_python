@@ -411,13 +411,14 @@ def test_fake_model_returns_citations_and_dedup_decisions_as_copies(tmp_path: Pa
 
     citations = asyncio.run(model.classify_chunks(citation_request))
     decisions = asyncio.run(model.resolve_duplicates(dedup_request))
-    with pytest.raises(TypeError):
+    with pytest.raises(AttributeError):
         citations.refs_by_slug["entity/acme"].append("c002")
-    citation_request.chunks[0].text = "Mutated"
+    with pytest.raises(ValidationError):
+        citation_request.chunks[0].text = "Mutated"
 
     assert decisions.decisions[0].canonical_slug == "entity/existing"
     assert model.citation_requests[0].chunks[0].text == "Body"
-    assert asyncio.run(model.classify_chunks(citation_request)).refs_by_slug == {"entity/acme": ["c001"]}
+    assert asyncio.run(model.classify_chunks(citation_request)).refs_by_slug == {"entity/acme": ("c001",)}
 
 
 def test_fake_model_dedup_defaults_orders_calls_and_isolates_copies(tmp_path: Path) -> None:
@@ -437,13 +438,15 @@ def test_fake_model_dedup_defaults_orders_calls_and_isolates_copies(tmp_path: Pa
     ])
 
     output = asyncio.run(model.resolve_duplicates(request))
-    output.decisions[0].canonical_slug = None
-    request.candidates[0].candidate.aliases.append("Mutated")
+    with pytest.raises(ValidationError):
+        output.decisions[0].canonical_slug = None
+    first.aliases.append("Mutated")
     next_output = asyncio.run(model.resolve_duplicates(request))
 
     assert [decision.canonical_slug for decision in next_output.decisions] == ["entity/existing", None]
+    assert next_output is not output
     assert model.calls == ["dedup:entity/acme", "dedup:entity/other", "dedup:entity/acme", "dedup:entity/other"]
-    assert model.dedup_requests[0].candidates[0].candidate.aliases == ["Acme"]
+    assert model.dedup_requests[0].candidates[0].candidate.aliases == ("Acme",)
 
 
 def test_fake_model_dedup_retries_transient_failure(tmp_path: Path) -> None:

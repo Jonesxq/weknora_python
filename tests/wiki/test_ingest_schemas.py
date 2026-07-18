@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from uuid import UUID, uuid4
 
 import pytest
@@ -409,7 +410,7 @@ def test_citation_dtos_normalize_and_reject_hidden_chunk_ids() -> None:
 
     assert request.knowledge_id == "knowledge-1"
     assert request.chunks[0].text == "Body"
-    assert output.refs_by_slug == {"entity/acme": ["c001"]}
+    assert output.refs_by_slug == {"entity/acme": ("c001",)}
     assert input_refs == {" entity/acme ": [" c001 "]}
     with pytest.raises(ValidationError):
         CitationBatchChunk(alias="c001", text="Body", chunk_id="internal")
@@ -430,7 +431,7 @@ def test_dedup_dtos_enforce_static_target_and_decision_contracts() -> None:
     request = DedupRequest(candidates=[DedupCandidateRequest(candidate=candidate, allowed_targets=[target])])
     decision = DedupDecision(candidate_slug=" ENTITY/ACME ", canonical_slug=" entity/existing ")
 
-    assert request.candidates[0].allowed_targets[0].aliases == ["Existing alias"]
+    assert request.candidates[0].allowed_targets[0].aliases == ("Existing alias",)
     assert input_aliases == [" Existing alias "]
     assert decision.candidate_slug == "entity/acme"
     assert decision.canonical_slug == "entity/existing"
@@ -533,8 +534,8 @@ def test_stored_contribution_record_strips_arrays_without_mutating_input() -> No
     payload.update(aliases=aliases, chunk_refs=chunk_refs)
     record = StoredContributionRecord(**payload)
 
-    assert record.aliases == ["Acme alias"]
-    assert record.chunk_refs == ["c001"]
+    assert record.aliases == ("Acme alias",)
+    assert record.chunk_refs == ("c001",)
     assert aliases == [" Acme alias "]
     assert chunk_refs == [" c001 "]
 
@@ -648,3 +649,67 @@ def test_incremental_dto_collections_block_in_place_invariant_breaks() -> None:
         batch.superseded_op_ids.append(batch.completed_op_ids[0])
     assert isinstance(citation.model_dump(mode="json")["chunks"], list)
     assert isinstance(batch.model_dump(mode="json")["completed_op_ids"], list)
+
+
+def test_page_expectation_failed_assignment_preserves_fields_set() -> None:
+    expectation = PageExpectation(slug="entity/acme")
+    before_fields_set = expectation.model_fields_set.copy()
+    before_dump = expectation.model_dump(exclude_unset=True)
+
+    with pytest.raises(ValidationError):
+        expectation.page_id = uuid4()
+
+    assert expectation.model_fields_set == before_fields_set
+    assert expectation.model_dump(exclude_unset=True) == before_dump
+
+
+def test_incremental_dto_nested_values_are_deeply_immutable() -> None:
+    citation = CitationBatchRequest(
+        knowledge_id="knowledge-1", batch_index=0, candidates=[],
+        chunks=[CitationBatchChunk(alias="c001", text="A"), CitationBatchChunk(alias="c002", text="B")],
+    )
+    delta = ContributionDelta(
+        pending_op_id=uuid4(), action="add", slug="entity/acme", knowledge_id="knowledge-1",
+        previous=None, current=_record(),
+    )
+    batch = BatchApplyRequest(
+        claim_token=uuid4(),
+        pages=[
+            ReducedPage(slug="entity/acme", title="Acme", page_type="entity", content="A", summary="A"),
+            ReducedPage(slug="entity/other", title="Other", page_type="entity", content="B", summary="B"),
+        ],
+        contribution_deltas=[], completed_op_ids=[], superseded_op_ids=[], failures=[], expected_pages=[], operation_id=uuid4(),
+    )
+
+    with pytest.raises((AttributeError, TypeError, ValidationError)):
+        citation.chunks[1].alias = "c001"
+    with pytest.raises((AttributeError, TypeError, ValidationError)):
+        delta.current.slug = "entity/other"  # type: ignore[union-attr]
+    with pytest.raises((AttributeError, TypeError, ValidationError)):
+        batch.pages[1].slug = "entity/acme"
+
+
+def test_incremental_dto_collections_cannot_be_bypassed_by_builtin_mutators() -> None:
+    citation = CitationBatchRequest(
+        knowledge_id="knowledge-1", batch_index=0, candidates=[],
+        chunks=[CitationBatchChunk(alias="c001", text="Body")],
+    )
+    output = CitationBatchOutput(refs_by_slug={"entity/acme": ["c001"]})
+
+    with pytest.raises(TypeError):
+        list.append(citation.chunks, CitationBatchChunk(alias="c002", text="Other"))
+    with pytest.raises(TypeError):
+        dict.__setitem__(output.refs_by_slug, "entity/other", ("c001",))
+
+
+def test_incremental_frozen_dtos_keep_json_and_deep_copy_contracts() -> None:
+    request = CitationBatchRequest(
+        knowledge_id="knowledge-1", batch_index=0, candidates=[],
+        chunks=[CitationBatchChunk(alias="c001", text="Body")],
+    )
+    output = CitationBatchOutput(refs_by_slug={"entity/acme": ["c001"]})
+    copied = request.model_copy(deep=True)
+
+    assert copied is not request
+    assert copied.chunks is not request.chunks
+    assert json.loads(output.model_dump_json()) == {"refs_by_slug": {"entity/acme": ["c001"]}, "supplemental_candidates": []}
