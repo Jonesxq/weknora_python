@@ -411,7 +411,8 @@ def test_fake_model_returns_citations_and_dedup_decisions_as_copies(tmp_path: Pa
 
     citations = asyncio.run(model.classify_chunks(citation_request))
     decisions = asyncio.run(model.resolve_duplicates(dedup_request))
-    citations.refs_by_slug["entity/acme"].append("c002")
+    with pytest.raises(TypeError):
+        citations.refs_by_slug["entity/acme"].append("c002")
     citation_request.chunks[0].text = "Mutated"
 
     assert decisions.decisions[0].canonical_slug == "entity/existing"
@@ -495,5 +496,16 @@ def test_fixture_rejects_invalid_dedup_response_keys(tmp_path: Path, key: str, r
     data = json.loads(json.dumps(FIXTURE))
     data["model_responses"]["deduplications"] = {key: response}
     write_fixture(fixture, data)
+    with pytest.raises(ValidationError):
+        load_fake_adapters(fixture)
+
+
+@pytest.mark.parametrize("batch", ["00", "01", "-1", "١", "1.0"])
+def test_fixture_rejects_noncanonical_citation_transient_batch(tmp_path: Path, batch: str) -> None:
+    fixture = tmp_path / "wiki.json"
+    data = json.loads(json.dumps(FIXTURE))
+    data["transient_failures"] = {f"citation:knowledge-1:{batch}": 1}
+    write_fixture(fixture, data)
+
     with pytest.raises(ValidationError):
         load_fake_adapters(fixture)

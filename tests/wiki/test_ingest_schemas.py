@@ -587,3 +587,64 @@ def test_apply_request_rejects_duplicate_page_slugs(field: str) -> None:
     payload[field] = [page, page] if field == "pages" else [expected, expected]
     with pytest.raises(ValidationError):
         BatchApplyRequest(**payload)
+
+
+@pytest.mark.parametrize(
+    ("model", "field", "invalid_value"),
+    [
+        (
+            CitationBatchRequest(
+                knowledge_id="knowledge-1", batch_index=0, candidates=[],
+                chunks=[CitationBatchChunk(alias="c001", text="Body")],
+            ),
+            "chunks",
+            [CitationBatchChunk(alias="c001", text="A"), CitationBatchChunk(alias="c001", text="B")],
+        ),
+        (
+            ContributionDelta(
+                pending_op_id=uuid4(), action="add", slug="entity/acme", knowledge_id="knowledge-1",
+                previous=None, current=_record(),
+            ),
+            "action",
+            "replace",
+        ),
+        (PageExpectation(slug="entity/acme"), "page_id", uuid4()),
+        (
+            BatchApplyRequest(
+                claim_token=uuid4(), pages=[], contribution_deltas=[], completed_op_ids=[uuid4()],
+                superseded_op_ids=[], failures=[], expected_pages=[], operation_id=uuid4(),
+            ),
+            "superseded_op_ids",
+            None,
+        ),
+    ],
+)
+def test_incremental_dto_assignment_failure_is_atomic(
+    model: object, field: str, invalid_value: object
+) -> None:
+    if invalid_value is None:
+        invalid_value = [model.completed_op_ids[0]]  # type: ignore[attr-defined]
+    before = model.model_dump(mode="json")  # type: ignore[attr-defined]
+
+    with pytest.raises(ValidationError):
+        setattr(model, field, invalid_value)
+
+    assert model.model_dump(mode="json") == before  # type: ignore[attr-defined]
+
+
+def test_incremental_dto_collections_block_in_place_invariant_breaks() -> None:
+    citation = CitationBatchRequest(
+        knowledge_id="knowledge-1", batch_index=0, candidates=[],
+        chunks=[CitationBatchChunk(alias="c001", text="Body")],
+    )
+    batch = BatchApplyRequest(
+        claim_token=uuid4(), pages=[], contribution_deltas=[], completed_op_ids=[uuid4()],
+        superseded_op_ids=[], failures=[], expected_pages=[], operation_id=uuid4(),
+    )
+
+    with pytest.raises((AttributeError, TypeError)):
+        citation.chunks.append(CitationBatchChunk(alias="c001", text="Duplicate"))
+    with pytest.raises((AttributeError, TypeError)):
+        batch.superseded_op_ids.append(batch.completed_op_ids[0])
+    assert isinstance(citation.model_dump(mode="json")["chunks"], list)
+    assert isinstance(batch.model_dump(mode="json")["completed_op_ids"], list)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Annotated
 from uuid import UUID
 
@@ -103,7 +104,11 @@ class FakeDataset(_StrictModel):
                 raise ValueError("merge 瞬时失败键包含未知 slug")
             if prefix == "citation":
                 knowledge_id, separator, batch_index = suffix.rpartition(":")
-                if not separator or knowledge_id not in knowledge_ids or not batch_index.isdecimal():
+                if (
+                    not separator
+                    or knowledge_id not in knowledge_ids
+                    or re.fullmatch(r"0|[1-9][0-9]*", batch_index) is None
+                ):
                     raise ValueError("citation 瞬时失败键必须引用已知 knowledge_id 和非负 batch")
             if prefix == "dedup" and suffix not in self.model_responses.deduplications:
                 raise ValueError("dedup 瞬时失败键包含未知 slug")
