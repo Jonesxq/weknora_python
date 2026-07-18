@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from numbers import Real
 from copy import deepcopy
 from collections.abc import Iterable, Sequence
@@ -396,6 +397,15 @@ def build_operation_outbox_identity(op: str, knowledge_id: str) -> str:
     )
 
 
+def build_operation_lock_key(operation_id: UUID) -> int:
+    """为 operation_id 生成跨 scope 稳定的 PostgreSQL advisory lock key。"""
+
+    if not isinstance(operation_id, UUID):
+        raise TypeError("operation_id 必须是 UUID")
+    digest = hashlib.sha256(operation_id.bytes).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
+
+
 def build_finalization_register_statement(request: FinalizationRequest):
     return (
         postgresql.insert(WikiFinalizationMarker)
@@ -521,23 +531,17 @@ def _safe_dead_letter_payload(
     return {"knowledge_id": knowledge_id}
 
 
+_SENSITIVE_ERROR_PATTERN = re.compile(
+    r"traceback|claim[ _-]+token|chunk[ _-]+text|raw[ _-]+chunk|"
+    r"model[ _-]+output|raw[ _-]+output|chunk原文|模型原始输出",
+    re.IGNORECASE,
+)
+
+
 def _safe_error_summary(summary: str) -> str:
-    cleaned = " ".join(summary.replace("\r", " ").replace("\n", " ").split())
-    folded = cleaned.casefold()
-    markers = (
-        "traceback",
-        "claim_token",
-        "claim token",
-        "chunk text",
-        "raw chunk",
-        "chunk原文",
-        "model output",
-        "raw output",
-        "模型原始输出",
-    )
-    positions = [folded.find(marker) for marker in markers if marker in folded]
-    if positions:
-        cleaned = cleaned[: min(positions)].strip()
+    match = _SENSITIVE_ERROR_PATTERN.search(summary)
+    safe_prefix = summary[: match.start()] if match is not None else summary
+    cleaned = " ".join(safe_prefix.replace("\r", " ").replace("\n", " ").split())
     return (cleaned or "敏感错误详情已省略")[:2000]
 
 
@@ -552,6 +556,36 @@ def _freeze_json_snapshot(value: Any) -> object:
 
 
 def _dead_letter_record(row: WikiDeadLetter) -> DeadLetterRecord:
+    if (
+        not isinstance(row.knowledge_id, str)
+        or not row.knowledge_id.strip()
+        or not isinstance(row.op_version, str)
+        or not row.op_version.strip()
+    ):
+        raise InvariantError("dead-letter 来源身份无效")
+    if type(row.payload) is not dict or row.payload != {
+        "knowledge_id": row.knowledge_id
+    }:
+        raise InvariantError("dead-letter payload 不符合安全白名单")
+    if row.op not in {"ingest", "retract"}:
+        raise InvariantError("dead-letter op 无效")
+    if type(row.fail_count) is not int or row.fail_count < 5:
+        raise InvariantError("dead-letter fail_count 无效")
+    if (
+        not isinstance(row.last_error_code, str)
+        or not row.last_error_code.strip()
+        or len(row.last_error_code) > 128
+    ):
+        raise InvariantError("dead-letter error code 无效")
+    if (
+        not isinstance(row.last_error_summary, str)
+        or not row.last_error_summary.strip()
+        or len(row.last_error_summary) > 2000
+        or "\r" in row.last_error_summary
+        or "\n" in row.last_error_summary
+        or _SENSITIVE_ERROR_PATTERN.search(row.last_error_summary) is not None
+    ):
+        raise InvariantError("dead-letter error summary 无效")
     payload = _freeze_json_snapshot(row.payload)
     if not isinstance(payload, Mapping):
         raise InvariantError("dead-letter payload 必须是 JSON object")
@@ -646,17 +680,27 @@ def _legacy_batch_request(
     claim_token: UUID | None,
     pages: Sequence[ReducedPage],
     completed_op_ids: Sequence[UUID],
-    operation_id: UUID,
+    operation_id: UUID | None,
     failed_op_ids: Sequence[UUID],
     expected_pages: Mapping[str, ExistingPageRecord | None] | None,
 ) -> BatchApplyRequest:
     snapshots, completed_ids, failed_ids, expected = _validate_batch_inputs(
         pages, completed_op_ids, failed_op_ids, expected_pages
     )
+    empty_batch = not snapshots and not completed_ids and not failed_ids
     token = (
         _require_claim_token(claim_token)
         if completed_ids or failed_ids
         else claim_token
+        if isinstance(claim_token, UUID)
+        else UUID(int=0)
+    )
+    checked_operation_id = (
+        operation_id
+        if isinstance(operation_id, UUID)
+        else UUID(int=0)
+        if empty_batch
+        else operation_id
     )
     return _validate_batch_request(
         BatchApplyRequest(
@@ -681,7 +725,7 @@ def _legacy_batch_request(
                 )
                 for slug, record in expected.items()
             ),
-            operation_id=operation_id,
+            operation_id=checked_operation_id,
         )
     )
 
@@ -1534,10 +1578,10 @@ class SqlAlchemyIngestStore:
                 raise TypeError("现代 apply_results 不能混用 legacy 参数")
             checked = _validate_batch_request(request)
         else:
-            if pages is None or completed_op_ids is None or operation_id is None:
+            if pages is None or completed_op_ids is None:
                 raise TypeError("legacy apply_results 参数不完整")
-            if not completed_op_ids and not failed_op_ids and not pages:
-                return False
+            if operation_id is None and (completed_op_ids or failed_op_ids or pages):
+                raise TypeError("legacy apply_results 参数不完整")
             checked = _legacy_batch_request(
                 request,
                 pages,
@@ -1546,6 +1590,15 @@ class SqlAlchemyIngestStore:
                 failed_op_ids,
                 expected_pages,
             )
+        if not (
+            checked.pages
+            or checked.contribution_deltas
+            or checked.completed_op_ids
+            or checked.superseded_op_ids
+            or checked.failures
+            or checked.expected_pages
+        ):
+            return False
         return await self._apply_batch_results(scope, checked)
 
     async def _apply_batch_results(
@@ -1553,6 +1606,13 @@ class SqlAlchemyIngestStore:
     ) -> bool:
         async with self._session_factory() as session:
             async with session.begin():
+                await session.execute(
+                    select(
+                        func.pg_advisory_xact_lock(
+                            build_operation_lock_key(request.operation_id)
+                        )
+                    )
+                )
                 existing_log = (
                     await session.execute(
                         select(WikiLogEntry).where(
@@ -1635,6 +1695,27 @@ class SqlAlchemyIngestStore:
                     if op_id not in superseded_ids
                 ]
                 terminal_ids = [*completed_ids, *superseded_ids]
+
+                auto_superseded_slugs = {
+                    delta.slug
+                    for delta in request.contribution_deltas
+                    if delta.pending_op_id in auto_superseded
+                }
+                effective_completed_slugs = {
+                    delta.slug
+                    for delta in request.contribution_deltas
+                    if delta.pending_op_id in completed_ids
+                }
+                for page in request.pages:
+                    contributor_ids = set(page.contributor_op_ids)
+                    if (
+                        page.slug in auto_superseded_slugs & effective_completed_slugs
+                        or contributor_ids & auto_superseded
+                        and contributor_ids & set(completed_ids)
+                    ):
+                        raise PageConflict(
+                            "auto-superseded 来源与有效 completed 来源共享页面 slug"
+                        )
 
                 superseded_slugs = {
                     delta.slug

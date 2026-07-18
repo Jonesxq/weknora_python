@@ -163,6 +163,31 @@ def test_validate_batch_request_rejects_two_current_active_source_versions() -> 
         ingest_store._validate_batch_request(request)
 
 
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "ClAiM ToKeN",
+        "CLAIM_TOKEN",
+        "claim-token",
+        "TrAcEbAcK",
+        "ChUnK TeXt",
+        "chunk_text",
+        "chunk-text",
+        "RaW ChUnK",
+        "raw_chunk",
+        "raw-chunk",
+        "MoDeL OuTpUt",
+        "model_output",
+        "model-output",
+        "RaW OuTpUt",
+        "raw_output",
+        "raw-output",
+    ],
+)
+def test_safe_error_summary_truncates_separator_and_case_variants(marker: str) -> None:
+    assert ingest_store._safe_error_summary(f"安全摘要 {marker} secret") == "安全摘要"
+
+
 @pytest.mark.asyncio
 async def test_modern_apply_results_returns_idempotent_noop_for_same_scope_log() -> (
     None
@@ -207,7 +232,50 @@ async def test_modern_apply_results_returns_idempotent_noop_for_same_scope_log()
 
     assert await store.apply_results(SCOPE, request) is False  # type: ignore[call-arg]
     assert session.begin_count == 1
-    assert session.execute_count == 1
+    assert session.execute_count == 2
+
+
+@pytest.mark.asyncio
+async def test_operation_lock_is_first_stable_global_sql_for_operation_id() -> None:
+    operation_id = uuid4()
+
+    async def execute(scope: WikiScope, op_id: UUID) -> int:
+        existing_log = WikiLogEntry(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            operation_id=op_id,
+            action="wiki_ingest_batch",
+            message="已完成",
+            pages_affected=[],
+            actor_id=scope.actor_id,
+        )
+        session = _ScriptedSession([_ScriptedResult(scalar=existing_log)])
+        store = SqlAlchemyIngestStore(
+            _OneSessionFactory(session), SqlFinalizationPort()
+        )  # type: ignore[arg-type]
+
+        assert (
+            await store.apply_results(scope, _batch_request(operation_id=op_id))
+            is False
+        )
+        assert _sql(session.statements[0]).startswith("SELECT pg_advisory_xact_lock")
+        assert _sql(session.statements[1]).startswith("SELECT wiki_log_entries.")
+        params = session.statements[0].compile(dialect=postgresql.dialect()).params
+        assert len(params) == 1
+        return next(iter(params.values()))
+
+    other_scope = WikiScope(
+        tenant_id=SCOPE.tenant_id + 1,
+        knowledge_base_id=uuid4(),
+        actor_id="other-worker",
+    )
+    first = await execute(SCOPE, operation_id)
+    same_operation_other_scope = await execute(other_scope, operation_id)
+    different_operation = await execute(SCOPE, uuid4())
+
+    assert first == same_operation_other_scope
+    assert first != different_operation
+    assert -(2**63) <= first < 2**63
 
 
 @pytest.mark.asyncio
@@ -258,6 +326,8 @@ async def test_modern_apply_results_rejects_an_incompletely_covered_claim() -> N
 
         async def execute(self, statement):
             self.statements.append(statement)
+            if "pg_advisory_xact_lock" in _sql(statement):
+                return Result()
             return self.results.pop(0)
 
     session = Session()
@@ -269,7 +339,7 @@ async def test_modern_apply_results_rejects_an_incompletely_covered_claim() -> N
 
     with pytest.raises(ClaimLost, match="完整覆盖"):
         await store.apply_results(SCOPE, request)
-    assert "FOR UPDATE" in _sql(session.statements[1])
+    assert "FOR UPDATE" in _sql(session.statements[2])
 
 
 def _sql(statement) -> str:
@@ -838,6 +908,46 @@ async def test_non_empty_runtime_operations_reject_missing_claim_token() -> None
 
 
 @pytest.mark.asyncio
+async def test_legacy_empty_batch_still_validates_expected_pages() -> None:
+    class ExplodingFactory:
+        def __call__(self):
+            raise AssertionError("非法空批不应打开数据库 session")
+
+    store = SqlAlchemyIngestStore(ExplodingFactory(), SqlFinalizationPort())  # type: ignore[arg-type]
+
+    with pytest.raises(InvariantError, match="expected_pages"):
+        await store.apply_results(
+            SCOPE,
+            None,
+            [],
+            [],
+            uuid4(),
+            expected_pages={"entity/unexpected": None},
+        )
+
+
+@pytest.mark.asyncio
+async def test_legacy_valid_empty_batch_is_noop_without_claim_or_operation() -> None:
+    class ExplodingFactory:
+        def __call__(self):
+            raise AssertionError("合法空批不应打开数据库 session")
+
+    store = SqlAlchemyIngestStore(ExplodingFactory(), SqlFinalizationPort())  # type: ignore[arg-type]
+
+    assert (
+        await store.apply_results(
+            SCOPE,
+            None,
+            [],
+            [],
+            None,  # type: ignore[arg-type]
+            expected_pages={},
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
 async def test_sql_store_rejects_forged_scope_before_opening_session() -> None:
     class ExplodingFactory:
         def __call__(self):
@@ -1285,7 +1395,7 @@ async def test_list_dead_letters_returns_scoped_immutable_snapshots() -> None:
             knowledge_id=f"knowledge-{index}",
             op="ingest",
             op_version="version-1",
-            payload={"nested": {"attempt": index}},
+            payload={"knowledge_id": f"knowledge-{index}"},
             fail_count=5,
             last_error_code="MODEL_PERMANENT",
             last_error_summary="重试耗尽",
@@ -1318,8 +1428,8 @@ async def test_list_dead_letters_returns_scoped_immutable_snapshots() -> None:
     records = await store.list_dead_letters(SCOPE, limit=2)  # type: ignore[attr-defined]
 
     assert [record.id for record in records] == [row.id for row in rows]
-    rows[0].payload["nested"]["attempt"] = 99
-    assert records[0].payload["nested"]["attempt"] == 1  # type: ignore[index]
+    rows[0].payload["knowledge_id"] = "mutated"
+    assert records[0].payload["knowledge_id"] == "knowledge-1"
     with pytest.raises(FrozenInstanceError):
         records[0].fail_count = 6  # type: ignore[misc]
     with pytest.raises(TypeError):
@@ -1329,6 +1439,55 @@ async def test_list_dead_letters_returns_scoped_immutable_snapshots() -> None:
     assert "wiki_dead_letters.knowledge_base_id" in sql
     assert "ORDER BY wiki_dead_letters.dead_at, wiki_dead_letters.id" in sql
     assert "LIMIT" in sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"payload": {"knowledge_id": "knowledge-1", "claim_token": "secret"}},
+        {"payload": {"knowledge_id": "knowledge-1", "traceback": "raw"}},
+        {
+            "payload": {
+                "knowledge_id": "knowledge-1",
+                "nested": {"model_output": "raw"},
+            }
+        },
+        {"payload": {"knowledge_id": "other"}},
+        {"tenant_id": SCOPE.tenant_id + 1},
+        {"knowledge_base_id": UUID("22222222-2222-2222-2222-222222222222")},
+        {"op": "delete"},
+        {"fail_count": 4},
+        {"last_error_code": ""},
+        {"last_error_code": "x" * 129},
+        {"last_error_summary": ""},
+        {"last_error_summary": "x" * 2001},
+        {"last_error_summary": "line one\r\nline two"},
+        {"last_error_summary": "safe MODEL_OUTPUT raw"},
+    ],
+)
+async def test_list_dead_letters_rejects_polluted_rows(updates) -> None:
+    values = {
+        "id": uuid4(),
+        "pending_op_id": uuid4(),
+        "tenant_id": SCOPE.tenant_id,
+        "knowledge_base_id": SCOPE.knowledge_base_id,
+        "knowledge_id": "knowledge-1",
+        "op": "ingest",
+        "op_version": "version-1",
+        "payload": {"knowledge_id": "knowledge-1"},
+        "fail_count": 5,
+        "last_error_code": "MODEL_PERMANENT",
+        "last_error_summary": "重试耗尽",
+        "dead_at": NOW,
+    }
+    values.update(updates)
+    row = WikiDeadLetter(**values)
+    session = _ScriptedSession([_ScriptedResult(rows=[row])])
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), SqlFinalizationPort())  # type: ignore[arg-type]
+
+    with pytest.raises(InvariantError, match="dead-letter"):
+        await store.list_dead_letters(SCOPE)
 
 
 @pytest.mark.asyncio
@@ -1352,6 +1511,86 @@ async def test_release_claim_only_clears_the_owned_scoped_claim() -> None:
     params = statement.compile(dialect=postgresql.dialect()).params
     assert params["claimed_at"] is None
     assert params["claim_token"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_contributor_ids", [True, False])
+async def test_auto_superseded_shared_slug_rolls_back_before_any_writes(
+    include_contributor_ids: bool,
+) -> None:
+    token = uuid4()
+    superseded = _pending(claimed=True)
+    superseded.claim_token = token
+    other = _pending(knowledge_id="knowledge-2", version="version-2", claimed=True)
+    other.claim_token = token
+    retract = _pending(
+        knowledge_id=superseded.knowledge_id,
+        op="retract",
+        version="delete-1",
+    )
+    retract.enqueued_at = NOW + timedelta(seconds=1)
+    superseded_current = _stored_contribution(version=superseded.op_version)
+    other_current = _stored_contribution(
+        knowledge_id=other.knowledge_id, version=other.op_version
+    )
+    page = ReducedPage(
+        slug="entity/acme",
+        title="混合页面",
+        page_type="entity",
+        content="同时包含两个来源的正文",
+        summary="混合摘要",
+        source_refs=[superseded.knowledge_id, other.knowledge_id],
+        contributor_op_ids=(
+            [superseded.id, other.id] if include_contributor_ids else []
+        ),
+    )
+    request = _batch_request(
+        claim_token=token,
+        pages=(page,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=superseded.id,
+                action="add",
+                slug=page.slug,
+                knowledge_id=superseded.knowledge_id,
+                previous=None,
+                current=superseded_current,
+            ),
+            ContributionDelta(
+                pending_op_id=other.id,
+                action="add",
+                slug=page.slug,
+                knowledge_id=other.knowledge_id,
+                previous=None,
+                current=other_current,
+            ),
+        ),
+        completed_op_ids=(superseded.id, other.id),
+        expected_pages=(PageExpectation(slug=page.slug),),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[superseded, other]),
+            _ScriptedResult(rows=[retract]),
+            _ScriptedResult(rowcount=2),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=0),
+        ]
+    )
+    finalization = _RecordingFinalization(session.events)
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
+
+    with pytest.raises(ingest_store.PageConflict, match="superseded"):
+        await store.apply_results(SCOPE, request)
+
+    assert session.rolled_back is True
+    assert session.added == []
+    assert finalization.requests == []
+    assert not any(
+        _sql(statement).startswith(("INSERT", "UPDATE", "DELETE"))
+        for statement in session.statements
+    )
 
 
 @pytest.mark.asyncio
@@ -1503,7 +1742,7 @@ async def test_modern_operation_id_reuse_across_scope_rolls_back() -> None:
         )
 
     assert session.rolled_back is True
-    assert len(session.statements) == 1
+    assert len(session.statements) == 2
 
 
 @pytest.mark.asyncio
