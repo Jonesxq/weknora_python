@@ -38,7 +38,7 @@ def _combine(items: Sequence[TopicCandidate]) -> TopicCandidate:
         raise WikiValidationError("DEDUP_TYPE_CONFLICT", "同一去重簇的类型不一致")
     return TopicCandidate(
         name=first.name, slug=first.slug, page_type=first.page_type,
-        aliases=_unique([value for item in items[1:] for value in (item.name, *item.aliases)] + first.aliases),
+        aliases=_unique([*first.aliases, *[value for item in items[1:] for value in (item.name, *item.aliases)]]),
         description="\n\n".join(_unique([item.description for item in items])),
         details="\n\n".join(_unique([item.details for item in items])),
     )
@@ -46,14 +46,18 @@ def _combine(items: Sequence[TopicCandidate]) -> TopicCandidate:
 
 def validate_dedup_output(request: DedupRequest, output: DedupOutput) -> dict[str, str | None]:
     requested = {item.candidate.slug: item for item in request.candidates}
+    generated = set(requested)
     decisions = {decision.candidate_slug: decision for decision in output.decisions}
     if len(decisions) != len(output.decisions) or set(decisions) != set(requested):
         raise WikiValidationError("DEDUP_OUTPUT_INVALID", "dedup 输出必须完整且恰好覆盖请求候选")
     result: dict[str, str | None] = {}
     for slug, decision in decisions.items():
         canonical = decision.canonical_slug
-        if canonical is not None and canonical not in {target.slug for target in requested[slug].allowed_targets}:
-            raise WikiValidationError("DEDUP_OUTPUT_INVALID", "canonical_slug 不在 allowed targets 中")
+        if canonical is not None:
+            if canonical in generated:
+                raise WikiValidationError("DEDUP_OUTPUT_INVALID", "canonical_slug 不能指向 generated 候选")
+            if canonical not in {target.slug for target in requested[slug].allowed_targets}:
+                raise WikiValidationError("DEDUP_OUTPUT_INVALID", "canonical_slug 不在 allowed targets 中")
         result[slug] = canonical
     return result
 
@@ -113,7 +117,7 @@ async def deduplicate_candidates(scope: WikiScope, candidates: Sequence[TopicCan
             target = _exact_target(item, record)
             targets[target.slug] = target
             mapping[item.slug] = target.slug
-    generated = {item.slug for item in originals}
+    generated = {item.slug for item in undecided}
     requests: list[DedupCandidateRequest] = []
     for item in undecided:
         allowed: list[DedupPageCandidate] = []

@@ -3,9 +3,11 @@ from __future__ import annotations
 import pytest
 
 from app.wiki.errors import WikiValidationError
-from app.wiki.ingest.dedup import deduplicate_candidates
+from app.wiki.ingest.dedup import deduplicate_candidates, validate_dedup_output
 from app.wiki.ingest.schemas import (
     DedupDecision,
+    DedupCandidateRequest,
+    DedupRequest,
     DedupOutput,
     DedupPageCandidate,
     TopicCandidate,
@@ -122,3 +124,44 @@ async def test_empty_targets_are_not_sent_to_model_in_mixed_batch() -> None:
     assert model.calls == 1
     assert [item.slug for item in result] == ["entity/existing-target", "entity/without"]
     assert mapping["entity/without"] == "entity/without"
+
+
+def test_validate_output_rejects_any_generated_canonical_even_if_whitelisted() -> None:
+    request = DedupRequest(candidates=[
+        DedupCandidateRequest(
+            candidate=TopicCandidate(name="A", slug="entity/a", page_type="entity"),
+            allowed_targets=[DedupPageCandidate(slug="entity/b", title="B", page_type="entity")],
+        ),
+        DedupCandidateRequest(candidate=TopicCandidate(name="B", slug="entity/b", page_type="entity"), allowed_targets=[]),
+    ])
+    output = DedupOutput.model_construct(decisions=(
+        DedupDecision(candidate_slug="entity/a", canonical_slug="entity/b"),
+        DedupDecision(candidate_slug="entity/b"),
+    ))
+    with pytest.raises(WikiValidationError, match="generated"):
+        validate_dedup_output(request, output)
+
+
+@pytest.mark.asyncio
+async def test_exact_existing_can_be_model_canonical_and_aliases_keep_first_seen_order() -> None:
+    class ExactStore(Store):
+        async def find_existing_pages(self, _scope, slugs):
+            return {
+                "entity/existing": ExistingPageRecord(
+                    page_id=uuid4(), version=1,
+                    page=ReducedPage(slug="entity/existing", title="Existing", page_type="entity", content="", summary="", aliases=["DB"]),
+                )
+            }
+    model = Model(DedupOutput(decisions=[DedupDecision(candidate_slug="entity/new", canonical_slug="entity/existing")]))
+    result, mapping = await deduplicate_candidates(
+        SCOPE,
+        [
+            TopicCandidate(name="Existing", slug="entity/existing", page_type="entity", aliases=["Input exact"]),
+            TopicCandidate(name="New", slug="entity/new", page_type="entity", aliases=["N"]),
+        ],
+        ExactStore({"entity/new": [DedupPageCandidate(slug="entity/existing", title="Existing", page_type="entity", aliases=["DB"])]}), model,
+    )
+    assert model.calls == 1
+    assert [item.slug for item in result] == ["entity/existing"]
+    assert result[0].aliases == ["DB", "Existing", "Input exact", "New", "N"]
+    assert mapping == {"entity/existing": "entity/existing", "entity/new": "entity/existing"}
