@@ -254,14 +254,26 @@ def test_classify_runs_all_batches_with_bounded_workers_and_concurrency(monkeypa
             knowledge_id="k", chunks=[chunk(str(i), "x", i) for i in range(1000)], candidates=[candidate()],
             model=model, max_chars=1, max_parallel=4,
         ))
-        await model.entered.wait()
-        assert model.peak == 4
-        assert len(model.requests) == 4
-        assert created == 4
-        model.release.set()
-        refs, _ = await operation
-        assert refs["entity/acme"] == [str(i) for i in range(1000)]
-        return model, created
+        try:
+            try:
+                await asyncio.wait_for(model.entered.wait(), timeout=1)
+            except TimeoutError:
+                pytest.fail("citation workers did not enter the four-call barrier within one second")
+            assert model.peak == 4
+            assert len(model.requests) == 4
+            assert created == 4
+            model.release.set()
+            try:
+                refs, _ = await asyncio.wait_for(operation, timeout=2)
+            except TimeoutError:
+                pytest.fail("citation workers did not finish all batches within two seconds after release")
+            assert refs["entity/acme"] == [str(i) for i in range(1000)]
+            return model, created
+        finally:
+            model.release.set()
+            if not operation.done():
+                operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
 
     model, created = asyncio.run(exercise())
     assert model.peak <= 4
