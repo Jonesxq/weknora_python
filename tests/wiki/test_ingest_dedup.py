@@ -798,6 +798,100 @@ async def test_service_rejects_more_than_64_distinct_query_names() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("repeat_cancel", [2, 3])
+async def test_double_external_cancel_waits_for_worker_cleanup_barrier(
+    repeat_cancel: int,
+) -> None:
+    class CleanupStore(Store):
+        def __init__(self):
+            super().__init__({})
+            self.active = 0
+            self.cleanup = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def find_existing_pages(self, *_args):
+            return {}
+
+        async def find_dedup_candidates(self, *_args):
+            self.active += 1
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cleanup.set()
+                await self.release.wait()
+                raise
+            finally:
+                self.active -= 1
+
+    store = CleanupStore()
+    task = asyncio.create_task(
+        deduplicate_candidates(SCOPE, _many_candidates(8), store, Model(DedupOutput()))
+    )
+    try:
+        for _ in range(50):
+            if store.active == 8:
+                break
+            await asyncio.sleep(0)
+        for _ in range(repeat_cancel - 1):
+            task.cancel()
+        await asyncio.wait_for(store.cleanup.wait(), 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done() and store.active == 8
+        store.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        assert store.active == 0
+    finally:
+        store.release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_thousand_same_canonical_returns_one_accumulated_page() -> None:
+    target = DedupPageCandidate(slug="entity/db", title="DB", page_type="entity")
+
+    class CanonicalModel:
+        async def resolve_duplicates(self, request):
+            return DedupOutput(
+                decisions=[
+                    DedupDecision(
+                        candidate_slug=item.candidate.slug, canonical_slug="entity/db"
+                    )
+                    for item in request.candidates
+                ]
+            )
+
+    candidates = [
+        TopicCandidate(
+            name=f"Name {index}",
+            slug=f"entity/n-{index}",
+            page_type="entity",
+            description=f"D {index}",
+        )
+        for index in range(1000)
+    ]
+    result, mapping = await deduplicate_candidates(
+        SCOPE,
+        candidates,
+        Store({candidate.slug: [target] for candidate in candidates}),
+        CanonicalModel(),
+    )
+    assert len(result) == 1 and result[0].slug == "entity/db" and len(mapping) == 1000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [1, 20])
+async def test_service_accepts_exact_integer_limits(limit: int) -> None:
+    result, _ = await deduplicate_candidates(
+        SCOPE, [], Store({}), Model(DedupOutput()), limit=limit
+    )
+    assert result == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("version", [True, 1.5])
 async def test_exact_model_construct_invalid_record_is_domain_error(version) -> None:
     class BadExactStore(Store):

@@ -321,7 +321,14 @@ async def deduplicate_candidates(
 
     workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
     try:
-        await asyncio.gather(*workers)
+        pending: set[asyncio.Task[object]] = set(workers)
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in workers:
+                if task in done:
+                    task.result()
     except BaseException as original:
         cancelled_again = await _cancel_and_drain_workers(workers)
         if cancelled_again and not isinstance(original, asyncio.CancelledError):
