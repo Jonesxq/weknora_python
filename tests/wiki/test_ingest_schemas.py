@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import copy
+from collections.abc import ItemsView
 import json
+import pickle
 from uuid import UUID, uuid4
 
 import pytest
@@ -727,6 +730,7 @@ def test_citation_mapping_items_preserve_pair_order_for_linear_dumps() -> None:
         }
     )
 
+    assert isinstance(output.refs_by_slug.items(), ItemsView)
     assert tuple(output.refs_by_slug.items()) == (
         ("entity/first", ("c001",)),
         ("entity/second", ("c002",)),
@@ -737,3 +741,24 @@ def test_citation_mapping_items_preserve_pair_order_for_linear_dumps() -> None:
         "entity/second": ("c002",),
         "entity/third": ("c003",),
     }
+    assert output.refs_by_slug.items() & {("entity/second", ("c002",))} == {
+        ("entity/second", ("c002",))
+    }
+
+
+def test_citation_mapping_supports_copy_and_pickle_round_trips() -> None:
+    output = CitationBatchOutput(refs_by_slug={"entity/acme": ["c001"]})
+    mapping = output.refs_by_slug
+
+    copied_mapping = copy.copy(mapping)
+    restored_mapping = pickle.loads(pickle.dumps(mapping))
+    restored_output = pickle.loads(pickle.dumps(output))
+
+    assert copied_mapping is mapping
+    assert restored_mapping is not mapping
+    assert restored_mapping == mapping
+    assert restored_output is not output
+    assert restored_output.refs_by_slug is not mapping
+    assert restored_output.model_dump_json() == output.model_dump_json()
+    with pytest.raises((AttributeError, TypeError)):
+        restored_mapping._items = ()  # type: ignore[attr-defined]

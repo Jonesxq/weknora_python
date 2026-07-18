@@ -62,11 +62,14 @@ class _FrozenMapping(Mapping[str, tuple[str, ...]]):
     def __len__(self) -> int:
         return len(self._items)
 
-    def items(self) -> tuple[tuple[str, tuple[str, ...]], ...]:
-        return self._items
-
     def _iter_pairs(self) -> Iterable[tuple[str, tuple[str, ...]]]:
         return iter(self._items)
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __reduce__(self) -> tuple[type[Self], tuple[tuple[tuple[str, tuple[str, ...]], ...]]]:
+        return type(self), (self._items,)
 
     def __deepcopy__(self, memo: dict[int, object]) -> Self:
         return type(self)(copy.deepcopy(self._items, memo))
