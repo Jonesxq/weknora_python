@@ -118,20 +118,47 @@ def test_classify_degrades_only_invalid_or_permanent_batches() -> None:
     assert supplements == []
 
 
-def test_classify_rejects_cross_batch_alias_and_supplement_conflicts() -> None:
+def test_classify_rejects_alias_that_only_exists_in_another_batch() -> None:
+    model = ScriptedModel({
+        0: [CitationBatchOutput(refs_by_slug={"entity/acme": ("c000", "c001")})],
+        1: [CitationBatchOutput(refs_by_slug={"entity/acme": ("c001",)})],
+    })
+    refs, supplements = asyncio.run(classify_citations(
+        knowledge_id="k", chunks=[chunk("a", "a"), chunk("b", "b"), chunk("c", "cc")],
+        candidates=[candidate()], model=model, max_chars=2,
+    ))
+    assert [[part.alias for part in request.chunks] for request in model.requests] == [["c000", "c001"], ["c000"]]
+    assert refs == {"entity/acme": ["a", "b"]}
+    assert supplements == []
+
+
+def test_classify_rejects_cross_batch_supplement_conflicts() -> None:
     first = candidate("concept/extra")
     conflicting = TopicCandidate(name="Other", slug="concept/extra", page_type="concept")
     model = ScriptedModel({
         0: [CitationBatchOutput(refs_by_slug={"concept/extra": ("c000",)}, supplemental_candidates=(first,))],
         1: [CitationBatchOutput(refs_by_slug={"concept/extra": ("c000",)}, supplemental_candidates=(conflicting,))],
-        2: [CitationBatchOutput(refs_by_slug={"entity/acme": ("c001",)})],
     })
     refs, supplements = asyncio.run(classify_citations(
-        knowledge_id="k", chunks=[chunk("a", "a"), chunk("b", "b"), chunk("c", "c")],
+        knowledge_id="k", chunks=[chunk("a", "a"), chunk("b", "b")],
         candidates=[candidate()], model=model, max_chars=1,
     ))
     assert refs == {"concept/extra": ["a"]}
     assert [item.slug for item in supplements] == ["concept/extra"]
+
+
+def test_classify_deduplicates_real_id_across_split_batches_in_source_order() -> None:
+    model = ScriptedModel({
+        0: [CitationBatchOutput(refs_by_slug={"entity/acme": ("c000",)})],
+        1: [CitationBatchOutput(refs_by_slug={"entity/acme": ("c000",)})],
+        2: [CitationBatchOutput(refs_by_slug={"entity/acme": ("c000",)})],
+    })
+    refs, _ = asyncio.run(classify_citations(
+        knowledge_id="k", chunks=[chunk("same-id", "abcdef", 0), chunk("later", "xyz", 1)],
+        candidates=[candidate()], model=model, max_chars=3,
+    ))
+    assert refs == {"entity/acme": ["same-id", "later"]}
+    assert all(not value.startswith("c") for value in refs["entity/acme"])
 
 
 def test_classify_retries_transient_twice_and_merges_supplements_stably() -> None:
@@ -223,13 +250,100 @@ def test_classify_propagates_unknown_model_exceptions(error: BaseException) -> N
 
 
 def test_classify_propagates_child_cancellation_and_collects_siblings() -> None:
-    model = ScriptedModel({0: [asyncio.CancelledError()], 1: ["yield"]})
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(classify_citations(
+    class SelfCancellingModel:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.start_count = 0
+            self.active = 0
+            self.sibling_cancelled = False
+
+        async def classify_chunks(self, request):  # type: ignore[no-untyped-def]
+            self.active += 1
+            self.start_count += 1
+            if self.start_count == 2:
+                self.started.set()
+            try:
+                await self.release.wait()
+                if request.batch_index == 0:
+                    raise asyncio.CancelledError()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if request.batch_index == 1:
+                    self.sibling_cancelled = True
+                raise
+            finally:
+                self.active -= 1
+
+    async def assert_cancelled_while_loop_is_running() -> None:
+        model = SelfCancellingModel()
+        operation = asyncio.create_task(classify_citations(
             knowledge_id="k", chunks=[chunk("a", "a"), chunk("b", "b")], candidates=[candidate()],
             model=model, max_chars=1,
         ))
-    assert model.active == 0
+        await model.started.wait()
+        model.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        assert model.active == 0
+        assert model.sibling_cancelled
+        assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task() and not task.done()]
+
+    asyncio.run(assert_cancelled_while_loop_is_running())
+
+
+def test_classify_merges_reversed_completion_in_batch_order() -> None:
+    first = candidate("concept/first")
+    duplicate = candidate("concept/first")
+    second = candidate("concept/second")
+
+    class ReversedModel:
+        def __init__(self) -> None:
+            self.later_done = asyncio.Event()
+
+        async def classify_chunks(self, request):  # type: ignore[no-untyped-def]
+            if request.batch_index == 0:
+                await self.later_done.wait()
+                return CitationBatchOutput(supplemental_candidates=(first,))
+            self.later_done.set()
+            return CitationBatchOutput(supplemental_candidates=(duplicate, second))
+
+    _, supplements = asyncio.run(classify_citations(
+        knowledge_id="k", chunks=[chunk("a", "a"), chunk("b", "b")], candidates=[candidate()],
+        model=ReversedModel(), max_chars=1,
+    ))
+    assert [item.slug for item in supplements] == ["concept/first", "concept/second"]
+
+
+def test_classify_keeps_inputs_model_output_and_return_containers_isolated() -> None:
+    sources = [chunk("source-id", "a")]
+    candidates = [candidate()]
+    output = CitationBatchOutput(refs_by_slug={"entity/acme": ("c000",)})
+    source_before = [item.model_dump() for item in sources]
+    candidate_before = [item.model_dump() for item in candidates]
+    output_before = output.model_dump()
+    model = ScriptedModel({0: [output, output]})
+
+    refs, supplements = asyncio.run(classify_citations(
+        knowledge_id="k", chunks=sources, candidates=candidates, model=model, max_chars=1,
+    ))
+    assert type(refs) is dict
+    assert type(refs["entity/acme"]) is list
+    assert type(supplements) is list
+    assert [item.model_dump() for item in sources] == source_before
+    assert [item.model_dump() for item in candidates] == candidate_before
+    assert output.model_dump() == output_before
+    assert all(not hasattr(part, "chunk_id") for part in model.requests[0].chunks)
+    assert "source-id" not in str(model.requests[0].model_dump())
+
+    refs["entity/acme"].append("forged")
+    refs["forged"] = ["source-id"]
+    again, _ = asyncio.run(classify_citations(
+        knowledge_id="k", chunks=sources, candidates=candidates, model=model, max_chars=1,
+    ))
+    assert again == {"entity/acme": ["source-id"]}
+    assert [item.model_dump() for item in sources] == source_before
+    assert output.model_dump() == output_before
 
 
 def test_classify_propagates_parent_cancellation_and_collects_siblings() -> None:

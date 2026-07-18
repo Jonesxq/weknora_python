@@ -138,7 +138,8 @@ async def classify_citations(
         batch, output = result
         candidates_for_batch = list(output.supplemental_candidates)
         conflict = any(
-            item.slug in known_supplements and known_supplements[item.slug].model_dump() != item.model_dump()
+            item.slug in known_supplements
+            and known_supplements[item.slug].model_dump(mode="json") != item.model_dump(mode="json")
             for item in candidates_for_batch
         )
         if conflict:
@@ -168,7 +169,7 @@ def _validate_batch_output(
     supplemental_by_slug: dict[str, object] = {}
     for item in output.supplemental_candidates:
         previous = supplemental_by_slug.get(item.slug)
-        snapshot = item.model_dump()
+        snapshot = item.model_dump(mode="json")
         if previous is not None and previous != snapshot:
             raise _CitationOutputRejected("citation supplemental candidate slug 冲突")
         supplemental_by_slug[item.slug] = snapshot
