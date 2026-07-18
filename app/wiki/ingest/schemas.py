@@ -268,7 +268,7 @@ class DocumentSummary(_ModelTextOutput):
 
 
 class PageContribution(_StrictModel):
-    pending_op_id: UUID
+    pending_op_id: UUID | None
     knowledge_id: str
     title: str
     content: str

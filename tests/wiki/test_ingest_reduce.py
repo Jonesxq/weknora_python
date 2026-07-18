@@ -418,6 +418,161 @@ async def test_reduce_contribution_model_failure_propagates_without_polluting_in
 
 
 @pytest.mark.asyncio
+async def test_reduce_replace_replay_with_current_already_active_is_idempotent() -> (
+    None
+):
+    model = RecordingModel()
+    previous = stored_contribution("doc-1", op_version="v1", content="old")
+    current = stored_contribution("doc-1", op_version="v2", content="new")
+    delta = contribution_delta("replace", "doc-1", previous=previous, current=current)
+
+    page = await reduce_slug("entity/shared", [delta], None, [current], model)
+
+    assert page.deleted is False
+    assert len(model.merge_requests) == 1
+    assert [
+        (item.knowledge_id, item.content)
+        for item in model.merge_requests[0].contributions
+    ] == [("doc-1", "new")]
+
+
+@pytest.mark.asyncio
+async def test_reduce_duplicate_identical_delta_is_idempotent() -> None:
+    model = RecordingModel()
+    current = stored_contribution("doc-1")
+    delta = contribution_delta("add", "doc-1", current=current)
+
+    page = await reduce_slug("entity/shared", [delta, delta], None, [], model)
+
+    assert page.source_refs == ["doc-1"]
+    assert len(model.merge_requests) == 1
+    assert len(model.merge_requests[0].contributions) == 1
+    assert page.contributor_op_ids == [OP_A]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_reduce_rejects_add_and_retract_for_same_identity_regardless_of_order(
+    reverse: bool,
+) -> None:
+    model = RecordingModel()
+    current = stored_contribution("doc-1")
+    pending = current.model_copy(update={"state": "retract_pending"})
+    add = contribution_delta("add", "doc-1", pending_op_id=OP_A, current=current)
+    retract = contribution_delta(
+        "retract", "doc-1", pending_op_id=OP_B, previous=pending
+    )
+    deltas = [retract, add] if reverse else [add, retract]
+
+    with pytest.raises(WikiValidationError, match="冲突"):
+        await reduce_slug("entity/shared", deltas, None, [], model)
+
+    assert model.merge_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("different_version", [False, True])
+async def test_reduce_rejects_conflicting_current_for_same_source(
+    different_version: bool,
+) -> None:
+    model = RecordingModel()
+    first = stored_contribution("doc-1", content="first")
+    second = stored_contribution(
+        "doc-1",
+        op_version="v2" if different_version else "v1",
+        content="second",
+    )
+    deltas = [
+        contribution_delta("add", "doc-1", pending_op_id=OP_A, current=first),
+        contribution_delta("add", "doc-1", pending_op_id=OP_B, current=second),
+    ]
+
+    with pytest.raises(WikiValidationError, match="current"):
+        await reduce_slug("entity/shared", deltas, None, [], model)
+
+    assert model.merge_requests == []
+
+
+@pytest.mark.asyncio
+async def test_reduce_model_request_does_not_forge_batch_id_for_historical_active() -> (
+    None
+):
+    model = RecordingModel()
+    historical_a = stored_contribution("doc-a")
+    historical_b = stored_contribution("doc-b")
+    current = stored_contribution("doc-c")
+    delta = contribution_delta("add", "doc-c", current=current)
+
+    await reduce_slug(
+        "entity/shared", [delta], None, [historical_b, historical_a], model
+    )
+
+    assert [
+        (item.knowledge_id, item.pending_op_id)
+        for item in model.merge_requests[0].contributions
+    ] == [("doc-a", None), ("doc-b", None), ("doc-c", OP_A)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("updates_keyword", [False, True])
+async def test_reduce_legacy_accepts_model_and_updates_keywords(
+    updates_keyword: bool,
+) -> None:
+    model = RecordingModel()
+    update = topic_update()
+
+    if updates_keyword:
+        page = await reduce_slug(  # type: ignore[call-overload]
+            slug=update.slug,
+            updates=[update],
+            existing_page=None,
+            model=model,
+        )
+    else:
+        page = await reduce_slug(  # type: ignore[call-overload]
+            update.slug,
+            [update],
+            None,
+            model=model,
+        )
+
+    assert page.deleted is False
+    assert len(model.merge_requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_reduce_modern_call_without_active_contributions_is_not_legacy() -> None:
+    model = RecordingModel()
+    current = stored_contribution("doc-1")
+    delta = contribution_delta("add", "doc-1", current=current)
+
+    with pytest.raises(WikiValidationError, match="active_contributions"):
+        await reduce_slug(  # type: ignore[call-overload]
+            slug="entity/shared",
+            deltas=[delta],
+            existing_page=None,
+            model=model,
+        )
+
+    assert model.merge_requests == []
+
+
+@pytest.mark.asyncio
+async def test_reduce_empty_modern_call_without_active_is_not_legacy() -> None:
+    model = RecordingModel()
+
+    with pytest.raises(WikiValidationError, match="active_contributions"):
+        await reduce_slug(  # type: ignore[call-overload]
+            slug="entity/shared",
+            deltas=[],
+            existing_page=None,
+            model=model,
+        )
+
+    assert model.merge_requests == []
+
+
+@pytest.mark.asyncio
 async def test_reduce_summary_replaces_page_without_model_call() -> None:
     model = RecordingModel()
     update = SlugUpdate(

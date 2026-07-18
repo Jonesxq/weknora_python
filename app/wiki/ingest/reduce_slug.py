@@ -118,7 +118,7 @@ def _record_identity(
 
 
 def _record_contribution(
-    record: StoredContributionRecord, pending_op_id: UUID
+    record: StoredContributionRecord, pending_op_id: UUID | None
 ) -> PageContribution:
     return PageContribution(
         pending_op_id=pending_op_id,
@@ -142,6 +142,144 @@ def _record_sort_key(
         0 if record.id is None else 1,
         0 if record.id is None else record.id.int,
     )
+
+
+def _source_identity(record: StoredContributionRecord) -> tuple[int, UUID, str, str]:
+    return (
+        record.tenant_id,
+        record.knowledge_base_id,
+        record.slug,
+        record.knowledge_id,
+    )
+
+
+def _record_payload(record: StoredContributionRecord) -> tuple[object, ...]:
+    """比较贡献内容，忽略数据库 id 和 retract_pending 状态。"""
+
+    return (
+        record.page_type,
+        record.title,
+        record.content,
+        record.summary,
+        record.aliases,
+        record.chunk_refs,
+    )
+
+
+def _stable_unique_deltas(
+    deltas: Sequence[ContributionDelta],
+) -> list[ContributionDelta]:
+    result: list[ContributionDelta] = []
+    for delta in deltas:
+        if delta not in result:
+            result.append(delta)
+    return result
+
+
+def _apply_contribution_transitions(
+    deltas: Sequence[ContributionDelta],
+    active_contributions: Sequence[StoredContributionRecord],
+) -> list[StoredContributionRecord]:
+    """先规划整个批次，再以集合语义统一应用 remove/add。"""
+
+    unique_deltas = _stable_unique_deltas(deltas)
+    removals: dict[tuple[int, UUID, str, str, str], list[int]] = {}
+    additions: dict[tuple[int, UUID, str, str, str], StoredContributionRecord] = {}
+    addition_origins: dict[tuple[int, UUID, str, str, str], list[int]] = {}
+    current_by_source: dict[
+        tuple[int, UUID, str, str], tuple[int, UUID, str, str, str]
+    ] = {}
+
+    for index, delta in enumerate(unique_deltas):
+        if delta.previous is not None:
+            removals.setdefault(_record_identity(delta.previous), []).append(index)
+        if delta.current is None:
+            continue
+        identity = _record_identity(delta.current)
+        source = _source_identity(delta.current)
+        existing_current = additions.get(identity)
+        if existing_current is not None and _record_payload(
+            existing_current
+        ) != _record_payload(delta.current):
+            _reject(
+                "WIKI_REDUCE_CURRENT_CONFLICT",
+                "同一 exact identity 存在冲突的 current contribution",
+            )
+        existing_identity = current_by_source.get(source)
+        if existing_identity is not None and existing_identity != identity:
+            _reject(
+                "WIKI_REDUCE_CURRENT_CONFLICT",
+                "同一 source/slug 不能包含多个不同 current contribution",
+            )
+        additions.setdefault(identity, delta.current)
+        addition_origins.setdefault(identity, []).append(index)
+        current_by_source[source] = identity
+
+    for identity in removals.keys() & additions.keys():
+        remove_origins = removals[identity]
+        add_origins = addition_origins[identity]
+        same_replace = (
+            len(remove_origins) == 1
+            and remove_origins == add_origins
+            and unique_deltas[remove_origins[0]].action == "replace"
+        )
+        if not same_replace:
+            _reject(
+                "WIKI_REDUCE_TRANSITION_CONFLICT",
+                "同一 exact identity 的 add 与 retract transition 冲突",
+            )
+
+    active_by_identity: dict[
+        tuple[int, UUID, str, str, str], StoredContributionRecord
+    ] = {}
+    active_by_source: dict[
+        tuple[int, UUID, str, str], tuple[int, UUID, str, str, str]
+    ] = {}
+    for record in active_contributions:
+        identity = _record_identity(record)
+        source = _source_identity(record)
+        existing = active_by_identity.get(identity)
+        if existing is not None:
+            if _record_payload(existing) != _record_payload(record):
+                _reject(
+                    "WIKI_REDUCE_ACTIVE_CONFLICT",
+                    "active snapshot 的同一 identity 存在不同 payload",
+                )
+            continue
+        existing_identity = active_by_source.get(source)
+        if existing_identity is not None and existing_identity != identity:
+            _reject(
+                "WIKI_REDUCE_ACTIVE_CONFLICT",
+                "active snapshot 的同一 source/slug 存在多个版本",
+            )
+        active_by_identity[identity] = record
+        active_by_source[source] = identity
+
+    for identity in removals:
+        removed = active_by_identity.pop(identity, None)
+        if removed is not None:
+            active_by_source.pop(_source_identity(removed), None)
+
+    for identity, record in additions.items():
+        existing = active_by_identity.get(identity)
+        if existing is not None:
+            if _record_payload(existing) != _record_payload(record):
+                _reject(
+                    "WIKI_REDUCE_CURRENT_CONFLICT",
+                    "current contribution 与 active payload 冲突",
+                )
+            continue
+        source = _source_identity(record)
+        existing_identity = active_by_source.get(source)
+        if existing_identity is not None and existing_identity != identity:
+            _reject(
+                "WIKI_REDUCE_CURRENT_CONFLICT",
+                "current contribution 与 active source/version 冲突",
+            )
+        active_by_identity[identity] = record
+        active_by_source[source] = identity
+
+    return list(active_by_identity.values())
 
 
 def _snapshot_deltas(deltas: object) -> list[ContributionDelta]:
@@ -275,17 +413,27 @@ async def _reduce_contributions(
     contribution_deltas = _snapshot_deltas(deltas)
     snapshots = _snapshot_active_contributions(active_contributions)
     existing_page = _snapshot_existing(existing_page)
-    _validate_contribution_inputs(slug, contribution_deltas, existing_page, snapshots)
-    for delta in contribution_deltas:
-        if delta.previous is not None:
-            previous_identity = _record_identity(delta.previous)
-            snapshots = [
-                record
-                for record in snapshots
-                if _record_identity(record) != previous_identity
-            ]
-        if delta.current is not None:
-            snapshots.append(delta.current)
+    page_type = _validate_contribution_inputs(
+        slug, contribution_deltas, existing_page, snapshots
+    )
+    if page_type == "summary":
+        summary_identities = {_record_identity(record) for record in snapshots}
+        summary_identities.difference_update(
+            _record_identity(delta.previous)
+            for delta in contribution_deltas
+            if delta.previous is not None
+        )
+        summary_identities.update(
+            _record_identity(delta.current)
+            for delta in contribution_deltas
+            if delta.current is not None
+        )
+        if len(summary_identities) > 1:
+            _reject(
+                "WIKI_REDUCE_SUMMARY_CONTRIBUTION_COUNT",
+                "summary 页面必须恰好一份 active contribution",
+            )
+    snapshots = _apply_contribution_transitions(contribution_deltas, snapshots)
 
     if not legacy_metadata:
         snapshots.sort(key=_record_sort_key)
@@ -352,12 +500,16 @@ async def _reduce_contributions(
             contributor_op_ids=contributor_op_ids,
         )
 
+    pending_ids_by_record: dict[tuple[int, UUID, str, str, str], set[UUID]] = {}
+    for delta in contribution_deltas:
+        if delta.current is not None:
+            pending_ids_by_record.setdefault(
+                _record_identity(delta.current), set()
+            ).add(delta.pending_op_id)
     pending_by_record = {
-        _record_identity(delta.current): delta.pending_op_id
-        for delta in contribution_deltas
-        if delta.current is not None
+        identity: next(iter(pending_ids)) if len(pending_ids) == 1 else None
+        for identity, pending_ids in pending_ids_by_record.items()
     }
-    fallback_pending_op_id = contribution_deltas[0].pending_op_id
     topic_page_type = cast(TopicPageType, snapshots[0].page_type)
     request = PageMergeRequest(
         slug=slug,
@@ -377,7 +529,7 @@ async def _reduce_contributions(
         contributions=[
             _record_contribution(
                 record,
-                pending_by_record.get(_record_identity(record), fallback_pending_op_id),
+                pending_by_record.get(_record_identity(record)),
             )
             for record in snapshots
         ],
@@ -467,28 +619,71 @@ async def reduce_slug(
     slug: str,
     updates: Sequence[SlugUpdate],
     existing_page: ReducedPage | None,
-    active_contributions: ChatModelPort,
+    model: ChatModelPort,
 ) -> ReducedPage: ...
 
 
 async def reduce_slug(
     slug: str,
-    deltas: Sequence[ContributionDelta] | Sequence[SlugUpdate],
-    existing_page: ReducedPage | None,
-    active_contributions: Sequence[StoredContributionRecord] | ChatModelPort,
+    deltas: Sequence[ContributionDelta] | Sequence[SlugUpdate] | None = None,
+    existing_page: ReducedPage | None = None,
+    active_contributions: Sequence[StoredContributionRecord]
+    | ChatModelPort
+    | None = None,
     model: ChatModelPort | None = None,
+    *,
+    updates: Sequence[SlugUpdate] | None = None,
 ) -> ReducedPage:
     """投影贡献差量；四参数 overload 仅用于阶段二 Worker 兼容。"""
 
-    if model is None:
-        if not callable(getattr(active_contributions, "merge_page", None)):
-            _reject("WIKI_REDUCE_INVALID_MODEL", "legacy Reduce 的第四参数必须是模型")
+    if updates is not None:
+        if deltas is not None or active_contributions is not None:
+            _reject(
+                "WIKI_REDUCE_INVALID_LEGACY_ARGUMENTS",
+                "legacy updates 不能与 deltas/active_contributions 同时提供",
+            )
+        if model is None:
+            _reject("WIKI_REDUCE_INVALID_MODEL", "legacy Reduce 必须提供 model")
+        return await _reduce_legacy_adapter(
+            slug,
+            updates,
+            existing_page,
+            model,
+        )
+
+    if deltas is None:
+        _reject("WIKI_REDUCE_INVALID_DELTAS", "必须提供 deltas 或 legacy updates")
+    positional_legacy_model = (
+        cast(ChatModelPort, active_contributions)
+        if callable(getattr(active_contributions, "merge_page", None)) and model is None
+        else None
+    )
+    keyword_legacy_model = (
+        model
+        if active_contributions is None
+        and isinstance(deltas, Sequence)
+        and not isinstance(deltas, (str, bytes))
+        and bool(deltas)
+        and all(isinstance(update, SlugUpdate) for update in deltas)
+        else None
+    )
+    legacy_model = positional_legacy_model or keyword_legacy_model
+    if legacy_model is not None:
         return await _reduce_legacy_adapter(
             slug,
             cast(Sequence[SlugUpdate], deltas),
             existing_page,
-            cast(ChatModelPort, active_contributions),
+            legacy_model,
         )
+    if active_contributions is None or callable(
+        getattr(active_contributions, "merge_page", None)
+    ):
+        _reject(
+            "WIKI_REDUCE_INVALID_ACTIVE",
+            "modern Reduce 必须提供 active_contributions 序列",
+        )
+    if model is None:
+        _reject("WIKI_REDUCE_INVALID_MODEL", "modern Reduce 必须提供 model")
     return await _reduce_contributions(
         slug,
         cast(Sequence[ContributionDelta], deltas),
