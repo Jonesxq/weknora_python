@@ -191,7 +191,13 @@ def _request() -> DedupRequest:
 
 
 def test_validate_accepts_canonical_and_null() -> None:
-    assert validate_dedup_output(_request(), DedupOutput(decisions=[DedupDecision(candidate_slug="entity/a", canonical_slug="entity/db")])) == {"entity/a": "entity/db"}
+    request = DedupRequest(candidates=[
+        _request().candidates[0],
+        DedupCandidateRequest(candidate=TopicCandidate(name="B", slug="entity/b", page_type="entity"), allowed_targets=[]),
+    ])
+    assert validate_dedup_output(request, DedupOutput(decisions=[
+        DedupDecision(candidate_slug="entity/a", canonical_slug="entity/db"), DedupDecision(candidate_slug="entity/b"),
+    ])) == {"entity/a": "entity/db", "entity/b": None}
 
 
 @pytest.mark.parametrize("decisions", [
@@ -277,3 +283,31 @@ async def test_store_targets_are_stably_deduplicated_and_limited_before_model() 
     model = InspectingModel()
     await deduplicate_candidates(SCOPE, [TopicCandidate(name="A", slug="entity/a", page_type="entity")], OverflowStore({"entity/a": targets}), model)
     assert [target.slug for target in model.request.candidates[0].allowed_targets] == [f"entity/db-{index}" for index in range(20)]
+
+
+@pytest.mark.parametrize("slug,page_type", [("concept/bad", "concept"), ("summary/bad", "summary")])
+def test_validate_rejects_runtime_cross_type_and_summary_before_whitelist(slug: str, page_type: str) -> None:
+    request = _request().model_copy(deep=True)
+    bad = DedupPageCandidate.model_construct(slug=slug, title="Bad", page_type=page_type, aliases=())
+    item = DedupCandidateRequest.model_construct(candidate=request.candidates[0].candidate, allowed_targets=(bad,))
+    forged = DedupRequest.model_construct(candidates=(item,))
+    output = DedupOutput.model_construct(decisions=(DedupDecision.model_construct(candidate_slug="entity/a", canonical_slug=slug),))
+    with pytest.raises(WikiValidationError, match="类型"):
+        validate_dedup_output(forged, output)
+
+
+@pytest.mark.asyncio
+async def test_service_input_model_output_and_return_value_are_isolated() -> None:
+    candidate = TopicCandidate(name="A", slug="entity/a", page_type="entity", aliases=["Input"])
+    target = DedupPageCandidate(slug="entity/db", title="DB", page_type="entity", aliases=["Target"])
+    output = DedupOutput(decisions=[DedupDecision(candidate_slug="entity/a", canonical_slug="entity/db")])
+    model = Model(output)
+    store = Store({"entity/a": [target]})
+    result, _ = await deduplicate_candidates(SCOPE, [candidate], store, model)
+    result[0].aliases.append("returned only")
+    result[0].name = "Editable"
+    again, _ = await deduplicate_candidates(SCOPE, [candidate], store, model)
+    assert candidate.aliases == ["Input"]
+    assert target.aliases == ("Target",)
+    assert output.decisions[0].canonical_slug == "entity/db"
+    assert again[0].name == "DB" and "returned only" not in again[0].aliases

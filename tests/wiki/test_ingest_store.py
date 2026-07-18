@@ -27,7 +27,7 @@ from app.wiki.ingest.store import (
     build_dedup_candidate_statement,
 )
 from app.wiki.ingest.schemas import TopicCandidate
-from app.wiki.models import WikiPendingOp
+from app.wiki.models import WikiPage, WikiPendingOp
 from app.wiki.scope import WikiScope
 
 
@@ -91,6 +91,59 @@ def test_dedup_single_name_sql_has_no_least_and_aliases_do_not_add_empty_query()
     ))
     assert "LEAST" not in sql
     assert sql.count(" <-> ") == 1
+
+
+def _dedup_row(**updates) -> WikiPage:
+    values = {
+        "id": uuid4(), "tenant_id": SCOPE.tenant_id, "knowledge_base_id": KB_ID,
+        "slug": "entity/db", "title": "Database", "page_type": "entity",
+        "status": "published", "deleted_at": None, "aliases": ["DB"],
+    }
+    values.update(updates)
+    return WikiPage(**values)
+
+
+class _DedupSession:
+    def __init__(self, rows): self.rows = rows
+    async def __aenter__(self): return self
+    async def __aexit__(self, *_args): return None
+    async def execute(self, _statement):
+        class Result:
+            def __init__(self, rows): self.rows = rows
+            def scalars(self): return self.rows
+        return Result(self.rows)
+
+
+@pytest.mark.asyncio
+async def test_find_dedup_candidates_returns_detached_frozen_snapshots() -> None:
+    first, second = _dedup_row(slug="entity/a", aliases=["A"]), _dedup_row(slug="entity/b", aliases=["B"])
+    store = SqlAlchemyIngestStore(lambda: _DedupSession([first, second]), SqlFinalizationPort())  # type: ignore[arg-type]
+    result = await store.find_dedup_candidates(SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity"))
+    first.aliases.append("mutated")
+    assert [(item.slug, item.aliases) for item in result] == [("entity/a", ("A",)), ("entity/b", ("B",))]
+    with pytest.raises(Exception):
+        result[0].aliases += ("nope",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("updates", [
+    {"tenant_id": 8}, {"knowledge_base_id": uuid4()}, {"deleted_at": NOW},
+    {"status": "draft"}, {"page_type": "concept", "slug": "concept/db"},
+])
+async def test_find_dedup_candidates_rejects_polluted_rows(updates) -> None:
+    store = SqlAlchemyIngestStore(lambda: _DedupSession([_dedup_row(**updates)]), SqlFinalizationPort())  # type: ignore[arg-type]
+    with pytest.raises(InvariantError):
+        await store.find_dedup_candidates(SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity"))
+
+
+@pytest.mark.asyncio
+async def test_find_dedup_candidates_rejects_overflow_and_dirty_aliases() -> None:
+    overflow = SqlAlchemyIngestStore(lambda: _DedupSession([_dedup_row(slug=f"entity/{index}") for index in range(2)]), SqlFinalizationPort())  # type: ignore[arg-type]
+    with pytest.raises(InvariantError):
+        await overflow.find_dedup_candidates(SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity"), limit=1)
+    dirty = SqlAlchemyIngestStore(lambda: _DedupSession([_dedup_row(aliases=["", "A", "A"])]), SqlFinalizationPort())  # type: ignore[arg-type]
+    with pytest.raises(InvariantError):
+        await dirty.find_dedup_candidates(SCOPE, TopicCandidate(name="A", slug="entity/new", page_type="entity"))
 
 
 @pytest.mark.parametrize("limit", [True, 0, 21])
