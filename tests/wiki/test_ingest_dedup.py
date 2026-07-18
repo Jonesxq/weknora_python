@@ -87,5 +87,38 @@ async def test_rejects_model_target_outside_store_whitelist() -> None:
     model = Model(DedupOutput(decisions=[DedupDecision(candidate_slug="entity/new", canonical_slug="entity/forged")]))
     with pytest.raises(WikiValidationError, match="allowed"):
         await deduplicate_candidates(
-            SCOPE, [TopicCandidate(name="New", slug="entity/new", page_type="entity")], Store({"entity/new": []}), model
+            SCOPE, [TopicCandidate(name="New", slug="entity/new", page_type="entity")],
+            Store({"entity/new": [DedupPageCandidate(slug="entity/valid", title="Valid", page_type="entity")]}), model,
         )
+
+
+@pytest.mark.asyncio
+async def test_document_dedup_closes_slug_name_bridge_and_skips_empty_model_requests() -> None:
+    model = Model(DedupOutput())
+    result, mapping = await deduplicate_candidates(
+        SCOPE,
+        [
+            TopicCandidate(name="Alpha", slug="entity/a", page_type="entity", description="A"),
+            TopicCandidate(name="Beta", slug="entity/b", page_type="entity", details="B"),
+            TopicCandidate(name="Alpha", slug="entity/b", page_type="entity", aliases=["Alias"]),
+        ],
+        Store({}), model,
+    )
+    assert model.calls == 0
+    assert [item.slug for item in result] == ["entity/a"]
+    assert result[0].aliases == ["Beta", "Alpha", "Alias"]
+    assert mapping == {"entity/a": "entity/a", "entity/b": "entity/a"}
+
+
+@pytest.mark.asyncio
+async def test_empty_targets_are_not_sent_to_model_in_mixed_batch() -> None:
+    target = DedupPageCandidate(slug="entity/existing-target", title="Target", page_type="entity")
+    model = Model(DedupOutput(decisions=[DedupDecision(candidate_slug="entity/with", canonical_slug="entity/existing-target")]))
+    result, mapping = await deduplicate_candidates(
+        SCOPE,
+        [TopicCandidate(name="With", slug="entity/with", page_type="entity"), TopicCandidate(name="Without", slug="entity/without", page_type="entity")],
+        Store({"entity/with": [target], "entity/without": []}), model,
+    )
+    assert model.calls == 1
+    assert [item.slug for item in result] == ["entity/existing-target", "entity/without"]
+    assert mapping["entity/without"] == "entity/without"

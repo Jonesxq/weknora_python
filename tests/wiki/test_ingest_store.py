@@ -80,6 +80,17 @@ def test_dedup_candidate_sql_is_scoped_index_equivalent_and_limited() -> None:
         "LIMIT",
     ):
         assert fragment in sql
+    assert "|| ' '" in sql
+    assert "coalesce(CAST(wiki_pages.aliases AS TEXT), '')" in sql
+    assert "least(" in sql.lower()
+
+
+def test_dedup_single_name_sql_has_no_least_and_aliases_do_not_add_empty_query() -> None:
+    sql = _sql(build_dedup_candidate_statement(
+        SCOPE, TopicCandidate(name="Acme", slug="entity/acme", page_type="entity", aliases=[])
+    ))
+    assert "LEAST" not in sql
+    assert sql.count(" <-> ") == 1
 
 
 @pytest.mark.parametrize("limit", [True, 0, 21])

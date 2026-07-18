@@ -12,7 +12,7 @@ from typing import Any, Mapping, Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import Select, Text, cast, delete, func, literal, or_, select, update
+from sqlalchemy import Select, Text, cast, delete, func, literal_column, or_, select, update
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.exc import IntegrityError
@@ -179,8 +179,8 @@ def _dedup_limit(limit: int) -> int:
 
 def _dedup_names_expression():
     """与 ix_wiki_pages_dedup_names_trgm 完全相同的索引表达式。"""
-    return func.lower(WikiPage.title) + literal(" ") + func.lower(
-        func.coalesce(cast(WikiPage.aliases, Text), literal(""))
+    return func.lower(WikiPage.title).op("||")(literal_column("' '")).op("||")(
+        func.lower(func.coalesce(cast(WikiPage.aliases, Text), literal_column("''")))
     )
 
 
@@ -189,10 +189,14 @@ def build_dedup_candidate_statement(
 ) -> Select[tuple[WikiPage]]:
     """构造限定范围的 pg_trgm 候选页查询。"""
     checked_limit = _dedup_limit(limit)
-    names = [candidate.name, *candidate.aliases]
-    query = " ".join(" ".join(value.split()).casefold() for value in names if value.strip())
+    names: list[str] = []
+    for value in (candidate.name, *candidate.aliases):
+        normalized = " ".join(value.split()).casefold()
+        if normalized and normalized not in names:
+            names.append(normalized)
     expression = _dedup_names_expression()
-    distance = expression.op("<->")(query)
+    distances = [expression.op("<->")(name) for name in names]
+    distance = distances[0] if len(distances) == 1 else func.least(*distances)
     return (
         select(WikiPage)
         .where(
@@ -762,7 +766,20 @@ class SqlAlchemyIngestStore:
         statement = build_dedup_candidate_statement(scope, candidate, limit)
         async with self._session_factory() as session:
             rows = list((await session.execute(statement)).scalars())
-        return [_dedup_candidate_record(row) for row in rows]
+        if len(rows) > limit:
+            raise InvariantError("dedup 查询返回超过 limit 的候选")
+        snapshots: list[DedupPageCandidate] = []
+        for row in rows:
+            if (
+                row.tenant_id != scope.tenant_id
+                or row.knowledge_base_id != scope.knowledge_base_id
+                or row.deleted_at is not None
+                or row.status != "published"
+                or row.page_type != candidate.page_type
+            ):
+                raise InvariantError("dedup 查询返回越界页面")
+            snapshots.append(_dedup_candidate_record(row))
+        return snapshots
 
     async def apply_results(
         self,
