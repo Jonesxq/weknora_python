@@ -56,8 +56,12 @@ def validate_dedup_output(request: DedupRequest, output: DedupOutput) -> dict[st
         if canonical is not None:
             if canonical in generated:
                 raise WikiValidationError("DEDUP_OUTPUT_INVALID", "canonical_slug 不能指向 generated 候选")
-            if canonical not in {target.slug for target in requested[slug].allowed_targets}:
+            allowed = {target.slug: target for target in requested[slug].allowed_targets}
+            target = allowed.get(canonical)
+            if target is None:
                 raise WikiValidationError("DEDUP_OUTPUT_INVALID", "canonical_slug 不在 allowed targets 中")
+            if target.page_type != requested[slug].candidate.page_type or target.slug.startswith("summary/"):
+                raise WikiValidationError("DEDUP_OUTPUT_INVALID", "canonical_slug 类型不合法")
         result[slug] = canonical
     return result
 
@@ -117,7 +121,7 @@ async def deduplicate_candidates(scope: WikiScope, candidates: Sequence[TopicCan
             target = _exact_target(item, record)
             targets[target.slug] = target
             mapping[item.slug] = target.slug
-    generated = {item.slug for item in undecided}
+    generated = {item.slug for item in originals} - set(targets)
     requests: list[DedupCandidateRequest] = []
     for item in undecided:
         allowed: list[DedupPageCandidate] = []

@@ -14,6 +14,7 @@ from app.wiki.ingest.schemas import (
 )
 from app.wiki.ingest.store import ExistingPageRecord
 from app.wiki.ingest.schemas import ReducedPage
+from app.wiki.ingest.ports import PermanentModelError, TransientModelError
 from uuid import uuid4
 from app.wiki.scope import WikiScope
 
@@ -165,3 +166,114 @@ async def test_exact_existing_can_be_model_canonical_and_aliases_keep_first_seen
     assert [item.slug for item in result] == ["entity/existing"]
     assert result[0].aliases == ["DB", "Existing", "Input exact", "New", "N"]
     assert mapping == {"entity/existing": "entity/existing", "entity/new": "entity/existing"}
+
+
+@pytest.mark.asyncio
+async def test_rejects_absorbed_generated_slug_as_store_target() -> None:
+    model = Model(DedupOutput())
+    with pytest.raises(WikiValidationError, match="目标不合法"):
+        await deduplicate_candidates(
+            SCOPE,
+            [
+                TopicCandidate(name="Alpha", slug="entity/a", page_type="entity"),
+                TopicCandidate(name="alpha", slug="entity/b", page_type="entity"),
+                TopicCandidate(name="Gamma", slug="entity/c", page_type="entity"),
+            ],
+            Store({"entity/c": [DedupPageCandidate(slug="entity/b", title="Alpha", page_type="entity")]}), model,
+        )
+
+
+def _request() -> DedupRequest:
+    return DedupRequest(candidates=[DedupCandidateRequest(
+        candidate=TopicCandidate(name="A", slug="entity/a", page_type="entity"),
+        allowed_targets=[DedupPageCandidate(slug="entity/db", title="DB", page_type="entity")],
+    )])
+
+
+def test_validate_accepts_canonical_and_null() -> None:
+    assert validate_dedup_output(_request(), DedupOutput(decisions=[DedupDecision(candidate_slug="entity/a", canonical_slug="entity/db")])) == {"entity/a": "entity/db"}
+
+
+@pytest.mark.parametrize("decisions", [
+    [DedupDecision(candidate_slug="entity/unknown")],
+    [],
+])
+def test_validate_rejects_unknown_or_missing_source(decisions) -> None:
+    with pytest.raises(WikiValidationError):
+        validate_dedup_output(_request(), DedupOutput.model_construct(decisions=tuple(decisions)))
+
+
+@pytest.mark.parametrize("canonical", ["entity/unknown", "entity/a", "summary/x", "concept/x"])
+def test_validate_rejects_invalid_canonical_contract(canonical: str) -> None:
+    output = DedupOutput.model_construct(decisions=(DedupDecision.model_construct(candidate_slug="entity/a", canonical_slug=canonical),))
+    with pytest.raises(WikiValidationError):
+        validate_dedup_output(_request(), output)
+
+
+@pytest.mark.parametrize("decisions", [
+    (DedupDecision.model_construct(candidate_slug="entity/a"), DedupDecision.model_construct(candidate_slug="entity/a")),
+    (DedupDecision.model_construct(candidate_slug="entity/a"), DedupDecision.model_construct(candidate_slug="entity/z")),
+    (DedupDecision.model_construct(candidate_slug="entity/z"),),
+    (),
+])
+def test_validate_rejects_duplicate_unknown_or_incomplete_runtime_output(decisions) -> None:
+    with pytest.raises(WikiValidationError):
+        validate_dedup_output(_request(), DedupOutput.model_construct(decisions=decisions))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [PermanentModelError("permanent"), TransientModelError("transient"), RuntimeError("runtime")])
+async def test_model_errors_propagate_unchanged(error: Exception) -> None:
+    class RaisingModel:
+        async def resolve_duplicates(self, _request):
+            raise error
+    with pytest.raises(type(error)) as caught:
+        await deduplicate_candidates(
+            SCOPE, [TopicCandidate(name="A", slug="entity/a", page_type="entity")],
+            Store({"entity/a": [DedupPageCandidate(slug="entity/db", title="DB", page_type="entity")]}), RaisingModel(),
+        )
+    assert caught.value is error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record_slug,record_type", [("entity/other", "entity"), ("entity/existing", "concept")])
+async def test_exact_record_mismatch_is_rejected(record_slug: str, record_type: str) -> None:
+    class BadStore(Store):
+        async def find_existing_pages(self, _scope, _slugs):
+            return {"entity/existing": ExistingPageRecord(
+                page_id=uuid4(), version=1,
+                page=ReducedPage.model_construct(slug=record_slug, title="Bad", page_type=record_type, content="", summary="", aliases=[]),
+            )}
+    with pytest.raises(WikiValidationError, match="已有页面"):
+        await deduplicate_candidates(SCOPE, [TopicCandidate(name="E", slug="entity/existing", page_type="entity")], BadStore({}), Model(DedupOutput()))
+
+
+@pytest.mark.asyncio
+async def test_same_normalized_name_cross_type_is_not_merged() -> None:
+    model = Model(DedupOutput())
+    result, mapping = await deduplicate_candidates(
+        SCOPE,
+        [TopicCandidate(name="Shared", slug="entity/shared", page_type="entity"), TopicCandidate(name=" shared ", slug="concept/shared", page_type="concept")],
+        Store({}), model,
+    )
+    assert [item.slug for item in result] == ["entity/shared", "concept/shared"]
+    assert mapping == {"entity/shared": "entity/shared", "concept/shared": "concept/shared"}
+    assert model.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_store_targets_are_stably_deduplicated_and_limited_before_model() -> None:
+    targets = [DedupPageCandidate(slug=f"entity/db-{index}", title=f"DB {index}", page_type="entity") for index in range(21)]
+    targets.insert(1, targets[0])
+    class InspectingModel:
+        def __init__(self): self.request = None
+        async def resolve_duplicates(self, request):
+            self.request = request
+            return DedupOutput(decisions=[DedupDecision(candidate_slug="entity/a")])
+    class OverflowStore(Store):
+        async def find_dedup_candidates(self, _scope, candidate, limit=20):
+            self.calls.append(candidate.slug)
+            return self.pages[candidate.slug]
+    model = InspectingModel()
+    await deduplicate_candidates(SCOPE, [TopicCandidate(name="A", slug="entity/a", page_type="entity")], OverflowStore({"entity/a": targets}), model)
+    assert [target.slug for target in model.request.candidates[0].allowed_targets] == [f"entity/db-{index}" for index in range(20)]

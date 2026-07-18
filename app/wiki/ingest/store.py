@@ -364,12 +364,15 @@ def _outbox_record(row: TaskOutbox) -> OutboxEventRecord:
 
 
 def _dedup_candidate_record(row: WikiPage) -> DedupPageCandidate:
-    return DedupPageCandidate(
-        slug=row.slug,
-        title=row.title,
-        page_type=row.page_type,
-        aliases=tuple(deepcopy(row.aliases)),
-    )
+    try:
+        return DedupPageCandidate(
+            slug=row.slug,
+            title=row.title,
+            page_type=row.page_type,
+            aliases=tuple(deepcopy(row.aliases)),
+        )
+    except (ValidationError, TypeError, ValueError) as exc:
+        raise InvariantError("dedup 查询返回的页面快照无效") from exc
 
 
 def _stable_clean(values: Iterable[str]) -> list[str]:
