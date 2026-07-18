@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+import copy
 import os
 import re
 from typing import Any, Literal, Self
@@ -37,20 +38,26 @@ class _FrozenValueModel(BaseModel):
 class _FrozenMapping(Mapping[str, tuple[str, ...]]):
     """可深拷贝且不继承 dict 的只读映射。"""
 
-    def __init__(self, values: Mapping[str, tuple[str, ...]]) -> None:
-        self._values = dict(values)
+    __slots__ = ("_items",)
+
+    def __init__(self, values: Mapping[str, tuple[str, ...]] | Iterable[tuple[str, tuple[str, ...]]]) -> None:
+        source = values.items() if isinstance(values, Mapping) else values
+        self._items = tuple((key, tuple(value)) for key, value in source)
 
     def __getitem__(self, key: str) -> tuple[str, ...]:
-        return self._values[key]
+        for stored_key, value in self._items:
+            if stored_key == key:
+                return value
+        raise KeyError(key)
 
     def __iter__(self):  # type: ignore[no-untyped-def]
-        return iter(self._values)
+        return (key for key, _ in self._items)
 
     def __len__(self) -> int:
-        return len(self._values)
+        return len(self._items)
 
     def __deepcopy__(self, memo: dict[int, object]) -> Self:
-        return self
+        return type(self)(copy.deepcopy(self._items, memo))
 
 
 def _normalize_slug(value: str, allowed_prefixes: tuple[str, ...]) -> str:

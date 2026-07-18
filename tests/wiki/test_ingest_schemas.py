@@ -709,7 +709,10 @@ def test_incremental_frozen_dtos_keep_json_and_deep_copy_contracts() -> None:
     )
     output = CitationBatchOutput(refs_by_slug={"entity/acme": ["c001"]})
     copied = request.model_copy(deep=True)
+    copied_output = output.model_copy(deep=True)
 
     assert copied is not request
     assert copied.chunks is not request.chunks
+    assert copied_output.refs_by_slug is not output.refs_by_slug
+    assert copied_output.model_dump() == output.model_dump()
     assert json.loads(output.model_dump_json()) == {"refs_by_slug": {"entity/acme": ["c001"]}, "supplemental_candidates": []}

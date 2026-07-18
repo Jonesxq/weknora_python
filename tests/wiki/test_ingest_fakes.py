@@ -8,7 +8,7 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from app.wiki.ingest.fakes import FakeChatModel, FakeKnowledgeSource, load_fake_adapters
+from app.wiki.ingest.fakes import FakeChatModel, FakeDataset, FakeKnowledgeSource, load_fake_adapters
 from app.wiki.ingest.ports import (
     ChatModelPort,
     CitationModelPort,
@@ -512,3 +512,28 @@ def test_fixture_rejects_noncanonical_citation_transient_batch(tmp_path: Path, b
 
     with pytest.raises(ValidationError):
         load_fake_adapters(fixture)
+
+
+def test_fake_citation_mappings_are_deeply_isolated() -> None:
+    data = json.loads(json.dumps(FIXTURE))
+    data["model_responses"]["citations"] = {
+        "knowledge-1": [{"refs_by_slug": {"entity/acme": ["c001"]}}]
+    }
+    dataset = FakeDataset.model_validate(data)
+    model = FakeChatModel(dataset)
+    request = CitationBatchRequest(
+        knowledge_id="knowledge-1", batch_index=0, candidates=[],
+        chunks=[CitationBatchChunk(alias="c001", text="Body")],
+    )
+
+    dataset_refs = dataset.model_responses.citations["knowledge-1"][0].refs_by_slug
+    model_refs = model._responses.citations["knowledge-1"][0].refs_by_slug
+    first = asyncio.run(model.classify_chunks(request)).refs_by_slug
+    second = asyncio.run(model.classify_chunks(request)).refs_by_slug
+
+    assert len({id(dataset_refs), id(model_refs), id(first), id(second)}) == 4
+    with pytest.raises(AttributeError):
+        first._values["entity/acme"] = ("c999",)  # type: ignore[attr-defined]
+    assert dataset_refs == {"entity/acme": ("c001",)}
+    assert model_refs == {"entity/acme": ("c001",)}
+    assert second == {"entity/acme": ("c001",)}
