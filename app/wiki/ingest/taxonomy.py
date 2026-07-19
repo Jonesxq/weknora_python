@@ -45,20 +45,26 @@ def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
             "EMBEDDING_OUTPUT_INVALID", "embedding 向量必须全部为有限数"
         ) from exc
 
-    left_norm = math.sqrt(sum(value * value for value in left))
-    right_norm = math.sqrt(sum(value * value for value in right))
-    if left_norm == 0.0 or right_norm == 0.0:
+    left_scale = max(abs(value) for value in left)
+    right_scale = max(abs(value) for value in right)
+    if left_scale == 0.0 or right_scale == 0.0:
         return 0.0
-    similarity = sum(
-        left_value * right_value for left_value, right_value in zip(left, right)
-    ) / (
-        left_norm * right_norm
+
+    left_scaled = tuple(value / left_scale for value in left)
+    right_scaled = tuple(value / right_scale for value in right)
+    left_norm = math.sqrt(math.fsum(value**2 for value in left_scaled))
+    right_norm = math.sqrt(math.fsum(value**2 for value in right_scaled))
+    left_unit = tuple(value / left_norm for value in left_scaled)
+    right_unit = tuple(value / right_norm for value in right_scaled)
+    similarity = math.fsum(
+        left_value * right_value
+        for left_value, right_value in zip(left_unit, right_unit)
     )
     if math.isclose(similarity, 1.0):
         return 1.0
     if math.isclose(similarity, -1.0):
         return -1.0
-    return similarity
+    return max(-1.0, min(1.0, similarity))
 
 
 async def select_allowed_bases(

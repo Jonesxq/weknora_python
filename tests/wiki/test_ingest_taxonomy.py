@@ -586,6 +586,36 @@ def test_cosine_similarity_handles_zero_orthogonal_and_equal_vectors() -> None:
     assert cosine_similarity((1.0, 2.0), (1.0, 2.0)) == 1.0
 
 
+def test_cosine_similarity_is_stable_for_large_finite_vectors() -> None:
+    vector = (1e308, 0.0)
+
+    same = cosine_similarity(vector, vector)
+    orthogonal = cosine_similarity(vector, (0.0, 1e308))
+    opposite = cosine_similarity(vector, (-1e308, 0.0))
+
+    assert math.isfinite(same)
+    assert same == pytest.approx(1.0)
+    assert orthogonal == pytest.approx(0.0)
+    assert opposite == pytest.approx(-1.0)
+
+
+def test_cosine_similarity_preserves_tiny_nonzero_vectors() -> None:
+    similarity = cosine_similarity((1e-308, 0.0), (1e-308, 0.0))
+
+    assert math.isfinite(similarity)
+    assert similarity == pytest.approx(1.0)
+
+
+def test_cosine_similarity_stays_bounded_for_mixed_scales() -> None:
+    similarity = cosine_similarity(
+        (1e308, 1.0, 1e-308),
+        (1e308, -1.0, 1e-308),
+    )
+
+    assert math.isfinite(similarity)
+    assert -1.0 <= similarity <= 1.0
+
+
 @pytest.mark.parametrize(
     ("left", "right"),
     [((1.0,), (1.0, 0.0)), ((), (1.0,)), ((math.nan,), (1.0,)), ((math.inf,), (1.0,))],
