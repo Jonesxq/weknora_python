@@ -928,18 +928,74 @@ class BatchApplyRequest(_FrozenValueModel):
         return self
 
 
-class BatchResult(_StrictModel):
-    completed_op_ids: list[UUID] = Field(default_factory=list)
-    failed_op_ids: list[UUID] = Field(default_factory=list)
+class BatchApplyOutcome(_FrozenValueModel):
+    applied: bool
+    completed_op_ids: tuple[UUID, ...] = ()
+    superseded_op_ids: tuple[UUID, ...] = ()
+    failed_op_ids: tuple[UUID, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_operation_ids(self) -> Self:
+        groups = (
+            self.completed_op_ids,
+            self.superseded_op_ids,
+            self.failed_op_ids,
+        )
+        if any(len(group) != len(set(group)) for group in groups):
+            raise ValueError("apply outcome operation id 不能重复")
+        if len(set().union(*(set(group) for group in groups))) != sum(
+            len(group) for group in groups
+        ):
+            raise ValueError("completed、superseded 与 failed operation id 不能重叠")
+        return self
+
+
+class _OperationIds(tuple):
+    """不可变 ID 序列，同时兼容阶段二测试中的 list 比较。"""
+
+    def __new__(cls, values: Iterable[UUID] = ()) -> Self:
+        return super().__new__(cls, values)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, (list, tuple)):
+            return tuple.__eq__(self, tuple(other))
+        return False
+
+    __hash__ = tuple.__hash__
+
+
+class BatchResult(_FrozenValueModel):
+    completed_op_ids: tuple[UUID, ...] = ()
+    failed_op_ids: tuple[UUID, ...] = ()
+    superseded_op_ids: tuple[UUID, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in {"completed_ops", "failed_ops", "superseded_ops"}:
+            raise AttributeError(f"{name} 是只读派生属性")
+        super().__setattr__(name, value)
 
     @model_validator(mode="after")
     def validate_ids(self) -> Self:
-        if len(self.completed_op_ids) != len(set(self.completed_op_ids)):
-            raise ValueError("completed_op_ids 不能重复")
-        if len(self.failed_op_ids) != len(set(self.failed_op_ids)):
-            raise ValueError("failed_op_ids 不能重复")
-        if set(self.completed_op_ids) & set(self.failed_op_ids):
-            raise ValueError("completed_op_ids 与 failed_op_ids 不能重叠")
+        groups = (
+            self.completed_op_ids,
+            self.failed_op_ids,
+            self.superseded_op_ids,
+        )
+        if any(len(group) != len(set(group)) for group in groups):
+            raise ValueError("BatchResult operation id 不能重复")
+        if len(set().union(*(set(group) for group in groups))) != sum(
+            len(group) for group in groups
+        ):
+            raise ValueError("completed、failed 与 superseded operation id 不能重叠")
+        object.__setattr__(
+            self, "completed_op_ids", _OperationIds(self.completed_op_ids)
+        )
+        object.__setattr__(self, "failed_op_ids", _OperationIds(self.failed_op_ids))
+        object.__setattr__(
+            self, "superseded_op_ids", _OperationIds(self.superseded_op_ids)
+        )
         return self
 
     @classmethod
@@ -947,17 +1003,27 @@ class BatchResult(_StrictModel):
         cls,
         pending_op_ids: Iterable[UUID],
         failed_op_ids: Iterable[UUID],
+        superseded_op_ids: Iterable[UUID] = (),
     ) -> Self:
         pending = list(dict.fromkeys(pending_op_ids))
         failed = list(dict.fromkeys(failed_op_ids))
+        superseded = list(dict.fromkeys(superseded_op_ids))
         pending_set = set(pending)
-        unknown_failed = [op_id for op_id in failed if op_id not in pending_set]
-        if unknown_failed:
-            raise ValueError("failed_op_ids 必须是 pending_op_ids 的子集")
+        unknown = [
+            op_id for op_id in (*failed, *superseded) if op_id not in pending_set
+        ]
+        if unknown:
+            raise ValueError("failed/superseded op ids 必须是 pending_op_ids 的子集")
         failed_set = set(failed)
+        superseded_set = set(superseded)
         return cls(
-            completed_op_ids=[op_id for op_id in pending if op_id not in failed_set],
-            failed_op_ids=failed,
+            completed_op_ids=tuple(
+                op_id
+                for op_id in pending
+                if op_id not in failed_set and op_id not in superseded_set
+            ),
+            failed_op_ids=tuple(failed),
+            superseded_op_ids=tuple(superseded),
         )
 
     @property
@@ -967,6 +1033,10 @@ class BatchResult(_StrictModel):
     @property
     def failed_ops(self) -> int:
         return len(self.failed_op_ids)
+
+    @property
+    def superseded_ops(self) -> int:
+        return len(self.superseded_op_ids)
 
 
 class FinalizationRequest(_StrictModel):

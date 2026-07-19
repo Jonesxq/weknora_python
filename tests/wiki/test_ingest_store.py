@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy.dialects import postgresql
 
+from app.wiki.ingest import schemas as ingest_schemas
 from app.wiki.ingest import store as ingest_store
 from app.wiki.ingest.schemas import (
     BatchApplyRequest,
@@ -70,6 +71,34 @@ def _batch_request(**updates) -> BatchApplyRequest:
     }
     values.update(updates)
     return BatchApplyRequest(**values)
+
+
+def test_batch_apply_outcome_is_frozen_and_partitions_operation_ids() -> None:
+    outcome_type = getattr(ingest_schemas, "BatchApplyOutcome", None)
+    assert outcome_type is not None
+    completed, superseded, failed = uuid4(), uuid4(), uuid4()
+    outcome = outcome_type(
+        applied=True,
+        completed_op_ids=(completed,),
+        superseded_op_ids=(superseded,),
+        failed_op_ids=(failed,),
+    )
+
+    assert outcome.completed_op_ids == (completed,)
+    assert outcome.superseded_op_ids == (superseded,)
+    assert outcome.failed_op_ids == (failed,)
+    with pytest.raises(ValidationError):
+        outcome.applied = False
+    for kwargs in (
+        {"completed_op_ids": (completed, completed)},
+        {"superseded_op_ids": (superseded, superseded)},
+        {"failed_op_ids": (failed, failed)},
+        {"completed_op_ids": (completed,), "superseded_op_ids": (completed,)},
+        {"completed_op_ids": (completed,), "failed_op_ids": (completed,)},
+        {"superseded_op_ids": (completed,), "failed_op_ids": (completed,)},
+    ):
+        with pytest.raises(ValidationError):
+            outcome_type(applied=True, **kwargs)
 
 
 def test_validate_batch_request_returns_an_immutable_snapshot() -> None:
@@ -502,9 +531,10 @@ async def test_retract_pending_add_delta_is_rejected_before_any_writes() -> None
 
 
 @pytest.mark.asyncio
-async def test_modern_apply_results_returns_idempotent_noop_for_same_scope_log() -> (
-    None
-):
+@pytest.mark.parametrize("detailed", [False, True])
+async def test_modern_apply_results_returns_idempotent_noop_for_same_scope_log(
+    detailed: bool,
+) -> None:
     operation_id = uuid4()
     existing_log = WikiLogEntry(
         tenant_id=SCOPE.tenant_id,
@@ -543,7 +573,14 @@ async def test_modern_apply_results_returns_idempotent_noop_for_same_scope_log()
     store = SqlAlchemyIngestStore(lambda: session, SqlFinalizationPort())  # type: ignore[arg-type]
     request = _batch_request(operation_id=operation_id)
 
-    assert await store.apply_results(SCOPE, request) is False  # type: ignore[call-arg]
+    if detailed:
+        outcome = await store.apply_results_with_outcome(SCOPE, request)
+        assert outcome.applied is False
+        assert outcome.completed_op_ids == request.completed_op_ids
+        assert outcome.superseded_op_ids == ()
+        assert outcome.failed_op_ids == ()
+    else:
+        assert await store.apply_results(SCOPE, request) is False  # type: ignore[call-arg]
     assert session.begin_count == 1
     assert session.execute_count == 2
 
@@ -1925,7 +1962,10 @@ async def test_auto_superseded_shared_slug_rolls_back_before_any_writes(
 
 
 @pytest.mark.asyncio
-async def test_later_retract_supersedes_ingest_without_writing_its_slug() -> None:
+@pytest.mark.parametrize("detailed", [False, True])
+async def test_later_retract_supersedes_ingest_without_writing_its_slug(
+    detailed: bool,
+) -> None:
     token = uuid4()
     ingest = _pending(claimed=True)
     ingest.claim_token = token
@@ -1967,8 +2007,17 @@ async def test_later_retract_supersedes_ingest_without_writing_its_slug() -> Non
     finalization = _RecordingFinalization(session.events)
     store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
 
-    assert await store.apply_results(SCOPE, request) is True
+    if detailed:
+        outcome = await store.apply_results_with_outcome(SCOPE, request)
+        assert outcome.applied is True
+        assert outcome.completed_op_ids == outcome.failed_op_ids == ()
+        assert outcome.superseded_op_ids == (ingest.id,)
+    else:
+        assert await store.apply_results(SCOPE, request) is True
 
+    assert (
+        sum("pg_advisory_xact_lock" in _sql(item) for item in session.statements) == 1
+    )
     assert not any(
         isinstance(item, (WikiPage, WikiPageContribution)) for item in session.added
     )

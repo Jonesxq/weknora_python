@@ -35,6 +35,7 @@ from app.wiki.domain import extract_wiki_links
 from app.wiki.ingest.ports import FinalizationPort
 from app.wiki.ingest.retract import project_active_refs
 from app.wiki.ingest.schemas import (
+    BatchApplyOutcome,
     BatchApplyRequest,
     ContributionDelta,
     ContributionState,
@@ -224,6 +225,12 @@ class IngestStore(Protocol):
         scope: WikiScope,
         request: BatchApplyRequest,
     ) -> bool: ...
+
+    async def apply_results_with_outcome(
+        self,
+        scope: WikiScope,
+        request: BatchApplyRequest,
+    ) -> BatchApplyOutcome: ...
 
     async def list_dead_letters(
         self, scope: WikiScope, *, limit: int = 100
@@ -654,6 +661,29 @@ def _validate_batch_request(
     if not _legacy_coverage and delta_slugs - page_slugs:
         raise InvariantError("completed contribution delta 必须有对应 page")
     return snapshot
+
+
+def _batch_apply_outcome(
+    request: BatchApplyRequest,
+    *,
+    applied: bool,
+    completed_op_ids: Sequence[UUID] | None = None,
+    superseded_op_ids: Sequence[UUID] | None = None,
+) -> BatchApplyOutcome:
+    return BatchApplyOutcome(
+        applied=applied,
+        completed_op_ids=(
+            request.completed_op_ids
+            if completed_op_ids is None
+            else tuple(completed_op_ids)
+        ),
+        superseded_op_ids=(
+            request.superseded_op_ids
+            if superseded_op_ids is None
+            else tuple(superseded_op_ids)
+        ),
+        failed_op_ids=tuple(failure.pending_op_id for failure in request.failures),
+    )
 
 
 def _validate_delta_for_pending(
@@ -1671,6 +1701,22 @@ class SqlAlchemyIngestStore:
                 failed_op_ids,
                 expected_pages,
             )
+        return (await self._apply_checked_results(scope, checked)).applied
+
+    async def apply_results_with_outcome(
+        self,
+        scope: WikiScope,
+        request: BatchApplyRequest,
+    ) -> BatchApplyOutcome:
+        return await self._apply_checked_results(
+            scope, _validate_batch_request(request)
+        )
+
+    async def _apply_checked_results(
+        self,
+        scope: WikiScope,
+        checked: BatchApplyRequest,
+    ) -> BatchApplyOutcome:
         if not (
             checked.pages
             or checked.contribution_deltas
@@ -1679,12 +1725,12 @@ class SqlAlchemyIngestStore:
             or checked.failures
             or checked.expected_pages
         ):
-            return False
+            return _batch_apply_outcome(checked, applied=False)
         return await self._apply_batch_results(scope, checked)
 
     async def _apply_batch_results(
         self, scope: WikiScope, request: BatchApplyRequest
-    ) -> bool:
+    ) -> BatchApplyOutcome:
         async with self._session_factory() as session:
             async with session.begin():
                 await session.execute(
@@ -1707,7 +1753,7 @@ class SqlAlchemyIngestStore:
                         or existing_log.knowledge_base_id != scope.knowledge_base_id
                     ):
                         raise InvariantError("operation_id 已被其他 scope 使用")
-                    return False
+                    return _batch_apply_outcome(request, applied=False)
                 requested_ids = {
                     *request.completed_op_ids,
                     *request.superseded_op_ids,
@@ -1770,14 +1816,23 @@ class SqlAlchemyIngestStore:
                         for retract in later_retracts
                     )
                 }
-                superseded_ids = {
-                    *request.superseded_op_ids,
-                    *auto_superseded,
-                }
+                superseded_ids = list(
+                    dict.fromkeys(
+                        [
+                            *request.superseded_op_ids,
+                            *(
+                                op_id
+                                for op_id in request.completed_op_ids
+                                if op_id in auto_superseded
+                            ),
+                        ]
+                    )
+                )
+                superseded_id_set = set(superseded_ids)
                 completed_ids = [
                     op_id
                     for op_id in request.completed_op_ids
-                    if op_id not in superseded_ids
+                    if op_id not in superseded_id_set
                 ]
                 completed_id_set = set(completed_ids)
                 terminal_ids = [*completed_ids, *superseded_ids]
@@ -2126,7 +2181,12 @@ class SqlAlchemyIngestStore:
                 if remaining:
                     await _enqueue_follow_up(session, scope, request.operation_id)
                 await session.flush()
-                return True
+                return _batch_apply_outcome(
+                    request,
+                    applied=True,
+                    completed_op_ids=completed_ids,
+                    superseded_op_ids=superseded_ids,
+                )
 
     async def pending_count(self, scope: WikiScope) -> int:
         async with self._session_factory() as session:
