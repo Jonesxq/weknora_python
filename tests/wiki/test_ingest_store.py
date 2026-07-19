@@ -843,6 +843,100 @@ def _sql(statement) -> str:
     return " ".join(str(statement.compile(dialect=postgresql.dialect())).split())
 
 
+@pytest.mark.asyncio
+async def test_load_taxonomy_context_filters_history_and_returns_stable_narrow_scope() -> (
+    None
+):
+    root_id, child_id = uuid4(), uuid4()
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(
+                rows=[
+                    (root_id, None, "Engineering", "/Engineering", 1),
+                    (
+                        child_id,
+                        root_id,
+                        "Databases",
+                        "/Engineering/Databases",
+                        2,
+                    ),
+                ]
+            ),
+            _ScriptedResult(rows=["concept/deleted-history", "entity/existing"]),
+        ]
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
+
+    context = await store.load_taxonomy_context(
+        SCOPE,
+        [
+            " entity/Zeta ",
+            "concept/new",
+            "ENTITY/zeta",
+            "entity/existing",
+            "concept/deleted-history",
+            "summary/overview",
+            "other/ignored",
+            7,  # type: ignore[list-item]
+        ],
+    )
+
+    assert [(folder.id, folder.path) for folder in context.folders] == [
+        (root_id, "/Engineering"),
+        (child_id, "/Engineering/Databases"),
+    ]
+    assert context.classifiable_slugs == ("concept/new", "entity/zeta")
+    folder_sql, page_sql = map(_sql, session.statements)
+    assert "wiki_folders.content" not in folder_sql
+    assert "wiki_pages.content" not in page_sql
+    assert "wiki_folders.tenant_id" in folder_sql
+    assert "wiki_folders.knowledge_base_id" in folder_sql
+    assert "wiki_folders.deleted_at IS NULL" in folder_sql
+    assert (
+        "ORDER BY wiki_folders.depth, wiki_folders.path, wiki_folders.id"
+        in folder_sql
+    )
+    assert "wiki_pages.tenant_id" in page_sql
+    assert "wiki_pages.knowledge_base_id" in page_sql
+    assert "wiki_pages.deleted_at" not in page_sql
+    for statement in session.statements:
+        params = statement.compile(dialect=postgresql.dialect()).params.values()
+        assert SCOPE.tenant_id in params
+        assert SCOPE.knowledge_base_id in params
+
+
+@pytest.mark.asyncio
+async def test_load_taxonomy_context_uses_topic_candidate_slug_boundary() -> None:
+    session = _ScriptedSession([])
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(ValidationError, match="slug"):
+        await store.load_taxonomy_context(SCOPE, ["entity/not valid"])
+
+    assert session.statements == []
+
+
+@pytest.mark.asyncio
+async def test_load_taxonomy_context_wraps_dirty_dto_rows_only() -> None:
+    bad_folder = (uuid4(), None, "Wrong", "/Different", 1)
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(rows=[bad_folder]),
+            _ScriptedResult(rows=[]),
+        ]
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(InvariantError, match="taxonomy context 查询返回脏数据"):
+        await store.load_taxonomy_context(SCOPE, ["entity/new"])
+
+
 def test_claim_pending_sql_is_scoped_ordered_and_skip_locked() -> None:
     sql = _sql(
         build_claim_pending_ops_statement(

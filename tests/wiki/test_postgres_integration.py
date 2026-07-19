@@ -52,6 +52,7 @@ from app.wiki.models import (
     TaskOutbox,
     WikiFinalizationMarker,
     WikiDeadLetter,
+    WikiFolder,
     WikiLink,
     WikiLogEntry,
     WikiPage,
@@ -1301,6 +1302,110 @@ async def test_real_dedup_function_filters_scope_type_state_and_limits_top_twent
     assert all(item.page_type == "entity" for item in found)
     assert all(item.slug.startswith("entity/acme-target-") for item in found)
     assert len({item.slug for item in found}) == 20
+
+
+@pytest.mark.asyncio
+async def test_real_taxonomy_context_is_scoped_and_excludes_all_page_history(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(tenant_id=39, knowledge_base_id=uuid4(), actor_id="task6")
+    other_scope = WikiScope(
+        tenant_id=scope.tenant_id + 1,
+        knowledge_base_id=uuid4(),
+        actor_id="other-task6",
+    )
+    root_id, child_id, leaf_id = uuid4(), uuid4(), uuid4()
+    async with postgres_factory() as session, session.begin():
+        session.add_all(
+            [
+                WikiFolder(
+                    id=root_id,
+                    tenant_id=scope.tenant_id,
+                    knowledge_base_id=scope.knowledge_base_id,
+                    name="Engineering",
+                    path="/Engineering",
+                    depth=1,
+                ),
+                WikiFolder(
+                    id=child_id,
+                    tenant_id=scope.tenant_id,
+                    knowledge_base_id=scope.knowledge_base_id,
+                    parent_id=root_id,
+                    name="Databases",
+                    path="/Engineering/Databases",
+                    depth=2,
+                ),
+                WikiFolder(
+                    id=leaf_id,
+                    tenant_id=scope.tenant_id,
+                    knowledge_base_id=scope.knowledge_base_id,
+                    parent_id=child_id,
+                    name="PostgreSQL",
+                    path="/Engineering/Databases/PostgreSQL",
+                    depth=3,
+                ),
+                WikiFolder(
+                    tenant_id=scope.tenant_id,
+                    knowledge_base_id=scope.knowledge_base_id,
+                    name="Deleted",
+                    path="/Deleted",
+                    depth=1,
+                    deleted_at=datetime.now(UTC),
+                ),
+                WikiFolder(
+                    tenant_id=other_scope.tenant_id,
+                    knowledge_base_id=other_scope.knowledge_base_id,
+                    name="Hidden",
+                    path="/Hidden",
+                    depth=1,
+                ),
+                WikiPage(
+                    tenant_id=scope.tenant_id,
+                    knowledge_base_id=scope.knowledge_base_id,
+                    slug="concept/current",
+                    title="Current",
+                    page_type="concept",
+                    status="published",
+                ),
+                WikiPage(
+                    tenant_id=scope.tenant_id,
+                    knowledge_base_id=scope.knowledge_base_id,
+                    slug="concept/deleted-history",
+                    title="Deleted history",
+                    page_type="concept",
+                    status="published",
+                    deleted_at=datetime.now(UTC),
+                ),
+                WikiPage(
+                    tenant_id=other_scope.tenant_id,
+                    knowledge_base_id=other_scope.knowledge_base_id,
+                    slug="entity/other-only",
+                    title="Other only",
+                    page_type="entity",
+                    status="published",
+                ),
+            ]
+        )
+
+    context = await SqlAlchemyIngestStore(
+        postgres_factory, SqlFinalizationPort()
+    ).load_taxonomy_context(
+        scope,
+        [
+            "entity/other-only",
+            "concept/current",
+            "entity/new",
+            "concept/deleted-history",
+            "summary/overview",
+        ],
+    )
+
+    assert [(folder.id, folder.path) for folder in context.folders] == [
+        (root_id, "/Engineering"),
+        (child_id, "/Engineering/Databases"),
+        (leaf_id, "/Engineering/Databases/PostgreSQL"),
+    ]
+    assert context.classifiable_slugs == ("entity/new", "entity/other-only")
 
 
 @pytest.mark.asyncio

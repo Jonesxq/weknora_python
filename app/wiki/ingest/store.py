@@ -41,17 +41,20 @@ from app.wiki.ingest.schemas import (
     ContributionState,
     DedupPageCandidate,
     FinalizationRequest,
+    FolderCatalogEntry,
     OperationFailure,
     PageExpectation,
     ReducedPage,
     SourceKnowledge,
     StoredContributionRecord,
+    TaxonomyContext,
     TopicCandidate,
 )
 from app.wiki.models import (
     TaskOutbox,
     WikiFinalizationMarker,
     WikiDeadLetter,
+    WikiFolder,
     WikiLogEntry,
     WikiLink,
     WikiPage,
@@ -207,6 +210,10 @@ class IngestStore(Protocol):
     async def find_existing_pages(
         self, scope: WikiScope, slugs: Iterable[str]
     ) -> dict[str, ExistingPageRecord]: ...
+
+    async def load_taxonomy_context(
+        self, scope: WikiScope, slugs: Iterable[str]
+    ) -> TaxonomyContext: ...
 
     async def list_source_contributions(
         self,
@@ -1069,6 +1076,58 @@ def _contribution_record(row: WikiPageContribution) -> StoredContributionRecord:
         raise InvariantError("贡献查询返回了脏数据") from exc
 
 
+def _taxonomy_requested_slugs(slugs: Iterable[str]) -> tuple[str, ...]:
+    requested: set[str] = set()
+    for value in slugs:
+        if not isinstance(value, str):
+            continue
+        slug = value.strip().casefold()
+        if not slug.startswith(("entity/", "concept/")):
+            continue
+        normalized = TaxonomyContext(
+            classifiable_slugs=(slug,)
+        ).classifiable_slugs[0]
+        requested.add(normalized)
+    return tuple(sorted(requested))
+
+
+def _taxonomy_context(
+    folder_rows: Iterable[Sequence[object]],
+    existing_page_slugs: Iterable[object],
+    requested_slugs: tuple[str, ...],
+) -> TaxonomyContext:
+    try:
+        folders = tuple(
+            FolderCatalogEntry(
+                id=folder_id,
+                parent_id=parent_id,
+                name=name,
+                path=path,
+                depth=depth,
+            )
+            for folder_id, parent_id, name, path, depth in folder_rows
+        )
+        existing: set[str] = set()
+        requested = set(requested_slugs)
+        for value in existing_page_slugs:
+            if not isinstance(value, str):
+                raise TypeError("page slug 必须是字符串")
+            normalized = TaxonomyContext(
+                classifiable_slugs=(value,)
+            ).classifiable_slugs[0]
+            if normalized != value or normalized not in requested:
+                raise ValueError("page slug 不属于 taxonomy context 请求")
+            existing.add(normalized)
+        return TaxonomyContext(
+            folders=folders,
+            classifiable_slugs=tuple(
+                slug for slug in requested_slugs if slug not in existing
+            ),
+        )
+    except (ValidationError, TypeError, ValueError) as exc:
+        raise InvariantError("taxonomy context 查询返回脏数据") from exc
+
+
 class SqlAlchemyIngestStore:
     """每个公开操作使用独立短 session 的 PostgreSQL 摄取仓储。"""
 
@@ -1608,6 +1667,51 @@ class SqlAlchemyIngestStore:
                 )
                 for row in rows
             }
+
+    async def load_taxonomy_context(
+        self, scope: WikiScope, slugs: Iterable[str]
+    ) -> TaxonomyContext:
+        requested_slugs = _taxonomy_requested_slugs(slugs)
+        async with self._session_factory() as session:
+            folder_rows = list(
+                (
+                    await session.execute(
+                        select(
+                            WikiFolder.id,
+                            WikiFolder.parent_id,
+                            WikiFolder.name,
+                            WikiFolder.path,
+                            WikiFolder.depth,
+                        )
+                        .where(
+                            WikiFolder.tenant_id == scope.tenant_id,
+                            WikiFolder.knowledge_base_id
+                            == scope.knowledge_base_id,
+                            WikiFolder.deleted_at.is_(None),
+                        )
+                        .order_by(WikiFolder.depth, WikiFolder.path, WikiFolder.id)
+                    )
+                ).all()
+            )
+            existing_page_slugs: list[object] = []
+            if requested_slugs:
+                existing_page_slugs = list(
+                    (
+                        await session.execute(
+                            select(WikiPage.slug)
+                            .where(
+                                WikiPage.tenant_id == scope.tenant_id,
+                                WikiPage.knowledge_base_id
+                                == scope.knowledge_base_id,
+                                WikiPage.slug.in_(requested_slugs),
+                            )
+                            .order_by(WikiPage.slug)
+                        )
+                    ).scalars()
+                )
+        return _taxonomy_context(
+            folder_rows, existing_page_slugs, requested_slugs
+        )
 
     async def list_source_contributions(
         self,
