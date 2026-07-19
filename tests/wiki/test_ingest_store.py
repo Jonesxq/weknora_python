@@ -16,6 +16,7 @@ from app.wiki.ingest.schemas import (
     BatchApplyRequest,
     ContributionDelta,
     FinalizationRequest,
+    FolderAssignment,
     OperationFailure,
     PageExpectation,
     ReducedPage,
@@ -56,9 +57,12 @@ from app.wiki.scope import WikiScope
 KB_ID = UUID("11111111-1111-1111-1111-111111111111")
 SCOPE = WikiScope(tenant_id=7, knowledge_base_id=KB_ID, actor_id="worker")
 NOW = datetime(2026, 7, 15, 12, tzinfo=UTC)
+_UNSET = object()
 
 
-def _batch_request(**updates) -> BatchApplyRequest:
+def _batch_request(
+    *, folder_assignments: object = _UNSET, **updates: object
+) -> BatchApplyRequest:
     values = {
         "claim_token": uuid4(),
         "pages": (),
@@ -70,6 +74,26 @@ def _batch_request(**updates) -> BatchApplyRequest:
         "operation_id": uuid4(),
     }
     values.update(updates)
+    if folder_assignments is _UNSET:
+        expectations = {
+            expectation.slug: expectation
+            for expectation in values["expected_pages"]
+            if isinstance(expectation, PageExpectation)
+        }
+        folder_assignments = tuple(
+            FolderAssignment(
+                slug=page.slug,
+                contributor_op_ids=tuple(page.contributor_op_ids),
+            )
+            for page in values["pages"]
+            if isinstance(page, ReducedPage)
+            and page.page_type in {"entity", "concept"}
+            and not page.deleted
+            and page.contributor_op_ids
+            and (expectation := expectations.get(page.slug)) is not None
+            and expectation.page_id is None
+        )
+    values["folder_assignments"] = folder_assignments
     return BatchApplyRequest(**values)
 
 
@@ -133,6 +157,26 @@ def _result_page() -> ReducedPage:
         page_type="entity",
         content="正文",
         summary="摘要",
+    )
+
+
+def _delta_for_page(op_id: UUID, page: ReducedPage) -> ContributionDelta:
+    record = _stored_contribution().model_copy(
+        update={
+            "slug": page.slug,
+            "page_type": page.page_type,
+            "title": page.title,
+            "content": page.content,
+            "summary": page.summary,
+        }
+    )
+    return ContributionDelta(
+        pending_op_id=op_id,
+        action="retract_stale" if page.deleted else "add",
+        slug=page.slug,
+        knowledge_id=record.knowledge_id,
+        previous=record if page.deleted else None,
+        current=None if page.deleted else record,
     )
 
 
@@ -357,6 +401,138 @@ def test_modern_page_rejects_empty_contributor_ids() -> None:
     )
 
     with pytest.raises(InvariantError, match="contributor"):
+        ingest_store._validate_batch_request(request)
+
+
+def test_new_topic_page_gets_root_assignment_unless_explicitly_disabled() -> None:
+    op_id = uuid4()
+    page = _result_page().model_copy(update={"contributor_op_ids": [op_id]})
+    expectation = PageExpectation(slug=page.slug)
+
+    request = _batch_request(
+        pages=(page,),
+        completed_op_ids=(op_id,),
+        expected_pages=(expectation,),
+    )
+    explicit_empty = _batch_request(
+        pages=(page,),
+        completed_op_ids=(op_id,),
+        expected_pages=(expectation,),
+        folder_assignments=(),
+    )
+
+    assert request.folder_assignments == (
+        FolderAssignment(slug=page.slug, contributor_op_ids=(op_id,)),
+    )
+    assert explicit_empty.folder_assignments == ()
+
+
+def _assignment_request(
+    *,
+    page: ReducedPage | None = None,
+    page_op_id: UUID | None = None,
+    assignment_op_ids: tuple[UUID, ...] | None = None,
+    completed_op_ids: tuple[UUID, ...] | None = None,
+    expectation: PageExpectation | None = None,
+) -> BatchApplyRequest:
+    page_op_id = page_op_id or uuid4()
+    page = (page or _result_page()).model_copy(
+        update={"contributor_op_ids": [page_op_id]}
+    )
+    assignment_values = {
+        "slug": page.slug,
+        "contributor_op_ids": assignment_op_ids or (page_op_id,),
+    }
+    assignment = (
+        FolderAssignment.model_construct(
+            **assignment_values,
+            base_folder_id=None,
+            base_path=None,
+            base_depth=0,
+            new_segments=(),
+        )
+        if page.page_type == "summary"
+        else FolderAssignment(**assignment_values)
+    )
+    return _batch_request(
+        pages=(page,),
+        contribution_deltas=(_delta_for_page(page_op_id, page),),
+        completed_op_ids=completed_op_ids or (page_op_id,),
+        expected_pages=(expectation or PageExpectation(slug=page.slug),),
+        folder_assignments=(assignment,),
+    )
+
+
+def test_folder_assignment_rejects_an_existing_page() -> None:
+    request = _assignment_request(
+        expectation=PageExpectation(slug="entity/acme", page_id=uuid4(), version=1)
+    )
+
+    with pytest.raises(InvariantError, match="新页面"):
+        ingest_store._validate_batch_request(request)
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_folder_assignment_rejects_summary_or_deleted_page(deleted: bool) -> None:
+    page = (
+        _result_page().model_copy(update={"deleted": True})
+        if deleted
+        else ReducedPage(
+            slug="summary/overview",
+            title="Overview",
+            page_type="summary",
+            content="Body",
+            summary="Summary",
+        )
+    )
+
+    with pytest.raises(InvariantError, match="未删除 topic 页面"):
+        ingest_store._validate_batch_request(_assignment_request(page=page))
+
+
+def test_folder_assignment_contributors_must_match_result_page() -> None:
+    page_op_id, other_op_id = uuid4(), uuid4()
+    request = _assignment_request(
+        page_op_id=page_op_id,
+        assignment_op_ids=(other_op_id,),
+        completed_op_ids=(page_op_id, other_op_id),
+    )
+
+    with pytest.raises(InvariantError, match="contributor"):
+        ingest_store._validate_batch_request(request)
+
+
+def test_folder_assignment_contributors_must_be_completed() -> None:
+    completed_id, other_id = uuid4(), uuid4()
+    request = _assignment_request(
+        page_op_id=completed_id,
+        assignment_op_ids=(other_id,),
+        completed_op_ids=(completed_id,),
+    )
+
+    with pytest.raises(InvariantError, match="completed"):
+        ingest_store._validate_batch_request(request)
+
+
+def test_folder_assignment_requires_a_result_page_and_expectation() -> None:
+    op_id = uuid4()
+    request = _batch_request(
+        completed_op_ids=(op_id,),
+        folder_assignments=(
+            FolderAssignment(slug="entity/missing", contributor_op_ids=(op_id,)),
+        ),
+    )
+
+    with pytest.raises(InvariantError, match="结果页面"):
+        ingest_store._validate_batch_request(request)
+
+
+def test_validate_batch_request_rejects_polluted_duplicate_assignments() -> None:
+    request = _assignment_request()
+    assignment = request.folder_assignments[0]
+    object.__setattr__(request, "folder_assignments", (assignment, assignment))
+
+    with pytest.raises(InvariantError, match="重复"):
         ingest_store._validate_batch_request(request)
 
 
@@ -1586,6 +1762,56 @@ def test_legacy_page_coverage_remains_compatible_without_deltas() -> None:
     assert [item.slug for item in request.pages] == [page.slug]
     assert request.pages[0].contributor_op_ids == (op_id,)
     assert request.contribution_deltas == ()
+    assert request.folder_assignments == ()
+
+
+@pytest.mark.asyncio
+async def test_apply_results_routes_taxonomy_requirement_by_request_style() -> None:
+    class RecordingStore(SqlAlchemyIngestStore):
+        def __init__(self) -> None:
+            super().__init__(lambda: None, SqlFinalizationPort())  # type: ignore[arg-type]
+            self.require_taxonomy_flags: list[bool] = []
+
+        async def _apply_batch_results(
+            self,
+            scope: WikiScope,
+            request: BatchApplyRequest,
+            *,
+            require_taxonomy: bool,
+        ):
+            self.require_taxonomy_flags.append(require_taxonomy)
+            return ingest_store._batch_apply_outcome(request, applied=True)
+
+    store = RecordingStore()
+    await store.apply_results(SCOPE, _batch_request())
+    await store.apply_results(SCOPE, uuid4(), [], [uuid4()], uuid4())
+    await store.apply_results_with_outcome(SCOPE, _batch_request())
+
+    assert store.require_taxonomy_flags == [True, False, True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "legacy_kwargs",
+    [
+        {"pages": ()},
+        {"completed_op_ids": ()},
+        {"operation_id": uuid4()},
+        {"failed_op_ids": ()},
+        {"expected_pages": {}},
+    ],
+)
+async def test_modern_apply_results_rejects_even_empty_legacy_arguments(
+    legacy_kwargs: dict[str, object],
+) -> None:
+    class ExplodingFactory:
+        def __call__(self):
+            raise AssertionError("混用参数不应打开数据库 session")
+
+    store = SqlAlchemyIngestStore(ExplodingFactory(), SqlFinalizationPort())  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match="不能混用"):
+        await store.apply_results(SCOPE, _batch_request(), **legacy_kwargs)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio

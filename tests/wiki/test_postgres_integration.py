@@ -26,6 +26,7 @@ from app.wiki.errors import WikiNotFoundError, WikiVersionConflictError
 from app.wiki.ingest.schemas import (
     BatchApplyRequest,
     ContributionDelta,
+    FolderAssignment,
     OperationFailure,
     PageExpectation,
     PageMergeOutput,
@@ -1575,6 +1576,12 @@ async def test_two_source_canonical_apply_and_outcome_replay_are_idempotent(
         failures=(),
         expected_pages=(PageExpectation(slug="entity/canonical"),),
         operation_id=operation_id,
+        folder_assignments=(
+            FolderAssignment(
+                slug="entity/canonical",
+                contributor_op_ids=tuple(item.id for item in claimed),
+            ),
+        ),
     )
 
     outcome = await store.apply_results_with_outcome(scope, request)

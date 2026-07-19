@@ -640,13 +640,55 @@ def _validate_batch_request(
     try:
         snapshot = BatchApplyRequest.model_validate(request.model_dump(mode="python"))
     except (ValidationError, TypeError, ValueError) as exc:
+        assignments = getattr(request, "folder_assignments", ())
+        assignment_slugs = [
+            getattr(assignment, "slug", None) for assignment in assignments
+        ]
+        if len(assignment_slugs) != len(set(assignment_slugs)):
+            raise InvariantError("folder assignment slug 不能重复") from exc
+        if any(
+            isinstance(slug, str) and slug.startswith("summary/")
+            for slug in assignment_slugs
+        ):
+            raise InvariantError("folder assignment 必须对应未删除 topic 页面") from exc
         raise InvariantError("结果批次未通过完整校验") from exc
-    page_slugs = {page.slug for page in snapshot.pages}
-    expected_slugs = {expectation.slug for expectation in snapshot.expected_pages}
+    pages_by_slug = {page.slug: page for page in snapshot.pages}
+    expectations_by_slug = {
+        expectation.slug: expectation for expectation in snapshot.expected_pages
+    }
+    page_slugs = set(pages_by_slug)
+    expected_slugs = set(expectations_by_slug)
     if page_slugs != expected_slugs:
         raise InvariantError("expected_pages 必须完整覆盖 pages slug")
 
     completed_ids = set(snapshot.completed_op_ids)
+    assignment_slugs = [assignment.slug for assignment in snapshot.folder_assignments]
+    if len(assignment_slugs) != len(set(assignment_slugs)):
+        raise InvariantError("folder assignment slug 不能重复")
+    assignments_by_slug = {
+        assignment.slug: assignment for assignment in snapshot.folder_assignments
+    }
+    for slug, assignment in assignments_by_slug.items():
+        page = pages_by_slug.get(slug)
+        expectation = expectations_by_slug.get(slug)
+        if page is None or expectation is None:
+            raise InvariantError(
+                "folder assignment 必须同时有结果页面和 PageExpectation"
+            )
+        if page.deleted or page.page_type not in {"entity", "concept"}:
+            raise InvariantError("folder assignment 必须对应未删除 topic 页面")
+        if expectation.page_id is not None:
+            raise InvariantError("folder assignment 只能用于新页面")
+        contributor_ids = set(assignment.contributor_op_ids)
+        if not contributor_ids.issubset(completed_ids):
+            raise InvariantError(
+                "folder assignment contributor 必须属于 completed operation"
+            )
+        if contributor_ids != set(page.contributor_op_ids):
+            raise InvariantError(
+                "folder assignment contributor 必须匹配结果页面 contributor"
+            )
+
     claimed_ids = {
         *snapshot.completed_op_ids,
         *snapshot.superseded_op_ids,
@@ -897,6 +939,7 @@ def _legacy_batch_request(
                 for slug, record in expected.items()
             ),
             operation_id=checked_operation_id,
+            folder_assignments=(),
         ),
         _legacy_coverage=True,
     )
@@ -1840,7 +1883,7 @@ class SqlAlchemyIngestStore:
         completed_op_ids: Sequence[UUID] | None = None,
         operation_id: UUID | None = None,
         *,
-        failed_op_ids: Sequence[UUID] = (),
+        failed_op_ids: Sequence[UUID] | None = None,
         expected_pages: Mapping[str, ExistingPageRecord | None] | None = None,
     ) -> bool:
         if isinstance(request, BatchApplyRequest):
@@ -1848,11 +1891,12 @@ class SqlAlchemyIngestStore:
                 pages is not None
                 or completed_op_ids is not None
                 or operation_id is not None
-                or failed_op_ids
+                or failed_op_ids is not None
                 or expected_pages is not None
             ):
                 raise TypeError("现代 apply_results 不能混用 legacy 参数")
             checked = _validate_batch_request(request)
+            require_taxonomy = True
         else:
             if pages is None or completed_op_ids is None:
                 raise TypeError("legacy apply_results 参数不完整")
@@ -1863,10 +1907,15 @@ class SqlAlchemyIngestStore:
                 pages,
                 completed_op_ids,
                 operation_id,
-                failed_op_ids,
+                failed_op_ids or (),
                 expected_pages,
             )
-        return (await self._apply_checked_results(scope, checked)).applied
+            require_taxonomy = False
+        return (
+            await self._apply_checked_results(
+                scope, checked, require_taxonomy=require_taxonomy
+            )
+        ).applied
 
     async def apply_results_with_outcome(
         self,
@@ -1874,13 +1923,15 @@ class SqlAlchemyIngestStore:
         request: BatchApplyRequest,
     ) -> BatchApplyOutcome:
         return await self._apply_checked_results(
-            scope, _validate_batch_request(request)
+            scope, _validate_batch_request(request), require_taxonomy=True
         )
 
     async def _apply_checked_results(
         self,
         scope: WikiScope,
         checked: BatchApplyRequest,
+        *,
+        require_taxonomy: bool,
     ) -> BatchApplyOutcome:
         if not (
             checked.pages
@@ -1891,10 +1942,16 @@ class SqlAlchemyIngestStore:
             or checked.expected_pages
         ):
             return _batch_apply_outcome(checked, applied=False)
-        return await self._apply_batch_results(scope, checked)
+        return await self._apply_batch_results(
+            scope, checked, require_taxonomy=require_taxonomy
+        )
 
     async def _apply_batch_results(
-        self, scope: WikiScope, request: BatchApplyRequest
+        self,
+        scope: WikiScope,
+        request: BatchApplyRequest,
+        *,
+        require_taxonomy: bool,
     ) -> BatchApplyOutcome:
         async with self._session_factory() as session:
             async with session.begin():
