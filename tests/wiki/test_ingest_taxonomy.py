@@ -163,6 +163,34 @@ def test_build_taxonomy_work_items_ignores_empty_summaries_and_input_container_o
     assert list_items[0].topic.summary == "Summary"
 
 
+def test_build_taxonomy_work_items_stabilizes_fully_tied_identity_records() -> None:
+    later = _add_delta(
+        knowledge_id="same",
+        op_version="v1",
+        pending_op_id=OP_A,
+        title="Zulu",
+        summary=" Zulu summary ",
+    )
+    first = _add_delta(
+        knowledge_id="same",
+        op_version="v1",
+        pending_op_id=OP_A,
+        title="Alpha",
+        summary="Alpha summary",
+    )
+
+    forward = build_taxonomy_work_items(
+        [later, first], classifiable_slugs=("entity/acme",)
+    )
+    reversed_items = build_taxonomy_work_items(
+        [first, later], classifiable_slugs=("entity/acme",)
+    )
+
+    assert forward == reversed_items
+    assert forward[0].topic.title == "Alpha"
+    assert forward[0].topic.summary == "Alpha summary\n\nZulu summary"
+
+
 def test_recover_taxonomy_output_requires_complete_exact_coverage() -> None:
     request = _request(
         TaxonomyTopic(slug="entity/acme", title="Acme", page_type="entity"),
@@ -223,6 +251,25 @@ def test_recover_taxonomy_output_accepts_root_and_allowed_base_depth_three() -> 
     assert based["entity/acme"].new_segments == ("Cloud",)
 
 
+def test_recover_taxonomy_output_rejects_casefold_duplicate_at_base_boundary() -> None:
+    base = AllowedFolderBase(id=BASE_ID, path="/Root", depth=1)
+    request = _request(
+        TaxonomyTopic(slug="entity/acme", title="Acme", page_type="entity"),
+        allowed_bases=(base,),
+    )
+    output = TaxonomyOutput(
+        decisions=(
+            TaxonomyDecision(
+                slug="entity/acme",
+                base_folder_id=BASE_ID,
+                new_segments=("root",),
+            ),
+        )
+    )
+
+    _invalid_output(request, output, "相邻")
+
+
 def test_recover_taxonomy_output_rejects_excess_depth_and_wiki_path() -> None:
     base = AllowedFolderBase(id=BASE_ID, path="/One/Two/Three", depth=3)
     deep_request = _request(
@@ -277,6 +324,8 @@ def test_recover_taxonomy_output_rebuilds_strict_snapshots() -> None:
 
     assert recovered == {"entity/acme": TaxonomyDecision(slug="entity/acme")}
     assert isinstance(recovered["entity/acme"], TaxonomyDecision)
+    assert recovered["entity/acme"] is not output.decisions[0]
+    assert recovered["entity/acme"] == output.decisions[0]
     with pytest.raises(ValidationError, match="frozen"):
         recovered["entity/acme"].slug = "entity/other"  # type: ignore[misc]
 
@@ -338,3 +387,19 @@ def test_recover_taxonomy_output_normalizes_polluted_constructs_without_warnings
 
     assert exc_info.value.code == "TAXONOMY_OUTPUT_INVALID"
     assert caught == []
+
+
+def test_recover_taxonomy_output_does_not_hide_programming_value_errors() -> None:
+    class BrokenTaxonomyOutput(TaxonomyOutput):
+        def model_dump(self, *args: object, **kwargs: object) -> dict[str, object]:
+            raise ValueError("programming error")
+
+    request = _request(
+        TaxonomyTopic(slug="entity/acme", title="Acme", page_type="entity")
+    )
+    output = BrokenTaxonomyOutput(
+        decisions=(TaxonomyDecision(slug="entity/acme"),)
+    )
+
+    with pytest.raises(ValueError, match="programming error"):
+        recover_taxonomy_output(request, output)

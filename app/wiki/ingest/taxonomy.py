@@ -48,6 +48,9 @@ def build_taxonomy_work_items(
                 delta.current.knowledge_id if delta.current is not None else "",
                 delta.current.op_version if delta.current is not None else "",
                 str(delta.pending_op_id),
+                delta.current.page_type if delta.current is not None else "",
+                delta.current.title if delta.current is not None else "",
+                delta.current.summary.strip() if delta.current is not None else "",
             ),
         )
         first_current = records[0].current
@@ -82,24 +85,18 @@ def recover_taxonomy_output(
     request: TaxonomyRequest, output: TaxonomyOutput
 ) -> dict[str, TaxonomyDecision]:
     """验证模型 taxonomy 输出，并返回与调用者隔离的严格快照。"""
+    if not isinstance(request, TaxonomyRequest) or not isinstance(
+        output, TaxonomyOutput
+    ):
+        _invalid("taxonomy 请求或输出结构无效")
     try:
-        if not isinstance(request, TaxonomyRequest) or not isinstance(
-            output, TaxonomyOutput
-        ):
-            raise TypeError("taxonomy 请求与输出类型不正确")
         request_snapshot = TaxonomyRequest.model_validate(
             request.model_dump(mode="python", warnings="error")
         )
         output_snapshot = TaxonomyOutput.model_validate(
             output.model_dump(mode="python", warnings="error")
         )
-    except (
-        AttributeError,
-        ValidationError,
-        PydanticSerializationError,
-        TypeError,
-        ValueError,
-    ) as exc:
+    except (ValidationError, PydanticSerializationError) as exc:
         raise WikiValidationError(
             "TAXONOMY_OUTPUT_INVALID", "taxonomy 请求或输出结构无效"
         ) from exc
@@ -118,6 +115,13 @@ def recover_taxonomy_output(
     recovered: dict[str, TaxonomyDecision] = {}
     for decision in decisions:
         base = _resolve_allowed_base(decision, allowed_bases)
+        if (
+            base is not None
+            and decision.new_segments
+            and base.path.rsplit("/", maxsplit=1)[-1].casefold()
+            == decision.new_segments[0].casefold()
+        ):
+            _invalid("taxonomy 相邻目录段不能仅大小写不同")
         base_depth = base.depth if base is not None else 0
         if base_depth + len(decision.new_segments) > 3:
             _invalid("taxonomy 目录总深度不能超过 3")
