@@ -163,12 +163,140 @@ def test_validate_batch_request_rejects_two_current_active_source_versions() -> 
         ingest_store._validate_batch_request(request)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["failure", "superseded"])
+async def test_noncompleted_page_contributor_is_rejected_before_session(
+    terminal: str,
+) -> None:
+    op_id = uuid4()
+    page = _result_page().model_copy(update={"contributor_op_ids": [op_id]})
+    request = _batch_request(
+        pages=(page,),
+        completed_op_ids=(),
+        superseded_op_ids=(op_id,) if terminal == "superseded" else (),
+        failures=(
+            OperationFailure(
+                pending_op_id=op_id,
+                error_code="MODEL_FAILURE",
+                error_summary="失败",
+            ),
+        )
+        if terminal == "failure"
+        else (),
+        expected_pages=(PageExpectation(slug=page.slug),),
+    )
+
+    class CountingFactory:
+        calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            raise AssertionError("非法页面结果不应打开 session")
+
+    factory = CountingFactory()
+    store = SqlAlchemyIngestStore(factory, SqlFinalizationPort())  # type: ignore[arg-type]
+    error: BaseException | None = None
+    try:
+        await store.apply_results(SCOPE, request)
+    except BaseException as exc:
+        error = exc
+
+    assert isinstance(error, InvariantError)
+    assert factory.calls == 0
+
+
+def test_completed_current_delta_requires_a_matching_page() -> None:
+    op_id = uuid4()
+    current = _stored_contribution()
+    request = _batch_request(
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=op_id,
+                action="add",
+                slug=current.slug,
+                knowledge_id=current.knowledge_id,
+                previous=None,
+                current=current,
+            ),
+        ),
+        completed_op_ids=(op_id,),
+    )
+
+    with pytest.raises(InvariantError, match="page"):
+        ingest_store._validate_batch_request(request)
+
+
+def test_page_contributor_requires_a_same_slug_delta() -> None:
+    op_id = uuid4()
+    page = _result_page().model_copy(update={"contributor_op_ids": [op_id]})
+    request = _batch_request(
+        pages=(page,),
+        completed_op_ids=(op_id,),
+        expected_pages=(PageExpectation(slug=page.slug),),
+    )
+
+    with pytest.raises(InvariantError, match="delta"):
+        ingest_store._validate_batch_request(request)
+
+
+def test_modern_page_rejects_empty_contributor_ids() -> None:
+    page = _result_page()
+    request = _batch_request(
+        pages=(page,),
+        expected_pages=(PageExpectation(slug=page.slug),),
+    )
+
+    with pytest.raises(InvariantError, match="contributor"):
+        ingest_store._validate_batch_request(request)
+
+
+@pytest.mark.parametrize("terminal", ["failure", "superseded"])
+def test_noncompleted_operation_cannot_own_a_contribution_delta(terminal: str) -> None:
+    op_id = uuid4()
+    current = _stored_contribution()
+    request = _batch_request(
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=op_id,
+                action="add",
+                slug=current.slug,
+                knowledge_id=current.knowledge_id,
+                previous=None,
+                current=current,
+            ),
+        ),
+        completed_op_ids=(),
+        superseded_op_ids=(op_id,) if terminal == "superseded" else (),
+        failures=(
+            OperationFailure(
+                pending_op_id=op_id,
+                error_code="MODEL_FAILURE",
+                error_summary="失败",
+            ),
+        )
+        if terminal == "failure"
+        else (),
+    )
+
+    with pytest.raises(InvariantError, match="completed"):
+        ingest_store._validate_batch_request(request)
+
+
+def test_completed_noop_without_delta_or_page_remains_valid() -> None:
+    request = _batch_request(pages=(), contribution_deltas=(), expected_pages=())
+
+    assert ingest_store._validate_batch_request(request) == request
+
+
 @pytest.mark.parametrize(
     "marker",
     [
         "ClAiM ToKeN",
         "CLAIM_TOKEN",
         "claim-token",
+        "claimToken",
+        "CLAIM.TOKEN",
+        "ClAiMtOkEn",
         "TrAcEbAcK",
         "ChUnK TeXt",
         "chunk_text",
@@ -186,6 +314,12 @@ def test_validate_batch_request_rejects_two_current_active_source_versions() -> 
 )
 def test_safe_error_summary_truncates_separator_and_case_variants(marker: str) -> None:
     assert ingest_store._safe_error_summary(f"安全摘要 {marker} secret") == "安全摘要"
+
+
+def test_safe_error_summary_does_not_truncate_claimant() -> None:
+    summary = "claimant completed successfully"
+
+    assert ingest_store._safe_error_summary(summary) == summary
 
 
 @pytest.mark.asyncio
@@ -947,6 +1081,24 @@ async def test_legacy_valid_empty_batch_is_noop_without_claim_or_operation() -> 
     )
 
 
+def test_legacy_page_coverage_remains_compatible_without_deltas() -> None:
+    op_id = uuid4()
+    page = _result_page().model_copy(update={"contributor_op_ids": [op_id]})
+
+    request = ingest_store._legacy_batch_request(
+        uuid4(),
+        [page],
+        [op_id],
+        uuid4(),
+        [],
+        {page.slug: None},
+    )
+
+    assert [item.slug for item in request.pages] == [page.slug]
+    assert request.pages[0].contributor_op_ids == (op_id,)
+    assert request.contribution_deltas == ()
+
+
 @pytest.mark.asyncio
 async def test_sql_store_rejects_forged_scope_before_opening_session() -> None:
     class ExplodingFactory:
@@ -1514,9 +1666,9 @@ async def test_release_claim_only_clears_the_owned_scoped_claim() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("include_contributor_ids", [True, False])
+@pytest.mark.parametrize("include_superseded_contributor", [True, False])
 async def test_auto_superseded_shared_slug_rolls_back_before_any_writes(
-    include_contributor_ids: bool,
+    include_superseded_contributor: bool,
 ) -> None:
     token = uuid4()
     superseded = _pending(claimed=True)
@@ -1541,7 +1693,7 @@ async def test_auto_superseded_shared_slug_rolls_back_before_any_writes(
         summary="混合摘要",
         source_refs=[superseded.knowledge_id, other.knowledge_id],
         contributor_op_ids=(
-            [superseded.id, other.id] if include_contributor_ids else []
+            [superseded.id, other.id] if include_superseded_contributor else [other.id]
         ),
     )
     request = _batch_request(
@@ -1605,7 +1757,7 @@ async def test_later_retract_supersedes_ingest_without_writing_its_slug() -> Non
     )
     retract.enqueued_at = NOW + timedelta(seconds=1)
     current = _stored_contribution(version=ingest.op_version)
-    page = _result_page()
+    page = _result_page().model_copy(update={"contributor_op_ids": [ingest.id]})
     request = _batch_request(
         claim_token=token,
         pages=(page,),
@@ -1751,10 +1903,21 @@ async def test_modern_cas_conflict_rolls_back_before_contribution_writes() -> No
     pending = _pending(claimed=True)
     pending.claim_token = token
     page = _page(sources=[pending.knowledge_id])
-    reduced = _result_page()
+    current = _stored_contribution(version=pending.op_version)
+    reduced = _result_page().model_copy(update={"contributor_op_ids": [pending.id]})
     request = _batch_request(
         claim_token=token,
         pages=(reduced,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="add",
+                slug=page.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=None,
+                current=current,
+            ),
+        ),
         completed_op_ids=(pending.id,),
         expected_pages=(
             PageExpectation(slug=page.slug, page_id=page.id, version=page.version - 1),
@@ -1792,7 +1955,7 @@ async def test_modern_contribution_conflict_rolls_back_before_page_writes() -> N
     old = _contribution(knowledge_id=pending.knowledge_id)
     previous = _stored_contribution().model_copy(update={"id": old.id})
     current = _stored_contribution(version=pending.op_version)
-    reduced = _result_page()
+    reduced = _result_page().model_copy(update={"contributor_op_ids": [pending.id]})
     request = _batch_request(
         claim_token=token,
         pages=(reduced,),
@@ -1852,6 +2015,16 @@ async def test_modern_finalization_failure_rolls_back_and_stops_pending_delete()
     request = _batch_request(
         claim_token=token,
         pages=(reduced,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="add",
+                slug=page.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=None,
+                current=_stored_contribution(version=pending.op_version),
+            ),
+        ),
         completed_op_ids=(pending.id,),
         expected_pages=(
             PageExpectation(slug=page.slug, page_id=page.id, version=page.version),

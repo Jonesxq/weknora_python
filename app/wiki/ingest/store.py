@@ -532,7 +532,7 @@ def _safe_dead_letter_payload(
 
 
 _SENSITIVE_ERROR_PATTERN = re.compile(
-    r"traceback|claim[ _-]+token|chunk[ _-]+text|raw[ _-]+chunk|"
+    r"traceback|claim(?:[\s_.-]*token)|chunk[ _-]+text|raw[ _-]+chunk|"
     r"model[ _-]+output|raw[ _-]+output|chunk原文|模型原始输出",
     re.IGNORECASE,
 )
@@ -605,7 +605,9 @@ def _dead_letter_record(row: WikiDeadLetter) -> DeadLetterRecord:
     )
 
 
-def _validate_batch_request(request: BatchApplyRequest) -> BatchApplyRequest:
+def _validate_batch_request(
+    request: BatchApplyRequest, *, _legacy_coverage: bool = False
+) -> BatchApplyRequest:
     if not isinstance(request, BatchApplyRequest):
         raise InvariantError("结果批次必须是 BatchApplyRequest")
     try:
@@ -617,20 +619,39 @@ def _validate_batch_request(request: BatchApplyRequest) -> BatchApplyRequest:
     if page_slugs != expected_slugs:
         raise InvariantError("expected_pages 必须完整覆盖 pages slug")
 
+    completed_ids = set(snapshot.completed_op_ids)
     claimed_ids = {
         *snapshot.completed_op_ids,
         *snapshot.superseded_op_ids,
         *(failure.pending_op_id for failure in snapshot.failures),
     }
+    delta_pairs = {
+        (delta.slug, delta.pending_op_id) for delta in snapshot.contribution_deltas
+    }
+    delta_slugs = {delta.slug for delta in snapshot.contribution_deltas}
     active_sources: set[tuple[str, str]] = set()
     for delta in snapshot.contribution_deltas:
         if delta.pending_op_id not in claimed_ids:
             raise InvariantError("贡献 delta pending_op 不属于本批次 claim 集合")
+        if delta.pending_op_id not in completed_ids:
+            raise InvariantError("贡献 delta 必须属于 completed operation")
         if delta.current is not None:
             active_key = (delta.slug, delta.knowledge_id)
             if active_key in active_sources:
                 raise InvariantError("同一 slug 和 source 不能产生两个 current active")
             active_sources.add(active_key)
+    for page in snapshot.pages:
+        if not page.contributor_op_ids:
+            raise InvariantError("每个结果页面必须至少包含一个 contributor")
+        for contributor_id in page.contributor_op_ids:
+            if contributor_id not in completed_ids:
+                raise InvariantError("页面 contributor 必须属于 completed operation")
+            if not _legacy_coverage and (page.slug, contributor_id) not in delta_pairs:
+                raise InvariantError(
+                    "页面 contributor 必须有同 slug contribution delta"
+                )
+    if not _legacy_coverage and delta_slugs - page_slugs:
+        raise InvariantError("completed contribution delta 必须有对应 page")
     return snapshot
 
 
@@ -726,7 +747,8 @@ def _legacy_batch_request(
                 for slug, record in expected.items()
             ),
             operation_id=checked_operation_id,
-        )
+        ),
+        _legacy_coverage=True,
     )
 
 
@@ -1694,6 +1716,7 @@ class SqlAlchemyIngestStore:
                     for op_id in request.completed_op_ids
                     if op_id not in superseded_ids
                 ]
+                completed_id_set = set(completed_ids)
                 terminal_ids = [*completed_ids, *superseded_ids]
 
                 auto_superseded_slugs = {
@@ -1711,7 +1734,7 @@ class SqlAlchemyIngestStore:
                     if (
                         page.slug in auto_superseded_slugs & effective_completed_slugs
                         or contributor_ids & auto_superseded
-                        and contributor_ids & set(completed_ids)
+                        and contributor_ids & completed_id_set
                     ):
                         raise PageConflict(
                             "auto-superseded 来源与有效 completed 来源共享页面 slug"
@@ -1726,7 +1749,7 @@ class SqlAlchemyIngestStore:
                     page
                     for page in request.pages
                     if page.slug not in superseded_slugs
-                    and not (set(page.contributor_op_ids) & superseded_ids)
+                    and set(page.contributor_op_ids).issubset(completed_id_set)
                 ]
                 expected_by_slug = {
                     expectation.slug: expectation
