@@ -1229,3 +1229,117 @@ async def test_parent_cancellation_during_claim_lost_release_takes_precedence() 
         await asyncio.wait_for(task, timeout=1)
     assert store.release_finished
     assert store.release_calls == [(SCOPE, [OP_A], CLAIM_TOKEN)]
+
+
+@pytest.mark.asyncio
+async def test_same_turn_conflict_release_and_parent_cancellation_prefers_cancel() -> None:
+    dataset = fake_dataset(("doc-a",))
+
+    class BarrierReleaseStore(WorkerStore):
+        def __init__(self) -> None:
+            super().__init__([pending_op(OP_A, "doc-a")], conflict=True)
+            self.release_started = asyncio.Event()
+            self.release_allowed = asyncio.Event()
+            self.release_finished = False
+
+        async def release_claim(
+            self, scope: WikiScope, ids: list[UUID], claim_token: UUID
+        ) -> None:
+            self.release_started.set()
+            try:
+                await self.release_allowed.wait()
+                await super().release_claim(scope, ids, claim_token)
+            finally:
+                self.release_finished = True
+
+    store = BarrierReleaseStore()
+    task = asyncio.create_task(
+        worker(store, FakeKnowledgeSource(dataset), FakeChatModel(dataset)).run_batch(
+            SCOPE
+        )
+    )
+    await asyncio.wait_for(store.release_started.wait(), timeout=1)
+
+    store.release_allowed.set()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+    assert store.release_finished
+    assert store.release_calls == [(SCOPE, [OP_A], CLAIM_TOKEN)]
+
+
+@pytest.mark.asyncio
+async def test_same_turn_claim_lost_release_and_parent_cancellation_prefers_cancel() -> None:
+    dataset = fake_dataset(("doc-a",))
+
+    class BarrierReleaseStore(WorkerStore):
+        def __init__(self) -> None:
+            super().__init__([pending_op(OP_A, "doc-a")], claim_lost=True)
+            self.release_started = asyncio.Event()
+            self.release_allowed = asyncio.Event()
+            self.release_finished = False
+
+        async def release_claim(
+            self, scope: WikiScope, ids: list[UUID], claim_token: UUID
+        ) -> None:
+            self.release_started.set()
+            try:
+                await self.release_allowed.wait()
+                await super().release_claim(scope, ids, claim_token)
+            finally:
+                self.release_finished = True
+
+    store = BarrierReleaseStore()
+    task = asyncio.create_task(
+        worker(store, FakeKnowledgeSource(dataset), FakeChatModel(dataset)).run_batch(
+            SCOPE
+        )
+    )
+    await asyncio.wait_for(store.release_started.wait(), timeout=1)
+
+    store.release_allowed.set()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+    assert store.release_finished
+    assert store.release_calls == [(SCOPE, [OP_A], CLAIM_TOKEN)]
+
+
+@pytest.mark.asyncio
+async def test_same_turn_cancellation_retrieves_release_failure_as_cause() -> None:
+    dataset = fake_dataset(("doc-a",))
+
+    class ReleaseFailure(RuntimeError):
+        pass
+
+    class FailingReleaseStore(WorkerStore):
+        def __init__(self) -> None:
+            super().__init__([pending_op(OP_A, "doc-a")], conflict=True)
+            self.release_started = asyncio.Event()
+            self.release_allowed = asyncio.Event()
+
+        async def release_claim(
+            self, scope: WikiScope, ids: list[UUID], claim_token: UUID
+        ) -> None:
+            self.release_started.set()
+            await self.release_allowed.wait()
+            await super().release_claim(scope, ids, claim_token)
+            raise ReleaseFailure("release failed")
+
+    store = FailingReleaseStore()
+    task = asyncio.create_task(
+        worker(store, FakeKnowledgeSource(dataset), FakeChatModel(dataset)).run_batch(
+            SCOPE
+        )
+    )
+    await asyncio.wait_for(store.release_started.wait(), timeout=1)
+
+    store.release_allowed.set()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as error:
+        await asyncio.wait_for(task, timeout=1)
+    assert isinstance(error.value.__cause__, ReleaseFailure)
+    assert store.release_calls == [(SCOPE, [OP_A], CLAIM_TOKEN)]

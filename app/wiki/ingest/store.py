@@ -633,12 +633,11 @@ def _validate_batch_request(
         *snapshot.superseded_op_ids,
         *(failure.pending_op_id for failure in snapshot.failures),
     }
-    delta_pairs = {
-        (delta.slug, delta.pending_op_id) for delta in snapshot.contribution_deltas
-    }
+    delta_contributors: dict[str, set[UUID]] = {}
     delta_slugs = {delta.slug for delta in snapshot.contribution_deltas}
     active_sources: set[tuple[str, str]] = set()
     for delta in snapshot.contribution_deltas:
+        delta_contributors.setdefault(delta.slug, set()).add(delta.pending_op_id)
         if delta.pending_op_id not in claimed_ids:
             raise InvariantError("贡献 delta pending_op 不属于本批次 claim 集合")
         if delta.pending_op_id not in completed_ids:
@@ -654,10 +653,10 @@ def _validate_batch_request(
         for contributor_id in page.contributor_op_ids:
             if contributor_id not in completed_ids:
                 raise InvariantError("页面 contributor 必须属于 completed operation")
-            if not _legacy_coverage and (page.slug, contributor_id) not in delta_pairs:
-                raise InvariantError(
-                    "页面 contributor 必须有同 slug contribution delta"
-                )
+        if not _legacy_coverage and set(page.contributor_op_ids) != delta_contributors.get(
+            page.slug, set()
+        ):
+            raise InvariantError("页面 contributor 必须完整匹配同 slug contribution delta")
     if not _legacy_coverage and delta_slugs - page_slugs:
         raise InvariantError("completed contribution delta 必须有对应 page")
     return snapshot

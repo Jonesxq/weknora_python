@@ -268,6 +268,87 @@ def test_page_contributor_requires_a_same_slug_delta() -> None:
         ingest_store._validate_batch_request(request)
 
 
+@pytest.mark.asyncio
+async def test_same_slug_deltas_require_exact_page_contributor_coverage_before_session() -> (
+    None
+):
+    first_id, second_id = uuid4(), uuid4()
+    first = _stored_contribution(knowledge_id="knowledge-1")
+    second = _stored_contribution(knowledge_id="knowledge-2")
+    page = _result_page().model_copy(update={"contributor_op_ids": [first_id]})
+    request = _batch_request(
+        pages=(page,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=first_id,
+                action="add",
+                slug=page.slug,
+                knowledge_id=first.knowledge_id,
+                previous=None,
+                current=first,
+            ),
+            ContributionDelta(
+                pending_op_id=second_id,
+                action="add",
+                slug=page.slug,
+                knowledge_id=second.knowledge_id,
+                previous=None,
+                current=second,
+            ),
+        ),
+        completed_op_ids=(first_id, second_id),
+        expected_pages=(PageExpectation(slug=page.slug),),
+    )
+
+    class CountingFactory:
+        calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            raise AssertionError("非法批次不应打开数据库 session")
+
+    factory = CountingFactory()
+    store = SqlAlchemyIngestStore(factory, SqlFinalizationPort())  # type: ignore[arg-type]
+
+    with pytest.raises(InvariantError, match="contributor"):
+        await store.apply_results_with_outcome(SCOPE, request)
+    assert factory.calls == 0
+
+
+def test_same_slug_deltas_accept_exact_page_contributor_coverage() -> None:
+    first_id, second_id = uuid4(), uuid4()
+    first = _stored_contribution(knowledge_id="knowledge-1")
+    second = _stored_contribution(knowledge_id="knowledge-2")
+    page = _result_page().model_copy(
+        update={"contributor_op_ids": [first_id, second_id]}
+    )
+    request = _batch_request(
+        pages=(page,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=first_id,
+                action="add",
+                slug=page.slug,
+                knowledge_id=first.knowledge_id,
+                previous=None,
+                current=first,
+            ),
+            ContributionDelta(
+                pending_op_id=second_id,
+                action="add",
+                slug=page.slug,
+                knowledge_id=second.knowledge_id,
+                previous=None,
+                current=second,
+            ),
+        ),
+        completed_op_ids=(first_id, second_id),
+        expected_pages=(PageExpectation(slug=page.slug),),
+    )
+
+    assert ingest_store._validate_batch_request(request) == request
+
+
 def test_modern_page_rejects_empty_contributor_ids() -> None:
     page = _result_page()
     request = _batch_request(
@@ -1948,10 +2029,7 @@ async def test_release_claim_only_clears_the_owned_scoped_claim() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("include_superseded_contributor", [True, False])
-async def test_auto_superseded_shared_slug_rolls_back_before_any_writes(
-    include_superseded_contributor: bool,
-) -> None:
+async def test_auto_superseded_shared_slug_rolls_back_before_any_writes() -> None:
     token = uuid4()
     superseded = _pending(claimed=True)
     superseded.claim_token = token
@@ -1974,9 +2052,7 @@ async def test_auto_superseded_shared_slug_rolls_back_before_any_writes(
         content="同时包含两个来源的正文",
         summary="混合摘要",
         source_refs=[superseded.knowledge_id, other.knowledge_id],
-        contributor_op_ids=(
-            [superseded.id, other.id] if include_superseded_contributor else [other.id]
-        ),
+        contributor_op_ids=[superseded.id, other.id],
     )
     request = _batch_request(
         claim_token=token,

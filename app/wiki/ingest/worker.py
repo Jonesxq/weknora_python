@@ -479,16 +479,36 @@ class WikiIngestWorker:
             name="wiki-release-claim",
         )
         cancellation: asyncio.CancelledError | None = None
-        while not task.done():
+        while True:
             try:
                 await asyncio.shield(task)
             except asyncio.CancelledError as error:
-                if task.done():
-                    break
-                cancellation = error
-        await task
+                if cancellation is None:
+                    cancellation = error
+            except BaseException:
+                pass
+            if task.done():
+                break
+
+        cleanup_error: BaseException | None = None
+        try:
+            task.result()
+        except BaseException as error:
+            cleanup_error = error
+
+        current_task = asyncio.current_task()
+        if (
+            cancellation is None
+            and current_task is not None
+            and current_task.cancelling()
+        ):
+            cancellation = asyncio.CancelledError()
         if cancellation is not None:
+            if cleanup_error is not None and cleanup_error is not cancellation:
+                cancellation.__cause__ = cleanup_error
             raise cancellation
+        if cleanup_error is not None:
+            raise cleanup_error
 
     async def _release_claim_preserving(
         self,
