@@ -1,6 +1,6 @@
 """Taxonomy topic 聚合、目录候选筛选与模型输出恢复。"""
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import math
 from uuid import UUID
@@ -16,6 +16,7 @@ from app.wiki.ingest.schemas import (
     EmbeddingItem,
     EmbeddingOutput,
     EmbeddingRequest,
+    FolderAssignment,
     FolderCatalogEntry,
     TaxonomyDecision,
     TaxonomyContext,
@@ -255,6 +256,99 @@ def build_taxonomy_work_items(
             TaxonomyWorkItem(topic=topic, contributor_op_ids=contributor_op_ids)
         )
     return tuple(work_items)
+
+
+def build_taxonomy_requests(
+    work_items: Iterable[TaxonomyWorkItem],
+    allowed_bases: Iterable[AllowedFolderBase],
+    *,
+    batch_size: int,
+) -> tuple[TaxonomyRequest, ...]:
+    """按稳定 topic 顺序把 taxonomy 工作项切分成模型请求。"""
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise ValueError("batch_size 必须是 1 到 60 的整数")
+    if not 1 <= batch_size <= 60:
+        raise ValueError("batch_size 必须是 1 到 60 的整数")
+
+    ordered_items = tuple(sorted(tuple(work_items), key=lambda item: item.topic.slug))
+    slugs = [item.topic.slug for item in ordered_items]
+    if len(slugs) != len(set(slugs)):
+        raise ValueError("taxonomy work item slug 不能重复")
+    base_snapshots = tuple(_snapshot_allowed_base(base) for base in allowed_bases)
+
+    return tuple(
+        TaxonomyRequest(
+            topics=tuple(
+                TaxonomyTopic.model_validate(
+                    item.topic.model_dump(mode="python", warnings="error")
+                )
+                for item in ordered_items[start : start + batch_size]
+            ),
+            allowed_bases=tuple(
+                _snapshot_allowed_base(base) for base in base_snapshots
+            ),
+        )
+        for start in range(0, len(ordered_items), batch_size)
+    )
+
+
+def build_folder_assignment(
+    work_item: TaxonomyWorkItem,
+    decision: TaxonomyDecision,
+    allowed_by_id: Mapping[UUID, AllowedFolderBase],
+) -> FolderAssignment:
+    """把单个 taxonomy 决策组合为经过最终 DTO 验证的目录归属。"""
+    decision_snapshot = _snapshot_decision(decision)
+    if decision_snapshot.slug != work_item.topic.slug:
+        _invalid("taxonomy decision slug不一致")
+
+    base: AllowedFolderBase | None = None
+    if decision_snapshot.base_folder_id is not None:
+        candidate = allowed_by_id.get(decision_snapshot.base_folder_id)
+        if not isinstance(candidate, AllowedFolderBase):
+            _invalid("taxonomy base_folder_id 必须位于请求白名单")
+        try:
+            base = _snapshot_allowed_base(candidate)
+        except (ValidationError, PydanticSerializationError) as exc:
+            raise WikiValidationError(
+                "TAXONOMY_OUTPUT_INVALID",
+                "taxonomy base_folder_id 必须位于请求白名单",
+            ) from exc
+        if base.id != decision_snapshot.base_folder_id:
+            _invalid("taxonomy base_folder_id 必须位于请求白名单")
+
+    try:
+        return FolderAssignment(
+            slug=work_item.topic.slug,
+            contributor_op_ids=tuple(op_id for op_id in work_item.contributor_op_ids),
+            base_folder_id=None if base is None else base.id,
+            base_path=None if base is None else base.path,
+            base_depth=0 if base is None else base.depth,
+            new_segments=tuple(segment for segment in decision_snapshot.new_segments),
+        )
+    except (ValidationError, PydanticSerializationError) as exc:
+        raise WikiValidationError(
+            "TAXONOMY_OUTPUT_INVALID", f"taxonomy 目录归属结构无效: {exc}"
+        ) from exc
+
+
+def _snapshot_allowed_base(base: AllowedFolderBase) -> AllowedFolderBase:
+    return AllowedFolderBase.model_validate(
+        base.model_dump(mode="python", warnings="error")
+    )
+
+
+def _snapshot_decision(decision: TaxonomyDecision) -> TaxonomyDecision:
+    if not isinstance(decision, TaxonomyDecision):
+        _invalid("taxonomy 决策结构无效")
+    try:
+        return TaxonomyDecision.model_validate(
+            decision.model_dump(mode="python", warnings="error")
+        )
+    except (ValidationError, PydanticSerializationError) as exc:
+        raise WikiValidationError(
+            "TAXONOMY_OUTPUT_INVALID", "taxonomy 决策结构无效"
+        ) from exc
 
 
 def recover_taxonomy_output(

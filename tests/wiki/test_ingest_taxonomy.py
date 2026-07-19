@@ -13,6 +13,7 @@ from app.wiki.ingest.schemas import (
     ContributionDelta,
     EmbeddingOutput,
     EmbeddingRequest,
+    FolderAssignment,
     FolderCatalogEntry,
     StoredContributionRecord,
     TaxonomyDecision,
@@ -22,6 +23,8 @@ from app.wiki.ingest.schemas import (
 )
 from app.wiki.ingest.taxonomy import (
     TaxonomyWorkItem,
+    build_folder_assignment,
+    build_taxonomy_requests,
     build_taxonomy_work_items,
     cosine_similarity,
     recover_taxonomy_output,
@@ -104,6 +107,16 @@ def _topic(slug: str = "entity/acme", title: str = "Acme") -> TaxonomyTopic:
         title=title,
         page_type=slug.split("/", maxsplit=1)[0],
         summary="Summary",
+    )
+
+
+def _work_items(count: int) -> tuple[TaxonomyWorkItem, ...]:
+    return tuple(
+        TaxonomyWorkItem(
+            topic=_topic(f"concept/topic-{index:03d}", f"Topic {index:03d}"),
+            contributor_op_ids=(OP_A,),
+        )
+        for index in range(count)
     )
 
 
@@ -276,6 +289,156 @@ def test_build_taxonomy_work_items_stabilizes_fully_tied_identity_records() -> N
     assert forward == reversed_items
     assert forward[0].topic.title == "Alpha"
     assert forward[0].topic.summary == "Alpha summary\n\nZulu summary"
+
+
+def test_build_taxonomy_requests_sorts_and_batches_all_topics() -> None:
+    work_items = _work_items(61)
+    bases = [
+        AllowedFolderBase(id=ROOT_BETA_ID, path="/Beta", depth=1),
+        AllowedFolderBase(id=ROOT_ALPHA_ID, path="/Alpha", depth=1),
+    ]
+
+    requests = build_taxonomy_requests(reversed(work_items), bases, batch_size=60)
+    bases.clear()
+
+    assert isinstance(requests, tuple)
+    assert [len(request.topics) for request in requests] == [60, 1]
+    assert [
+        topic.slug for request in requests for topic in request.topics
+    ] == [item.topic.slug for item in work_items]
+    assert [request.allowed_bases for request in requests] == [
+        (
+            AllowedFolderBase(id=ROOT_BETA_ID, path="/Beta", depth=1),
+            AllowedFolderBase(id=ROOT_ALPHA_ID, path="/Alpha", depth=1),
+        ),
+        (
+            AllowedFolderBase(id=ROOT_BETA_ID, path="/Beta", depth=1),
+            AllowedFolderBase(id=ROOT_ALPHA_ID, path="/Alpha", depth=1),
+        ),
+    ]
+    assert requests[0].allowed_bases[0] is not requests[1].allowed_bases[0]
+    with pytest.raises(ValidationError, match="frozen"):
+        requests[0].topics = ()  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("batch_size", [1, 60])
+def test_build_taxonomy_requests_accepts_batch_size_boundaries(batch_size: int) -> None:
+    requests = build_taxonomy_requests(_work_items(1), (), batch_size=batch_size)
+
+    assert len(requests) == 1
+    assert requests[0].topics[0].slug == "concept/topic-000"
+
+
+@pytest.mark.parametrize("batch_size", [0, 61, True, False])
+def test_build_taxonomy_requests_rejects_invalid_batch_size(batch_size: int) -> None:
+    with pytest.raises(ValueError):
+        build_taxonomy_requests(_work_items(1), (), batch_size=batch_size)
+
+
+def test_build_taxonomy_requests_handles_empty_and_rejects_duplicate_slugs() -> None:
+    assert build_taxonomy_requests((), (), batch_size=60) == ()
+    duplicate = TaxonomyWorkItem(
+        topic=_topic("concept/topic-000", "Duplicate"), contributor_op_ids=(OP_B,)
+    )
+
+    with pytest.raises(ValueError, match="slug"):
+        build_taxonomy_requests((*_work_items(1), duplicate), (), batch_size=60)
+
+
+def test_build_folder_assignment_snapshots_root_decision_and_contributors() -> None:
+    work_item = TaxonomyWorkItem(
+        topic=_topic("concept/root", "Root"), contributor_op_ids=(OP_B, OP_A)
+    )
+    decision = TaxonomyDecision(slug="concept/root", new_segments=("General",))
+
+    assignment = build_folder_assignment(work_item, decision, {})
+
+    assert assignment == FolderAssignment(
+        slug="concept/root",
+        contributor_op_ids=(OP_B, OP_A),
+        base_folder_id=None,
+        base_path=None,
+        base_depth=0,
+        new_segments=("General",),
+    )
+    assert assignment.new_segments is not decision.new_segments
+
+
+def test_build_folder_assignment_snapshots_base_and_contributors() -> None:
+    work_item = TaxonomyWorkItem(
+        topic=_topic("concept/cloud", "Cloud"), contributor_op_ids=(OP_A, OP_B)
+    )
+    base = AllowedFolderBase(id=BASE_ID, path="/Root/Products", depth=2)
+    decision = TaxonomyDecision(
+        slug="concept/cloud", base_folder_id=BASE_ID, new_segments=("Cloud",)
+    )
+
+    assignment = build_folder_assignment(work_item, decision, {BASE_ID: base})
+
+    assert assignment.base_folder_id == BASE_ID
+    assert assignment.base_path == "/Root/Products"
+    assert assignment.base_depth == 2
+    assert assignment.contributor_op_ids == (OP_A, OP_B)
+    assert assignment.new_segments == ("Cloud",)
+    assert assignment is not decision
+    assert assignment.new_segments is not decision.new_segments
+
+
+@pytest.mark.parametrize(
+    ("decision", "allowed_by_id", "message"),
+    [
+        (TaxonomyDecision(slug="concept/other"), {}, "slug不一致"),
+        (
+            TaxonomyDecision(slug="concept/root", base_folder_id=BASE_ID),
+            {},
+            "白名单",
+        ),
+        (
+            TaxonomyDecision(slug="concept/root", base_folder_id=BASE_ID),
+            {
+                BASE_ID: AllowedFolderBase(
+                    id=ROOT_ALPHA_ID, path="/Alpha", depth=1
+                )
+            },
+            "白名单",
+        ),
+    ],
+)
+def test_build_folder_assignment_rejects_mismatched_or_untrusted_decisions(
+    decision: TaxonomyDecision,
+    allowed_by_id: dict[UUID, AllowedFolderBase],
+    message: str,
+) -> None:
+    work_item = TaxonomyWorkItem(
+        topic=_topic("concept/root", "Root"), contributor_op_ids=(OP_A,)
+    )
+
+    with pytest.raises(WikiValidationError, match=message) as exc_info:
+        build_folder_assignment(work_item, decision, allowed_by_id)
+
+    assert exc_info.value.code == "TAXONOMY_OUTPUT_INVALID"
+
+
+def test_build_folder_assignment_normalizes_final_dto_invariants() -> None:
+    deep_work_item = TaxonomyWorkItem(
+        topic=_topic("concept/root", "Root"), contributor_op_ids=(OP_A,)
+    )
+    base = AllowedFolderBase(id=BASE_ID, path="/One/Two/Three", depth=3)
+    deep_decision = TaxonomyDecision(
+        slug="concept/root", base_folder_id=BASE_ID, new_segments=("Four",)
+    )
+
+    with pytest.raises(WikiValidationError, match="目录总深度") as exc_info:
+        build_folder_assignment(deep_work_item, deep_decision, {BASE_ID: base})
+    assert exc_info.value.code == "TAXONOMY_OUTPUT_INVALID"
+
+    empty_contributor_work_item = TaxonomyWorkItem(
+        topic=_topic("concept/root", "Root"), contributor_op_ids=()
+    )
+    root_decision = TaxonomyDecision(slug="concept/root")
+    with pytest.raises(WikiValidationError, match="contributor") as exc_info:
+        build_folder_assignment(empty_contributor_work_item, root_decision, {})
+    assert exc_info.value.code == "TAXONOMY_OUTPUT_INVALID"
 
 
 def test_recover_taxonomy_output_requires_complete_exact_coverage() -> None:
