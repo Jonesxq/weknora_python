@@ -25,4 +25,6 @@ uv run uvicorn app.main:app --reload --env-file .env
 uv run pytest -q
 ```
 
-Wiki 的 REST API、签名访问头和阶段一范围见 [Wiki 阶段一说明](docs/Wiki阶段一.md)；fake 摄取、Worker、Outbox 和失败恢复见 [Wiki 阶段二说明](docs/Wiki阶段二.md)。
+Wiki 的 REST API、签名访问头和阶段一范围见 [Wiki 阶段一说明](docs/Wiki阶段一.md)；fake 摄取、Worker、Outbox 和失败恢复见 [Wiki 阶段二说明](docs/Wiki阶段二.md)；增量贡献、citation、重解析、撤回和 dead-letter 的当前运行方式见 [Wiki 阶段三说明](docs/Wiki阶段三.md)。
+
+Wiki 阶段三继续使用可校验的 fake 上游，在阶段二链路上增加 citation、canonical 去重、贡献差量、Redis-first 撤回与第 5 次普通失败 dead-letter；现有 REST 字段保持不变。
