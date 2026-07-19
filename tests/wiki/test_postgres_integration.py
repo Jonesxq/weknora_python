@@ -1911,6 +1911,117 @@ async def test_retract_worker_minimally_cleans_unique_and_shared_source_pages(
 
 
 @pytest.mark.asyncio
+async def test_multiple_retract_versions_for_one_source_complete_in_one_batch(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(tenant_id=38, knowledge_base_id=uuid4(), actor_id="task13")
+    store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    async with postgres_factory() as session, session.begin():
+        page = WikiPage(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            slug="entity/retract-versions",
+            title="Retract versions",
+            page_type="entity",
+            status="published",
+            content="Original body",
+            summary="Original summary",
+            source_refs=["source-a"],
+            chunk_refs=["chunk:a"],
+            wiki_path="/entity/retract-versions",
+        )
+        contribution = WikiPageContribution(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            slug=page.slug,
+            knowledge_id="source-a",
+            op_version="v1",
+            page_type="entity",
+            state="active",
+            title="Contribution source-a",
+            content="Body source-a",
+            summary="Summary source-a",
+            aliases=[],
+            chunk_refs=["chunk:a"],
+        )
+        session.add_all([page, contribution])
+
+    first = await store.enqueue_retract(
+        scope,
+        "source-a",
+        "delete-v1",
+        {"knowledge_id": "source-a"},
+        delay_seconds=0,
+    )
+    second = await store.enqueue_retract(
+        scope,
+        "source-a",
+        "delete-v2",
+        {"knowledge_id": "source-a"},
+        delay_seconds=0,
+    )
+    assert first.id is not None and second.id is not None
+
+    class NoReadSource:
+        def __getattr__(self, name: str):
+            raise AssertionError(f"retract worker 不应读取 source: {name}")
+
+    class NoMergeModel:
+        async def merge_page(self, _request):
+            raise AssertionError("纯 retract 不应调用模型")
+
+    worker = WikiIngestWorker(
+        store=store,
+        locks=MemoryWikiLockManager(),
+        source=NoReadSource(),  # type: ignore[arg-type]
+        model=NoMergeModel(),  # type: ignore[arg-type]
+        options=WikiWorkerOptions(),
+    )
+
+    result = await worker.run_batch(scope)
+
+    assert set(result.completed_op_ids) == {first.id, second.id}
+    assert result.failed_op_ids == result.superseded_op_ids == ()
+    async with postgres_factory() as session:
+        assert (
+            await session.scalar(
+                select(func.count(WikiPageContribution.id)).where(
+                    WikiPageContribution.tenant_id == scope.tenant_id,
+                    WikiPageContribution.knowledge_base_id == scope.knowledge_base_id,
+                )
+            )
+            == 0
+        )
+        assert (
+            await session.scalar(
+                select(func.count(WikiPendingOp.id)).where(
+                    WikiPendingOp.tenant_id == scope.tenant_id,
+                    WikiPendingOp.knowledge_base_id == scope.knowledge_base_id,
+                )
+            )
+            == 0
+        )
+        markers = list(
+            (
+                await session.execute(
+                    select(WikiFinalizationMarker)
+                    .where(
+                        WikiFinalizationMarker.tenant_id == scope.tenant_id,
+                        WikiFinalizationMarker.knowledge_base_id
+                        == scope.knowledge_base_id,
+                        WikiFinalizationMarker.knowledge_id == "source-a",
+                    )
+                    .order_by(WikiFinalizationMarker.attempt)
+                )
+            ).scalars()
+        )
+        assert [(marker.attempt, marker.released_at is not None) for marker in markers] == [
+            ("delete-v1", True),
+            ("delete-v2", True),
+        ]
+
+
+@pytest.mark.asyncio
 async def test_retract_worker_dead_letters_after_five_real_failed_batches(
     postgres_factory: async_sessionmaker[AsyncSession],
 ) -> None:

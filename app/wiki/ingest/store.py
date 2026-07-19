@@ -1994,27 +1994,47 @@ class SqlAlchemyIngestStore:
                     for delta in request.contribution_deltas
                     if delta.pending_op_id in completed_ids
                 ]
-                deleted_contributions = False
+                previous_deletions: dict[
+                    tuple[int, UUID, str, str, str],
+                    tuple[StoredContributionRecord, str],
+                ] = {}
                 for delta in active_deltas:
-                    if delta.previous is not None:
-                        previous = delta.previous
-                        statement = delete(WikiPageContribution).where(
-                            WikiPageContribution.tenant_id == scope.tenant_id,
-                            WikiPageContribution.knowledge_base_id
-                            == scope.knowledge_base_id,
-                            WikiPageContribution.slug == previous.slug,
-                            WikiPageContribution.knowledge_id == previous.knowledge_id,
-                            WikiPageContribution.op_version == previous.op_version,
-                            WikiPageContribution.state == previous.state,
+                    previous = delta.previous
+                    if previous is None:
+                        continue
+                    identity = (
+                        previous.tenant_id,
+                        previous.knowledge_base_id,
+                        previous.slug,
+                        previous.knowledge_id,
+                        previous.op_version,
+                    )
+                    existing = previous_deletions.get(identity)
+                    if existing is not None and existing != (previous, delta.action):
+                        raise InvariantError(
+                            "同一 previous contribution 存在冲突的删除差量"
                         )
-                        if previous.id is not None:
-                            statement = statement.where(
-                                WikiPageContribution.id == previous.id
-                            )
-                        result = await session.execute(statement)
-                        if result.rowcount != 1:
-                            raise InvariantError("previous contribution 已变化或不存在")
-                        deleted_contributions = True
+                    previous_deletions.setdefault(identity, (previous, delta.action))
+
+                deleted_contributions = False
+                for previous, _action in previous_deletions.values():
+                    statement = delete(WikiPageContribution).where(
+                        WikiPageContribution.tenant_id == scope.tenant_id,
+                        WikiPageContribution.knowledge_base_id
+                        == scope.knowledge_base_id,
+                        WikiPageContribution.slug == previous.slug,
+                        WikiPageContribution.knowledge_id == previous.knowledge_id,
+                        WikiPageContribution.op_version == previous.op_version,
+                        WikiPageContribution.state == previous.state,
+                    )
+                    if previous.id is not None:
+                        statement = statement.where(
+                            WikiPageContribution.id == previous.id
+                        )
+                    result = await session.execute(statement)
+                    if result.rowcount != 1:
+                        raise InvariantError("previous contribution 已变化或不存在")
+                    deleted_contributions = True
                 if deleted_contributions:
                     await session.flush()
 
