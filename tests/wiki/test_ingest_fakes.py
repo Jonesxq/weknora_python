@@ -294,22 +294,74 @@ def test_fixture_rejects_invalid_embedding_taxonomy_contracts(
         FakeDataset.model_validate(payload)
 
 
-def test_load_fake_runtime_adapters_preserves_legacy_shape_and_isolates_state(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "embeddings",
+    [
+        {"": (1.0, 0.0)},
+        {"x" * 513: (1.0, 0.0)},
+        {"topic:entity/acme": (float("inf"), 0.0)},
+        {"topic:entity/acme": (float("-inf"), 0.0)},
+    ],
+)
+def test_fixture_rejects_embedding_identity_and_finite_value_boundaries(
+    embeddings: dict[str, tuple[float, ...]],
+) -> None:
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["embeddings"] = embeddings
+
+    with pytest.raises(ValidationError, match="embedding"):
+        FakeDataset.model_validate(payload)
+
+
+@pytest.mark.parametrize("batch_key", ["", ",entity/acme", "entity/acme,"])
+def test_fixture_rejects_empty_taxonomy_batch_key_segments(batch_key: str) -> None:
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["taxonomies"] = {batch_key: {"decisions": []}}
+
+    with pytest.raises(ValidationError, match=r"taxonomies.*batch key"):
+        FakeDataset.model_validate(payload)
+
+
+@pytest.mark.asyncio
+async def test_load_fake_runtime_adapters_preserves_legacy_shape_and_isolates_state(
+    tmp_path: Path,
+) -> None:
     payload = deepcopy(FIXTURE)
     payload["model_responses"]["embeddings"] = {"topic:entity/acme": (1.0, 0.0)}
+    payload["transient_failures"] = {"embedding:topic:entity/acme": 1}
     fixture = tmp_path / "wiki.json"
     write_fixture(fixture, payload)
 
     source, chat = load_fake_adapters(fixture)
-    runtime_source, runtime_chat, embedding = load_fake_runtime_adapters(fixture)
+    first_source, first_chat, first_embedding = load_fake_runtime_adapters(fixture)
+    second_source, second_chat, second_embedding = load_fake_runtime_adapters(fixture)
+    request = EmbeddingRequest(items=(EmbeddingItem(key="topic:entity/acme", text="Acme"),))
+
+    with pytest.raises(TransientModelError):
+        await first_embedding.embed(request)
+    with pytest.raises(TransientModelError):
+        await second_embedding.embed(request)
+    first_output = await first_embedding.embed(request)
+    second_output = await second_embedding.embed(request)
 
     assert isinstance(source, FakeKnowledgeSource)
     assert isinstance(chat, FakeChatModel)
-    assert isinstance(runtime_source, FakeKnowledgeSource)
-    assert isinstance(runtime_chat, FakeChatModel)
-    assert isinstance(embedding, FakeEmbeddingModel)
-    assert runtime_chat.calls == []
-    assert embedding.calls == []
+    assert isinstance(first_source, FakeKnowledgeSource)
+    assert isinstance(first_chat, FakeChatModel)
+    assert isinstance(first_embedding, FakeEmbeddingModel)
+    assert isinstance(second_source, FakeKnowledgeSource)
+    assert isinstance(second_chat, FakeChatModel)
+    assert isinstance(second_embedding, FakeEmbeddingModel)
+    assert first_output.vectors == second_output.vectors == {"topic:entity/acme": (1.0, 0.0)}
+    assert first_chat.calls == second_chat.calls == []
+    assert first_embedding.calls == second_embedding.calls == [
+        "embedding:topic:entity/acme",
+        "embedding:topic:entity/acme",
+    ]
+    assert len(first_embedding.requests) == len(second_embedding.requests) == 2
+    assert first_embedding.calls is not second_embedding.calls
+    assert first_embedding.requests is not second_embedding.requests
+    assert first_embedding.requests[0] is not second_embedding.requests[0]
 
 
 def test_load_fake_adapters_validates_fixture_and_protocols(tmp_path: Path) -> None:
