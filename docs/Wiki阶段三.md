@@ -101,6 +101,12 @@ $env:GRAPH_TEST_REDIS_URL="redis://127.0.0.1:6379/15"
 # 运行 PostgreSQL、Redis 和 Worker 阶段三验收
 uv run pytest tests/wiki/test_postgres_integration.py tests/wiki/test_tombstones.py tests/wiki/test_ingest_worker.py -q
 
+# 清除真实 PostgreSQL 测试地址，避免后续全量测试继续连接真实服务
+Remove-Item Env:GRAPH_TEST_POSTGRES_URL -ErrorAction SilentlyContinue
+
+# 清除真实 Redis 测试地址，恢复未配置真实服务时的 skip 行为
+Remove-Item Env:GRAPH_TEST_REDIS_URL -ErrorAction SilentlyContinue
+
 # 运行不连接默认真实服务的完整测试集
 uv run pytest -q
 ```
