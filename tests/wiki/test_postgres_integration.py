@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from datetime import UTC, datetime, timedelta
+from random import Random
 from typing import Any
 from uuid import uuid4
 
@@ -34,6 +35,7 @@ from app.wiki.ingest.schemas import (
     TopicCandidate,
     WikiWorkerOptions,
 )
+from app.wiki.ingest.ports import PermanentModelError
 from app.wiki.ingest.store import (
     ClaimLost,
     InvariantError,
@@ -1302,6 +1304,43 @@ async def test_real_dedup_function_filters_scope_type_state_and_limits_top_twent
 
 
 @pytest.mark.asyncio
+async def test_real_dedup_cutoff_ties_return_stable_smallest_twenty_slugs(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(tenant_id=35, knowledge_base_id=uuid4(), actor_id="task13")
+    slugs = [f"entity/exact-tie-{index:02d}" for index in range(25)]
+    insertion_order = slugs.copy()
+    Random(1307).shuffle(insertion_order)
+    async with postgres_factory() as session, session.begin():
+        session.add_all(
+            [
+                WikiPage(
+                    tenant_id=scope.tenant_id,
+                    knowledge_base_id=scope.knowledge_base_id,
+                    slug=slug,
+                    title="Exact Tie",
+                    page_type="entity",
+                    status="published",
+                    aliases=["Exact Tie Alias"],
+                    wiki_path=f"/{slug}",
+                )
+                for slug in insertion_order
+            ]
+        )
+    candidate = TopicCandidate(
+        name="Exact Tie",
+        slug="entity/generated-exact-tie",
+        page_type="entity",
+    )
+    store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    expected = sorted(slugs)[:20]
+
+    for _ in range(5):
+        found = await store.find_dedup_candidates(scope, candidate, limit=20)
+        assert [item.slug for item in found] == expected
+
+
+@pytest.mark.asyncio
 async def test_real_dedup_explain_uses_partial_trigram_gist_index(
     postgres_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -1869,3 +1908,169 @@ async def test_retract_worker_minimally_cleans_unique_and_shared_source_pages(
             )
         ).scalar_one()
         assert marker.released_at is not None
+
+
+@pytest.mark.asyncio
+async def test_retract_worker_dead_letters_after_five_real_failed_batches(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(tenant_id=37, knowledge_base_id=uuid4(), actor_id="task13")
+    store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    async with postgres_factory() as session, session.begin():
+        page = WikiPage(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            slug="entity/retract-retry",
+            title="Shared before retract",
+            page_type="entity",
+            status="published",
+            content="Original shared body",
+            summary="Original shared summary",
+            source_refs=["source-a", "source-b"],
+            chunk_refs=["chunk:a", "chunk:b"],
+            wiki_path="/entity/retract-retry",
+        )
+        session.add(page)
+        session.add_all(
+            [
+                WikiPageContribution(
+                    tenant_id=scope.tenant_id,
+                    knowledge_base_id=scope.knowledge_base_id,
+                    slug=page.slug,
+                    knowledge_id=knowledge_id,
+                    op_version="v1",
+                    page_type="entity",
+                    state="active",
+                    title=f"Contribution {knowledge_id}",
+                    content=f"Body {knowledge_id}",
+                    summary=f"Summary {knowledge_id}",
+                    aliases=[],
+                    chunk_refs=[chunk_ref],
+                )
+                for knowledge_id, chunk_ref in (
+                    ("source-a", "chunk:a"),
+                    ("source-b", "chunk:b"),
+                )
+            ]
+        )
+        await session.flush()
+
+    enqueued = await store.enqueue_retract(
+        scope,
+        "source-a",
+        "delete-v1",
+        {"knowledge_id": "source-a"},
+        delay_seconds=0,
+    )
+    assert enqueued.id is not None
+
+    class NoReadSource:
+        def __getattr__(self, name: str):
+            raise AssertionError(f"retract worker 不应读取 source: {name}")
+
+    class PermanentlyFailingModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def merge_page(self, _request):
+            self.calls += 1
+            raise PermanentModelError("retract reduce failed")
+
+    model = PermanentlyFailingModel()
+    worker = WikiIngestWorker(
+        store=store,
+        locks=MemoryWikiLockManager(),
+        source=NoReadSource(),  # type: ignore[arg-type]
+        model=model,  # type: ignore[arg-type]
+        options=WikiWorkerOptions(),
+        retry_wait=lambda _seconds: asyncio.sleep(0),
+    )
+
+    for expected_fail_count in range(1, 6):
+        result = await worker.run_batch(scope)
+        assert result.failed_op_ids == (enqueued.id,)
+        assert result.completed_op_ids == result.superseded_op_ids == ()
+        assert model.calls == expected_fail_count
+
+        async with postgres_factory() as session:
+            pending = await session.get(WikiPendingOp, enqueued.id)
+            if expected_fail_count < 5:
+                assert pending is not None
+                assert pending.fail_count == expected_fail_count
+                assert pending.claimed_at is None
+                assert pending.claim_token is None
+            else:
+                assert pending is None
+
+            persisted_page = await session.get(WikiPage, page.id)
+            assert persisted_page is not None
+            assert persisted_page.deleted_at is None
+            assert persisted_page.source_refs == ["source-b"]
+            assert persisted_page.chunk_refs == ["chunk:b"]
+            assert persisted_page.content == "Original shared body"
+
+            contributions = list(
+                (
+                    await session.execute(
+                        select(WikiPageContribution)
+                        .where(
+                            WikiPageContribution.tenant_id == scope.tenant_id,
+                            WikiPageContribution.knowledge_base_id
+                            == scope.knowledge_base_id,
+                            WikiPageContribution.slug == page.slug,
+                        )
+                        .order_by(WikiPageContribution.knowledge_id)
+                    )
+                ).scalars()
+            )
+            assert [
+                (item.knowledge_id, item.state) for item in contributions
+            ] == [("source-a", "retract_pending"), ("source-b", "active")]
+
+            trigger_rows = list(
+                (
+                    await session.execute(
+                        select(TaskOutbox).where(
+                            TaskOutbox.tenant_id == scope.tenant_id,
+                            TaskOutbox.knowledge_base_id == scope.knowledge_base_id,
+                            TaskOutbox.event_type == "wiki.batch.trigger",
+                        )
+                    )
+                ).scalars()
+            )
+            assert sum(row.sent_at is not None for row in trigger_rows) == (
+                expected_fail_count
+            )
+            assert sum(row.sent_at is None for row in trigger_rows) == 1 + min(
+                expected_fail_count, 4
+            )
+
+            marker = (
+                await session.execute(
+                    select(WikiFinalizationMarker).where(
+                        WikiFinalizationMarker.tenant_id == scope.tenant_id,
+                        WikiFinalizationMarker.knowledge_base_id
+                        == scope.knowledge_base_id,
+                        WikiFinalizationMarker.knowledge_id == "source-a",
+                        WikiFinalizationMarker.subtask_name == "wiki-retract",
+                    )
+                )
+            ).scalar_one()
+            assert (marker.released_at is not None) is (expected_fail_count == 5)
+
+            dead_count = int(
+                (
+                    await session.execute(
+                        select(func.count(WikiDeadLetter.id)).where(
+                            WikiDeadLetter.pending_op_id == enqueued.id
+                        )
+                    )
+                ).scalar_one()
+            )
+            assert dead_count == (1 if expected_fail_count == 5 else 0)
+
+    dead_letters = await store.list_dead_letters(scope)
+    assert len(dead_letters) == 1
+    assert dead_letters[0].pending_op_id == enqueued.id
+    assert dead_letters[0].op == "retract"
+    assert dead_letters[0].fail_count == 5

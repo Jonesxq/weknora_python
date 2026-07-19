@@ -400,6 +400,75 @@ async def test_redis_propagates_close_failure_when_operation_succeeds() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["mark", "read"])
+async def test_redis_sync_client_preserves_primary_await_type_error(
+    operation: str,
+) -> None:
+    class SyncClient:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def set(self, *_args: object, **_kwargs: object) -> bool:
+            return True
+
+        def get(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def aclose(self) -> None:
+            self.closed += 1
+
+    client = SyncClient()
+    tombstones = RedisTombstones(
+        "redis://example", client_factory=lambda *_args, **_kwargs: client
+    )
+
+    with pytest.raises(TypeError) as error:
+        if operation == "mark":
+            await tombstones.mark_deleted(scope(), "knowledge-1")
+        else:
+            await tombstones.is_deleted(scope(), "knowledge-1")
+
+    assert "can't be used in 'await' expression" in str(error.value)
+    assert client.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_redis_primary_error_wins_when_aclose_awaitable_creation_fails() -> None:
+    class SyncFailingCloseClient(FakeRedisClient):
+        def aclose(self) -> None:
+            self.closed += 1
+            raise OSError("close setup failed")
+
+    client = SyncFailingCloseClient()
+    client.set_error = ConnectionError("primary")
+
+    with pytest.raises(ConnectionError, match="primary"):
+        await RedisTombstones(
+            "redis://example", client_factory=FakeFactory(lambda: client)
+        ).mark_deleted(scope(), "knowledge-1")
+
+    assert client.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_redis_cancellation_wins_when_aclose_awaitable_creation_fails() -> None:
+    class SyncFailingCloseClient(FakeRedisClient):
+        def aclose(self) -> None:
+            self.closed += 1
+            raise OSError("close setup failed")
+
+    client = SyncFailingCloseClient()
+    client.get_error = asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await RedisTombstones(
+            "redis://example", client_factory=FakeFactory(lambda: client)
+        ).is_deleted(scope(), "knowledge-1")
+
+    assert client.closed == 1
+
+
+@pytest.mark.asyncio
 async def test_redis_requires_exact_true_set_result() -> None:
     for written in (False, None, 0, 1, "", object()):
         factory = FakeFactory(lambda: FakeRedisClient(set_result=written))
@@ -628,7 +697,7 @@ async def test_real_redis_refreshes_short_ttl_and_isolates_keys_without_persiste
         tombstone_key(first_scope, other_source),
         tombstone_key(other_scope, first_source),
     )
-    tombstones = RedisTombstones(TEST_REDIS_URL, ttl_seconds=3)
+    tombstones = RedisTombstones(TEST_REDIS_URL, ttl_seconds=10)
     cleanup = Redis.from_url(TEST_REDIS_URL, decode_responses=True)
     try:
         await cleanup.delete(*keys)
@@ -637,10 +706,10 @@ async def test_real_redis_refreshes_short_ttl_and_isolates_keys_without_persiste
         assert not await tombstones.is_deleted(first_scope, other_source)
         assert not await tombstones.is_deleted(other_scope, first_source)
 
-        await asyncio.sleep(1)
-        first_ttl = await cleanup.ttl(keys[0])
+        await asyncio.sleep(0.05)
+        first_ttl = await cleanup.pttl(keys[0])
         await tombstones.mark_deleted(first_scope, first_source)
-        second_ttl = await cleanup.ttl(keys[0])
+        second_ttl = await cleanup.pttl(keys[0])
 
         assert second_ttl >= first_ttl > 0
         assert not hasattr(tombstones, "_client")

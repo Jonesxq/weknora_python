@@ -313,13 +313,14 @@ def build_dedup_candidate_statement(
             WikiPage.page_type == literal_column(f"'{candidate.page_type}'"),
         )
         .order_by(distance)
-        .limit(checked_limit)
+        .fetch(checked_limit, with_ties=True)
         .subquery("dedup_ranked")
     )
     return (
         select(WikiPage, ranked.c.dedup_distance)
         .join(ranked, ranked.c.page_id == WikiPage.id)
         .order_by(ranked.c.dedup_distance, WikiPage.slug)
+        .limit(checked_limit)
     )
 
 

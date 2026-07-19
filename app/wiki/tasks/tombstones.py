@@ -187,23 +187,53 @@ class RedisTombstones:
         except BaseException as error:
             primary_error = error
 
-        close_task = asyncio.create_task(client.aclose(), name="wiki-tombstone-close")
+        close_task: asyncio.Task[None] | None = None
         cleanup_cancelled = False
         close_error: BaseException | None = None
-        while not close_task.done():
+        close_awaitable: object | None = None
+        try:
+            close_awaitable = client.aclose()
+            close_task = asyncio.create_task(
+                close_awaitable,  # type: ignore[arg-type]
+                name="wiki-tombstone-close",
+            )
+        except BaseException as error:
+            close_error = error
+            if inspect.iscoroutine(close_awaitable):
+                close_awaitable.close()
+            else:
+                cancel = getattr(close_awaitable, "cancel", None)
+                if callable(cancel):
+                    try:
+                        cancel()
+                    except BaseException:
+                        pass
+
+        while close_task is not None and not close_task.done():
             try:
                 await asyncio.shield(close_task)
             except asyncio.CancelledError:
                 cleanup_cancelled = True
             except BaseException as error:
                 close_error = error
-        try:
-            close_task.result()
-        except BaseException as error:
-            close_error = error
+        if close_task is not None:
+            try:
+                close_task.result()
+            except BaseException as error:
+                close_error = error
 
-        if cleanup_cancelled or isinstance(primary_error, asyncio.CancelledError):
-            cancellation = asyncio.CancelledError()
+        cancellation = (
+            primary_error
+            if isinstance(primary_error, asyncio.CancelledError)
+            else close_error
+            if isinstance(close_error, asyncio.CancelledError)
+            else asyncio.CancelledError()
+        )
+        if (
+            cleanup_cancelled
+            or isinstance(primary_error, asyncio.CancelledError)
+            or isinstance(close_error, asyncio.CancelledError)
+        ):
             if primary_error is not None and not isinstance(
                 primary_error, asyncio.CancelledError
             ):
