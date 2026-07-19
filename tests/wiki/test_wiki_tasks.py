@@ -12,6 +12,7 @@ from celery.exceptions import Retry
 from app.wiki.ingest.errors import WikiBatchBusy
 from app.wiki.ingest.schemas import BatchResult
 from app.wiki.tasks import wiki_tasks
+from app.wiki.tasks.tombstones import MemoryTombstones, RedisTombstones
 
 
 KB_ID = UUID("11111111-1111-1111-1111-111111111111")
@@ -185,6 +186,8 @@ async def test_build_runtime_creates_independent_batch_resources_and_disposes_ow
     _write_fake_fixture(fixture)
     monkeypatch.setenv("GRAPH_WIKI_FAKE_DATA_FILE", str(fixture))
     monkeypatch.setenv("GRAPH_WIKI_LOCK_MODE", "memory")
+    monkeypatch.setenv("GRAPH_WIKI_TOMBSTONE_MODE", "memory")
+    monkeypatch.setenv("GRAPH_WIKI_TOMBSTONE_TTL_SECONDS", "321")
     locks = object()
     engines = []
     session_factories = []
@@ -225,6 +228,12 @@ async def test_build_runtime_creates_independent_batch_resources_and_disposes_ow
     assert second.worker._store is second.enqueue.store
     assert first.worker._store is not second.worker._store
     assert first.worker._locks is second.worker._locks is locks
+    assert isinstance(first.tombstones, MemoryTombstones)
+    assert isinstance(second.tombstones, MemoryTombstones)
+    assert first.tombstones is first.worker._tombstones is first.enqueue.tombstones
+    assert second.tombstones is second.worker._tombstones is second.enqueue.tombstones
+    assert first.tombstones is not second.tombstones
+    assert first.tombstones._ttl_seconds == second.tombstones._ttl_seconds == 321
     assert len(session_factories) == 2
 
     await first.aclose()
@@ -232,6 +241,79 @@ async def test_build_runtime_creates_independent_batch_resources_and_disposes_ow
     assert engines[1].dispose_count == 0
     await second.aclose()
     assert engines[1].dispose_count == 1
+
+
+def test_build_runtime_defaults_to_independent_redis_tombstones(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / "wiki-fake.json"
+    _write_fake_fixture(fixture)
+    monkeypatch.setenv("GRAPH_WIKI_FAKE_DATA_FILE", str(fixture))
+    monkeypatch.setenv("GRAPH_WIKI_LOCK_MODE", "memory")
+    monkeypatch.delenv("GRAPH_WIKI_TOMBSTONE_MODE", raising=False)
+    monkeypatch.setenv("GRAPH_WIKI_TOMBSTONE_TTL_SECONDS", "654")
+    monkeypatch.setenv("GRAPH_REDIS_URL", "redis://runtime.example/7")
+    monkeypatch.setattr(wiki_tasks, "create_database_engine", lambda _settings: object())
+    monkeypatch.setattr(wiki_tasks, "create_session_factory", lambda _engine: object())
+    monkeypatch.setattr(
+        wiki_tasks, "build_lock_manager_from_env", lambda: object(), raising=False
+    )
+
+    first = wiki_tasks.build_runtime()
+    second = wiki_tasks.build_runtime()
+
+    assert isinstance(first.tombstones, RedisTombstones)
+    assert isinstance(second.tombstones, RedisTombstones)
+    assert first.tombstones is first.worker._tombstones is first.enqueue.tombstones
+    assert second.tombstones is second.worker._tombstones is second.enqueue.tombstones
+    assert first.tombstones is not second.tombstones
+    assert first.tombstones._url == second.tombstones._url == "redis://runtime.example/7"
+    assert first.tombstones._ttl_seconds == second.tombstones._ttl_seconds == 654
+
+
+@pytest.mark.parametrize("mode", ["invalid", " memory-ish "])
+def test_build_runtime_rejects_invalid_tombstone_mode_before_engine_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    fixture = tmp_path / "wiki-fake.json"
+    _write_fake_fixture(fixture)
+    monkeypatch.setenv("GRAPH_WIKI_FAKE_DATA_FILE", str(fixture))
+    monkeypatch.setenv("GRAPH_WIKI_TOMBSTONE_MODE", mode)
+    monkeypatch.setattr(
+        wiki_tasks,
+        "create_database_engine",
+        lambda _settings: pytest.fail("非法 tombstone mode 不应创建数据库引擎"),
+    )
+
+    with pytest.raises(RuntimeError, match="只能是 redis 或 memory"):
+        wiki_tasks.build_runtime()
+
+
+@pytest.mark.parametrize("redis_url", [None, "", "   "])
+def test_build_runtime_requires_redis_url_in_default_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    redis_url: str | None,
+) -> None:
+    fixture = tmp_path / "wiki-fake.json"
+    _write_fake_fixture(fixture)
+    monkeypatch.setenv("GRAPH_WIKI_FAKE_DATA_FILE", str(fixture))
+    monkeypatch.delenv("GRAPH_WIKI_TOMBSTONE_MODE", raising=False)
+    if redis_url is None:
+        monkeypatch.delenv("GRAPH_REDIS_URL", raising=False)
+    else:
+        monkeypatch.setenv("GRAPH_REDIS_URL", redis_url)
+    monkeypatch.setattr(
+        wiki_tasks,
+        "create_database_engine",
+        lambda _settings: pytest.fail("Redis URL 缺失时不应创建数据库引擎"),
+    )
+
+    with pytest.raises(RuntimeError, match="GRAPH_REDIS_URL"):
+        wiki_tasks.build_runtime()
 
 
 @pytest.mark.parametrize("fixture_value", [None, "", "   "])

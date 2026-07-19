@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import re
 from uuid import UUID
 
 import pytest
 
+from app.wiki.ingest.fakes import FakeDataset
 from app.wiki.ingest.schemas import EnqueueResult
 from app.wiki.tasks import enqueue_fake, wiki_tasks
 
@@ -16,7 +18,13 @@ OTHER_KB_ID = UUID("33333333-3333-3333-3333-333333333333")
 PENDING_OP_ID = UUID("22222222-2222-2222-2222-222222222222")
 
 
-def _write_fake_fixture(path: Path, *, tenant_id: int = 23) -> None:
+def _write_fake_fixture(
+    path: Path,
+    *,
+    tenant_id: int = 23,
+    op_version: str = "v1",
+    status: str = "ready",
+) -> None:
     path.write_text(
         json.dumps(
             {
@@ -36,7 +44,8 @@ def _write_fake_fixture(path: Path, *, tenant_id: int = 23) -> None:
                         "tenant_id": tenant_id,
                         "knowledge_base_id": str(KB_ID),
                         "title": "Document One",
-                        "op_version": "v1",
+                        "op_version": op_version,
+                        "status": status,
                         "chunks": [{"id": "chunk-1", "text": "Source text"}],
                     }
                 ],
@@ -173,9 +182,9 @@ def test_success_uses_fixture_tenant_prints_public_json_and_closes_on_same_loop(
     loops = []
 
     class Enqueue:
-        async def enqueue(self, scope, knowledge_id):
+        async def enqueue_ingest(self, scope, knowledge_id):
             loops.append(asyncio.get_running_loop())
-            calls.append((scope, knowledge_id))
+            calls.append(("ingest", scope, knowledge_id, None))
             return EnqueueResult(pending_op_id=PENDING_OP_ID)
 
     class Runtime:
@@ -190,18 +199,132 @@ def test_success_uses_fixture_tenant_prints_public_json_and_closes_on_same_loop(
     enqueue_fake.main(_args())
 
     assert len(calls) == 1
-    scope, knowledge_id = calls[0]
+    op, scope, knowledge_id, op_version = calls[0]
+    assert op == "ingest"
     assert scope.tenant_id == 23
     assert scope.knowledge_base_id == KB_ID
     assert scope.actor_id == "wiki-fake-cli"
     assert scope.can_write is True
     assert knowledge_id == "knowledge-1"
+    assert op_version is None
     assert loops[0] is loops[1]
     assert json.loads(capsys.readouterr().out) == {
+        "op": "ingest",
         "pending_op_id": str(PENDING_OP_ID),
         "skipped_reason": None,
         "deduplicated": False,
     }
+
+
+def test_retract_uses_fixture_version_and_prints_operation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = tmp_path / "wiki-fake.json"
+    _write_fake_fixture(fixture, op_version="fixture-delete-v7", status="deleted")
+    monkeypatch.setenv("GRAPH_WIKI_FAKE_DATA_FILE", str(fixture))
+    calls = []
+
+    class Enqueue:
+        async def enqueue_retract(self, scope, knowledge_id, op_version):
+            calls.append((scope, knowledge_id, op_version))
+            return EnqueueResult(pending_op_id=PENDING_OP_ID, deduplicated=True)
+
+    class Runtime:
+        enqueue = Enqueue()
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(wiki_tasks, "build_runtime", Runtime)
+
+    enqueue_fake.main(["--op", "retract", *_args()])
+
+    assert calls[0][1:] == ("knowledge-1", "fixture-delete-v7")
+    assert json.loads(capsys.readouterr().out) == {
+        "op": "retract",
+        "pending_op_id": str(PENDING_OP_ID),
+        "skipped_reason": None,
+        "deduplicated": True,
+    }
+
+
+@pytest.mark.parametrize("status", ["deleting", "cancelled", "deleted"])
+def test_ingest_rejects_inactive_fixture_status_before_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status: str,
+) -> None:
+    fixture = tmp_path / "wiki-fake.json"
+    _write_fake_fixture(fixture, status=status)
+    monkeypatch.setenv("GRAPH_WIKI_FAKE_DATA_FILE", str(fixture))
+    monkeypatch.setattr(
+        wiki_tasks, "build_runtime", lambda: pytest.fail("失活 ingest 不应启动 runtime")
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        enqueue_fake.main(_args())
+
+    assert raised.value.code == 2
+
+
+@pytest.mark.parametrize("status", ["ready", "deleting", "cancelled", "deleted"])
+def test_retract_accepts_all_fixture_source_states(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    status: str,
+) -> None:
+    fixture = tmp_path / "wiki-fake.json"
+    _write_fake_fixture(fixture, op_version=f"version-{status}", status=status)
+    monkeypatch.setenv("GRAPH_WIKI_FAKE_DATA_FILE", str(fixture))
+    calls = []
+
+    class Enqueue:
+        async def enqueue_retract(self, scope, knowledge_id, op_version):
+            calls.append((scope, knowledge_id, op_version))
+            return EnqueueResult(skipped_reason="queued")
+
+    class Runtime:
+        enqueue = Enqueue()
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(wiki_tasks, "build_runtime", Runtime)
+
+    enqueue_fake.main(["--op", "retract", *_args()])
+
+    assert calls[0][1:] == ("knowledge-1", f"version-{status}")
+    assert json.loads(capsys.readouterr().out)["op"] == "retract"
+
+
+def test_example_fixture_has_strict_incremental_model_responses() -> None:
+    fixture_path = Path(__file__).parents[2] / "examples" / "wiki_fake_data.json"
+    raw = json.loads(fixture_path.read_text(encoding="utf-8"))
+    dataset = FakeDataset.model_validate(raw)
+
+    citations = dataset.model_responses.citations["knowledge-1"]
+    assert len(citations) >= 2
+    assert any(batch.supplemental_candidates for batch in citations)
+    aliases = [
+        alias
+        for batch in citations
+        for refs in batch.refs_by_slug.values()
+        for alias in refs
+    ]
+    assert aliases and all(re.fullmatch(r"c\d{3}", alias) for alias in aliases)
+    response_text = json.dumps(raw["model_responses"], ensure_ascii=False)
+    chunk_ids = [chunk["id"] for item in raw["knowledge"] for chunk in item["chunks"]]
+    assert all(chunk_id not in response_text for chunk_id in chunk_ids)
+    decisions = dataset.model_responses.deduplications
+    assert decisions
+    assert all(decision.canonical_slug is not None for decision in decisions.values())
+    assert all(
+        decision.canonical_slug in dataset.model_responses.merges
+        for decision in decisions.values()
+    )
 
 
 def test_enqueue_error_is_not_masked_by_close_error(
@@ -215,7 +338,7 @@ def test_enqueue_error_is_not_masked_by_close_error(
     enqueue_error = RuntimeError("enqueue failed")
 
     class Enqueue:
-        async def enqueue(self, _scope, _knowledge_id):
+        async def enqueue_ingest(self, _scope, _knowledge_id):
             raise enqueue_error
 
     class Runtime:
@@ -246,7 +369,7 @@ def test_enqueue_cancellation_still_closes_runtime(
     monkeypatch.setenv("GRAPH_WIKI_FAKE_DATA_FILE", str(fixture))
 
     class Enqueue:
-        async def enqueue(self, _scope, _knowledge_id):
+        async def enqueue_ingest(self, _scope, _knowledge_id):
             raise asyncio.CancelledError()
 
     class Runtime:
@@ -275,7 +398,7 @@ def test_success_propagates_runtime_close_error(
     close_error = OSError("close failed")
 
     class Enqueue:
-        async def enqueue(self, _scope, _knowledge_id):
+        async def enqueue_ingest(self, _scope, _knowledge_id):
             return EnqueueResult(skipped_reason="source_inactive")
 
     class Runtime:
@@ -303,7 +426,7 @@ def test_each_cli_call_builds_and_closes_a_new_runtime(
     runtimes = []
 
     class Enqueue:
-        async def enqueue(self, _scope, _knowledge_id):
+        async def enqueue_ingest(self, _scope, _knowledge_id):
             return EnqueueResult(skipped_reason="source_inactive")
 
     class Runtime:

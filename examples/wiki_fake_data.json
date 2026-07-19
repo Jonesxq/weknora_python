@@ -79,6 +79,41 @@
       "concept/retrieval": {
         "headline": "Retrieval",
         "markdown": "Retrieval finds relevant source material for grounded answers."
+      },
+      "concept/grounding": {
+        "headline": "Grounding",
+        "markdown": "Grounding connects generated answers to retrieved source material."
+      }
+    },
+    "citations": {
+      "knowledge-1": [
+        {
+          "refs_by_slug": {
+            "entity/acme": ["c001"],
+            "concept/retrieval": ["c002"]
+          },
+          "supplemental_candidates": [
+            {
+              "name": "Grounding",
+              "slug": "concept/grounding",
+              "page_type": "concept",
+              "description": "Connecting answers to supporting sources.",
+              "details": "Grounding uses retrieved context to support generated answers."
+            }
+          ]
+        },
+        {
+          "refs_by_slug": {
+            "concept/grounding": ["c001"]
+          },
+          "supplemental_candidates": []
+        }
+      ]
+    },
+    "deduplications": {
+      "concept/grounding": {
+        "candidate_slug": "concept/grounding",
+        "canonical_slug": "concept/retrieval"
       }
     }
   },

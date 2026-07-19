@@ -23,11 +23,13 @@ from app.infrastructure.tasks.celery_app import celery_app
 from app.wiki.ingest.enqueue import WikiEnqueueService
 from app.wiki.ingest.errors import WikiBatchBusy
 from app.wiki.ingest.fakes import load_fake_adapters
+from app.wiki.ingest.ports import TombstonePort
 from app.wiki.ingest.schemas import BatchResult, WikiWorkerOptions
 from app.wiki.ingest.store import SqlAlchemyIngestStore, SqlFinalizationPort
 from app.wiki.ingest.worker import WikiIngestWorker
 from app.wiki.scope import WikiScope
 from app.wiki.tasks.locks import build_lock_manager_from_env
+from app.wiki.tasks.tombstones import MemoryTombstones, RedisTombstones
 
 
 T = TypeVar("T")
@@ -39,6 +41,7 @@ class WikiTaskRuntime:
     engine: AsyncEngine
     worker: WikiIngestWorker
     enqueue: WikiEnqueueService
+    tombstones: TombstonePort
 
     async def aclose(self) -> None:
         await self.engine.dispose()
@@ -179,6 +182,21 @@ def build_runtime() -> WikiTaskRuntime:
 
     database_settings = DatabaseSettings.from_env()
     worker_options = WikiWorkerOptions.from_env()
+    tombstone_mode = os.getenv("GRAPH_WIKI_TOMBSTONE_MODE", "redis").strip().casefold()
+    if tombstone_mode == "memory":
+        tombstones: TombstonePort = MemoryTombstones(
+            ttl_seconds=worker_options.tombstone_ttl_seconds
+        )
+    elif tombstone_mode == "redis":
+        redis_url = os.getenv("GRAPH_REDIS_URL", "").strip()
+        if not redis_url:
+            raise RuntimeError("GRAPH_REDIS_URL 必须配置为非空 Redis URL")
+        tombstones = RedisTombstones(
+            redis_url,
+            ttl_seconds=worker_options.tombstone_ttl_seconds,
+        )
+    else:
+        raise RuntimeError("GRAPH_WIKI_TOMBSTONE_MODE 只能是 redis 或 memory")
     locks = build_lock_manager_from_env()
     source, model = load_fake_adapters(Path(fixture_value))
 
@@ -190,10 +208,16 @@ def build_runtime() -> WikiTaskRuntime:
         locks=locks,
         source=source,
         model=model,
+        tombstones=tombstones,
         options=worker_options,
     )
-    enqueue = WikiEnqueueService(source, store)
-    return WikiTaskRuntime(engine=engine, worker=worker, enqueue=enqueue)
+    enqueue = WikiEnqueueService(source, store, tombstones)
+    return WikiTaskRuntime(
+        engine=engine,
+        worker=worker,
+        enqueue=enqueue,
+        tombstones=tombstones,
+    )
 
 
 async def _run_batch_on_worker_loop(scope: WikiScope) -> BatchResult:

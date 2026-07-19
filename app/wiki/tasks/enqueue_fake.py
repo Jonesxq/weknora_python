@@ -1,4 +1,4 @@
-"""从共享 fake fixture 手动入队一条 Wiki 摄取操作。"""
+"""从共享 fake fixture 手动入队一条 Wiki 增量操作。"""
 
 from __future__ import annotations
 
@@ -40,7 +40,8 @@ def _non_empty(value: str) -> str:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="从 fake fixture 入队 Wiki 摄取操作")
+    parser = argparse.ArgumentParser(description="从 fake fixture 入队 Wiki 增量操作")
+    parser.add_argument("--op", choices=("ingest", "retract"), default="ingest")
     parser.add_argument("--kb-id", required=True, type=_canonical_uuid)
     parser.add_argument("--knowledge-id", required=True, type=_non_empty)
     return parser
@@ -51,7 +52,7 @@ def _fixture_tenant(
     fixture_path: Path,
     knowledge_base_id: UUID,
     knowledge_id: str,
-) -> int:
+) -> tuple[int, str, str]:
     try:
         dataset = FakeDataset.model_validate_json(fixture_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError):
@@ -74,26 +75,32 @@ def _fixture_tenant(
         parser.error("fixture 中不存在与 --kb-id 和 --knowledge-id 匹配的知识条目")
     if len(matches) > 1:
         parser.error("fixture 中 --kb-id 和 --knowledge-id 匹配到多个租户")
-    return matches[0].tenant_id
+    knowledge = matches[0]
+    return knowledge.tenant_id, knowledge.op_version, knowledge.status
 
 
 async def _enqueue(
     *,
+    op: str,
     tenant_id: int,
     knowledge_base_id: UUID,
     knowledge_id: str,
+    op_version: str,
 ) -> EnqueueResult:
     runtime = wiki_tasks.build_runtime()
     try:
-        result = await runtime.enqueue.enqueue(
-            WikiScope(
-                tenant_id=tenant_id,
-                knowledge_base_id=knowledge_base_id,
-                actor_id="wiki-fake-cli",
-                can_write=True,
-            ),
-            knowledge_id,
+        scope = WikiScope(
+            tenant_id=tenant_id,
+            knowledge_base_id=knowledge_base_id,
+            actor_id="wiki-fake-cli",
+            can_write=True,
         )
+        if op == "ingest":
+            result = await runtime.enqueue.enqueue_ingest(scope, knowledge_id)
+        else:
+            result = await runtime.enqueue.enqueue_retract(
+                scope, knowledge_id, op_version
+            )
         if not isinstance(result, EnqueueResult):
             raise TypeError("Wiki 入队服务必须返回 EnqueueResult")
     except BaseException:
@@ -117,20 +124,29 @@ def main(argv: Sequence[str] | None = None) -> None:
     fixture_value = os.getenv("GRAPH_WIKI_FAKE_DATA_FILE", "").strip()
     if not fixture_value:
         parser.error("环境变量 GRAPH_WIKI_FAKE_DATA_FILE 必须配置为非空 fixture 路径")
-    tenant_id = _fixture_tenant(
+    tenant_id, op_version, status = _fixture_tenant(
         parser,
         Path(fixture_value),
         args.kb_id,
         args.knowledge_id,
     )
+    if args.op == "ingest" and status != "ready":
+        parser.error("ingest 只允许 fixture 中 status=ready 的知识条目")
     result = asyncio.run(
         _enqueue(
+            op=args.op,
             tenant_id=tenant_id,
             knowledge_base_id=args.kb_id,
             knowledge_id=args.knowledge_id,
+            op_version=op_version,
         )
     )
-    print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False))
+    print(
+        json.dumps(
+            {"op": args.op, **result.model_dump(mode="json")},
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":
