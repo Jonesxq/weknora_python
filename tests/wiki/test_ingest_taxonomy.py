@@ -419,6 +419,41 @@ def test_build_folder_assignment_rejects_mismatched_or_untrusted_decisions(
     assert exc_info.value.code == "TAXONOMY_OUTPUT_INVALID"
 
 
+@pytest.mark.parametrize(
+    "topic",
+    [
+        TaxonomyTopic.model_construct(
+            slug="concept/root", title="Root", page_type="entity", summary=""
+        ),
+        None,
+    ],
+)
+def test_build_folder_assignment_rejects_unvalidated_work_item_topics(
+    topic: object,
+) -> None:
+    work_item = TaxonomyWorkItem(
+        topic=topic,  # type: ignore[arg-type]
+        contributor_op_ids=(OP_A,),
+    )
+
+    with pytest.raises(WikiValidationError, match="工作项") as exc_info:
+        build_folder_assignment(work_item, TaxonomyDecision(slug="concept/root"), {})
+
+    assert exc_info.value.code == "TAXONOMY_OUTPUT_INVALID"
+
+
+def test_build_folder_assignment_rejects_unvalidated_work_item_contributors() -> None:
+    work_item = TaxonomyWorkItem(
+        topic=_topic("concept/root", "Root"),
+        contributor_op_ids=(str(OP_A),),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(WikiValidationError, match="工作项") as exc_info:
+        build_folder_assignment(work_item, TaxonomyDecision(slug="concept/root"), {})
+
+    assert exc_info.value.code == "TAXONOMY_OUTPUT_INVALID"
+
+
 def test_build_folder_assignment_normalizes_final_dto_invariants() -> None:
     deep_work_item = TaxonomyWorkItem(
         topic=_topic("concept/root", "Root"), contributor_op_ids=(OP_A,)

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import math
 from uuid import UUID
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 from pydantic_core import PydanticSerializationError
 
 from app.wiki.errors import WikiValidationError
@@ -30,6 +30,9 @@ from app.wiki.ingest.schemas import (
 class TaxonomyWorkItem:
     topic: TaxonomyTopic
     contributor_op_ids: tuple[UUID, ...]
+
+
+_CONTRIBUTOR_OP_IDS = TypeAdapter(tuple[UUID, ...])
 
 
 def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
@@ -298,8 +301,9 @@ def build_folder_assignment(
     allowed_by_id: Mapping[UUID, AllowedFolderBase],
 ) -> FolderAssignment:
     """把单个 taxonomy 决策组合为经过最终 DTO 验证的目录归属。"""
+    work_item_snapshot = _snapshot_work_item(work_item)
     decision_snapshot = _snapshot_decision(decision)
-    if decision_snapshot.slug != work_item.topic.slug:
+    if decision_snapshot.slug != work_item_snapshot.topic.slug:
         _invalid("taxonomy decision slug不一致")
 
     base: AllowedFolderBase | None = None
@@ -319,8 +323,8 @@ def build_folder_assignment(
 
     try:
         return FolderAssignment(
-            slug=work_item.topic.slug,
-            contributor_op_ids=tuple(op_id for op_id in work_item.contributor_op_ids),
+            slug=work_item_snapshot.topic.slug,
+            contributor_op_ids=work_item_snapshot.contributor_op_ids,
             base_folder_id=None if base is None else base.id,
             base_path=None if base is None else base.path,
             base_depth=0 if base is None else base.depth,
@@ -336,6 +340,26 @@ def _snapshot_allowed_base(base: AllowedFolderBase) -> AllowedFolderBase:
     return AllowedFolderBase.model_validate(
         base.model_dump(mode="python", warnings="error")
     )
+
+
+def _snapshot_work_item(work_item: TaxonomyWorkItem) -> TaxonomyWorkItem:
+    if not isinstance(work_item, TaxonomyWorkItem) or not isinstance(
+        work_item.topic, TaxonomyTopic
+    ):
+        _invalid("taxonomy 工作项结构无效")
+    try:
+        return TaxonomyWorkItem(
+            topic=TaxonomyTopic.model_validate(
+                work_item.topic.model_dump(mode="python", warnings="error")
+            ),
+            contributor_op_ids=_CONTRIBUTOR_OP_IDS.validate_python(
+                work_item.contributor_op_ids, strict=True
+            ),
+        )
+    except (ValidationError, PydanticSerializationError) as exc:
+        raise WikiValidationError(
+            "TAXONOMY_OUTPUT_INVALID", "taxonomy 工作项结构无效"
+        ) from exc
 
 
 def _snapshot_decision(decision: TaxonomyDecision) -> TaxonomyDecision:
