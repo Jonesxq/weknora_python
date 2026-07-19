@@ -43,6 +43,7 @@ from app.wiki.ingest.schemas import (
     SourceKnowledge,
     StoredContributionRecord,
     TaxonomyDecision,
+    TaxonomyContext,
     TaxonomyOutput,
     TaxonomyRequest,
     TaxonomyTopic,
@@ -169,6 +170,166 @@ def test_folder_catalog_rejects_invalid_path_depth_and_name() -> None:
         TaxonomyDecision(
             slug="entity/acme", new_segments=("Products", "products")
         )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("GRAPH_WIKI_TAXONOMY_TOPIC_BATCH_SIZE", "0"),
+        ("GRAPH_WIKI_TAXONOMY_TOPIC_BATCH_SIZE", "61"),
+        ("GRAPH_WIKI_TAXONOMY_PARALLEL", "0"),
+        ("GRAPH_WIKI_TAXONOMY_PARALLEL", "17"),
+        ("GRAPH_WIKI_TAXONOMY_FULL_CATALOG_LIMIT", "0"),
+        ("GRAPH_WIKI_TAXONOMY_FULL_CATALOG_LIMIT", "5001"),
+        ("GRAPH_WIKI_TAXONOMY_RELATED_FOLDER_LIMIT", "0"),
+        ("GRAPH_WIKI_TAXONOMY_RELATED_FOLDER_LIMIT", "501"),
+    ],
+)
+def test_phase_four_a_options_reject_out_of_range_environment(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValidationError):
+        WikiWorkerOptions.from_env()
+
+
+def test_embedding_output_normalizes_keys_and_rejects_normalized_collisions() -> None:
+    output = EmbeddingOutput(vectors={" a ": (1.0, 0.0)})
+
+    assert tuple(output.vectors) == ("a",)
+    for invalid_key in ("", " a,b "):
+        with pytest.raises(ValidationError):
+            EmbeddingOutput(vectors={invalid_key: (1.0, 0.0)})
+    with pytest.raises(ValidationError):
+        EmbeddingOutput(vectors={"a": (1.0, 0.0), " a ": (0.0, 1.0)})
+
+
+def test_embedding_output_round_trips_and_rejects_invalid_vector_shapes() -> None:
+    output = EmbeddingOutput(
+        vectors={"first": (1.0, 0.0), "second": (0.0, 1.0)}
+    )
+
+    copied = copy.deepcopy(output)
+    restored = EmbeddingOutput.model_validate(output.model_dump())
+
+    assert copied is not output
+    assert copied.vectors is not output.vectors
+    assert restored == output
+    with pytest.raises(ValidationError):
+        EmbeddingOutput(vectors={"first": (1.0,), "second": (0.0, 1.0)})
+    with pytest.raises(ValidationError):
+        EmbeddingOutput(vectors={"first": (math.inf, 0.0)})
+
+
+def test_taxonomy_context_requires_a_complete_unique_catalog_tree() -> None:
+    root_id, child_id, grandchild_id = uuid4(), uuid4(), uuid4()
+    root = FolderCatalogEntry(
+        id=root_id, parent_id=None, name="Organizations", path="/Organizations", depth=1
+    )
+    child = FolderCatalogEntry(
+        id=child_id,
+        parent_id=root_id,
+        name="Products",
+        path="/Organizations/Products",
+        depth=2,
+    )
+    grandchild = FolderCatalogEntry(
+        id=grandchild_id,
+        parent_id=child_id,
+        name="Catalog",
+        path="/Organizations/Products/Catalog",
+        depth=3,
+    )
+
+    context = TaxonomyContext(
+        folders=(root, child, grandchild), classifiable_slugs=(" ENTITY/acme ",)
+    )
+
+    assert context.classifiable_slugs == ("entity/acme",)
+    with pytest.raises(ValidationError):
+        TaxonomyContext(folders=(root, grandchild))
+    with pytest.raises(ValidationError):
+        TaxonomyContext(folders=(root, root))
+    duplicate_path = child.model_copy(update={"id": uuid4()})
+    with pytest.raises(ValidationError):
+        TaxonomyContext(folders=(root, child, duplicate_path))
+
+
+def test_folder_paths_must_be_canonical_and_names_reject_unicode_controls() -> None:
+    with pytest.raises(ValidationError):
+        FolderCatalogEntry(
+            id=uuid4(), parent_id=None, name="Catalog", path="/ Catalog", depth=1
+        )
+    with pytest.raises(ValidationError):
+        AllowedFolderBase(id=uuid4(), path="/Catalog ", depth=1)
+    with pytest.raises(ValidationError):
+        FolderCatalogEntry(
+            id=uuid4(), parent_id=None, name="good\u0085name", path="/good\u0085name", depth=1
+        )
+    folder = FolderCatalogEntry(
+        id=uuid4(), parent_id=None, name="产品", path="/产品", depth=1
+    )
+
+    assert folder.path == "/产品"
+    with pytest.raises(ValidationError):
+        FolderCatalogEntry(
+            id=uuid4(), parent_id=None, name="Catalog", path="/Catalog/Child", depth=1
+        )
+
+
+def test_folder_assignment_keeps_none_root_and_validates_base_segment_boundary() -> None:
+    op_id = uuid4()
+    root_assignment = FolderAssignment(
+        slug="entity/acme",
+        contributor_op_ids=(op_id,),
+        base_folder_id=None,
+        base_path=None,
+        base_depth=0,
+    )
+
+    assert root_assignment.base_path is None
+    assert root_assignment.wiki_path == "/entity/acme"
+    with pytest.raises(ValidationError):
+        FolderAssignment(
+            slug="entity/acme",
+            contributor_op_ids=(op_id,),
+            base_folder_id=uuid4(),
+            base_path="/Products ",
+            base_depth=1,
+        )
+    with pytest.raises(ValidationError, match="相邻"):
+        FolderAssignment(
+            slug="entity/acme",
+            contributor_op_ids=(op_id,),
+            base_folder_id=uuid4(),
+            base_path="/Products",
+            base_depth=1,
+            new_segments=("products",),
+        )
+
+
+def test_batch_apply_request_round_trips_folder_assignments() -> None:
+    assignment = FolderAssignment(
+        slug="entity/acme",
+        contributor_op_ids=(uuid4(),),
+        base_folder_id=None,
+        base_path=None,
+        base_depth=0,
+    )
+    request = BatchApplyRequest(
+        claim_token=uuid4(),
+        pages=(),
+        contribution_deltas=(),
+        completed_op_ids=(),
+        superseded_op_ids=(),
+        failures=(),
+        expected_pages=(),
+        operation_id=uuid4(),
+        folder_assignments=(assignment,),
+    )
+
+    assert BatchApplyRequest.model_validate(request.model_dump()) == request
 
 
 def test_worker_options_read_environment(monkeypatch: pytest.MonkeyPatch) -> None:

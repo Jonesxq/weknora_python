@@ -9,6 +9,7 @@ import os
 import re
 from types import MappingProxyType
 from typing import Any, Literal, Self
+import unicodedata
 from uuid import UUID
 
 from pydantic import (
@@ -145,18 +146,18 @@ def _normalize_slug(value: str, allowed_prefixes: tuple[str, ...]) -> str:
 
 
 def _folder_name(value: str) -> str:
+    if any(unicodedata.category(character).startswith("C") for character in value):
+        raise ValueError("目录名不能包含控制字符")
     name = value.strip()
     if not name or len(name) > 512:
         raise ValueError("目录名长度必须在 1 到 512 之间")
     if name in {".", ".."} or "/" in name or "\\" in name:
         raise ValueError("目录名不能包含路径分隔符或保留路径名")
-    if any(ord(character) < 32 or ord(character) == 127 for character in name):
-        raise ValueError("目录名不能包含控制字符")
     return name
 
 
 def _normalize_folder_path(value: str) -> str:
-    path = value.strip()
+    path = value
     if not 1 <= len(path) <= 2048:
         raise ValueError("目录 path 长度必须在 1 到 2048 之间")
     if not path.startswith("/") or path.endswith("/"):
@@ -165,12 +166,20 @@ def _normalize_folder_path(value: str) -> str:
     if not segments or any(not segment for segment in segments):
         raise ValueError("目录 path 不能包含空路径段")
     for segment in segments:
-        _folder_name(segment)
+        if _folder_name(segment) != segment:
+            raise ValueError("目录 path 段必须是原样规范的目录名")
     return "/" + "/".join(segments)
 
 
 def _folder_path_segments(path: str) -> tuple[str, ...]:
     return tuple(path[1:].split("/"))
+
+
+def _normalize_embedding_key(value: str) -> str:
+    key = value.strip()
+    if not 1 <= len(key) <= 512 or "," in key:
+        raise ValueError("embedding key 长度必须在 1 到 512 之间且不能包含逗号")
+    return key
 
 
 def _stable_clean_strings(values: list[str]) -> list[str]:
@@ -838,10 +847,7 @@ class EmbeddingItem(_FrozenValueModel):
     @field_validator("key")
     @classmethod
     def normalize_key(cls, value: str) -> str:
-        key = value.strip()
-        if not 1 <= len(key) <= 512 or "," in key:
-            raise ValueError("embedding key 长度必须在 1 到 512 之间且不能包含逗号")
-        return key
+        return _normalize_embedding_key(value)
 
     @field_validator("text")
     @classmethod
@@ -884,7 +890,7 @@ class EmbeddingOutput(_FrozenValueModel):
         vectors: dict[str, tuple[float, ...]] = {}
         dimension: int | None = None
         for raw_key, raw_vector in value.items():
-            key = str(raw_key)
+            key = _normalize_embedding_key(str(raw_key))
             if key in vectors:
                 raise ValueError("embedding vector key 不能重复")
             if isinstance(raw_vector, (str, bytes, Mapping)):
@@ -1003,7 +1009,7 @@ class FolderAssignment(_FrozenValueModel):
     slug: str
     contributor_op_ids: tuple[UUID, ...] = Field(min_length=1)
     base_folder_id: UUID | None = None
-    base_path: str = ""
+    base_path: str | None = None
     base_depth: int = Field(default=0, ge=0, le=3)
     new_segments: tuple[str, ...] = Field(default=(), max_length=2)
 
@@ -1014,8 +1020,8 @@ class FolderAssignment(_FrozenValueModel):
 
     @field_validator("base_path")
     @classmethod
-    def normalize_base_path(cls, value: str) -> str:
-        return "" if not value.strip() else _normalize_folder_path(value)
+    def normalize_base_path(cls, value: str | None) -> str | None:
+        return None if value is None else _normalize_folder_path(value) if value else ""
 
     @field_validator("new_segments")
     @classmethod
@@ -1027,8 +1033,8 @@ class FolderAssignment(_FrozenValueModel):
         if len(self.contributor_op_ids) != len(set(self.contributor_op_ids)):
             raise ValueError("folder assignment contributor op id 不能重复")
         root = self.base_folder_id is None
-        if root and (self.base_path != "" or self.base_depth != 0):
-            raise ValueError("根目录必须使用空 base_path 和 base_depth=0")
+        if root and (self.base_path not in (None, "") or self.base_depth != 0):
+            raise ValueError("根目录必须使用空或 None base_path 和 base_depth=0")
         if not root:
             if not self.base_path or self.base_depth == 0:
                 raise ValueError("既有目录必须同时提供 base id、path 和 depth")
@@ -1036,9 +1042,14 @@ class FolderAssignment(_FrozenValueModel):
                 raise ValueError("base path 段数必须与 base depth 一致")
         if self.base_depth + len(self.new_segments) > 3:
             raise ValueError("目录总深度不能超过 3")
+        derived_segments = (
+            [*_folder_path_segments(self.base_path)[-1:], *self.new_segments]
+            if self.base_path
+            else list(self.new_segments)
+        )
         if any(
             current.casefold() == following.casefold()
-            for current, following in zip(self.new_segments, self.new_segments[1:])
+            for current, following in zip(derived_segments, derived_segments[1:])
         ):
             raise ValueError("相邻目录段不能仅大小写不同")
         if len(self.folder_path) > 2048:
