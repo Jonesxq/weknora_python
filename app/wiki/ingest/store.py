@@ -43,6 +43,7 @@ from app.wiki.ingest.schemas import (
     ContributionState,
     DedupPageCandidate,
     FinalizationRequest,
+    FolderAssignment,
     FolderCatalogEntry,
     OperationFailure,
     PageExpectation,
@@ -723,6 +724,35 @@ def _validate_batch_request(
     return snapshot
 
 
+def _folder_assignments_for_new_topics(
+    selected_pages: Sequence[tuple[WikiPage | None, ReducedPage]],
+    assignments: Sequence[FolderAssignment],
+    completed_id_set: set[UUID],
+    *,
+    require_taxonomy: bool,
+) -> tuple[FolderAssignment, ...]:
+    effective = tuple(
+        assignment
+        for assignment in assignments
+        if set(assignment.contributor_op_ids).issubset(completed_id_set)
+    )
+    new_topic_slugs = {
+        reduced.slug
+        for row, reduced in selected_pages
+        if row is None
+        and not reduced.deleted
+        and reduced.page_type in {"entity", "concept"}
+    }
+    if require_taxonomy and {item.slug for item in effective} != new_topic_slugs:
+        raise InvariantError("folder assignments 必须精确覆盖真正新建 topic 页面")
+    return tuple(
+        sorted(
+            (item for item in effective if item.slug in new_topic_slugs),
+            key=lambda item: item.slug,
+        )
+    )
+
+
 def _batch_apply_outcome(
     request: BatchApplyRequest,
     *,
@@ -1183,6 +1213,99 @@ class SqlAlchemyIngestStore:
     ) -> None:
         self._session_factory = session_factory
         self._finalization = finalization
+
+    async def _resolve_folder_assignment(
+        self,
+        session: AsyncSession,
+        scope: WikiScope,
+        assignment: FolderAssignment,
+    ) -> tuple[UUID | None, list[str], str, int]:
+        parent: WikiFolder | None = None
+        if assignment.base_folder_id is not None:
+            parent = (
+                await session.execute(
+                    select(WikiFolder)
+                    .where(
+                        WikiFolder.tenant_id == scope.tenant_id,
+                        WikiFolder.knowledge_base_id == scope.knowledge_base_id,
+                        WikiFolder.id == assignment.base_folder_id,
+                        WikiFolder.deleted_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                parent is None
+                or parent.path != assignment.base_path
+                or parent.depth != assignment.base_depth
+            ):
+                raise PageConflict("taxonomy base 目录已移动或失效")
+
+        for segment in assignment.new_segments:
+            parent_id = parent.id if parent is not None else None
+            expected_path = (
+                f"{parent.path}/{segment}" if parent is not None else f"/{segment}"
+            )
+            expected_depth = parent.depth + 1 if parent is not None else 1
+            inserted_id = uuid4()
+            returned_id = (
+                await session.execute(
+                    postgresql.insert(WikiFolder)
+                    .values(
+                        id=inserted_id,
+                        tenant_id=scope.tenant_id,
+                        knowledge_base_id=scope.knowledge_base_id,
+                        parent_id=parent_id,
+                        name=segment,
+                        path=expected_path,
+                        depth=expected_depth,
+                        sort_order=0,
+                    )
+                    .on_conflict_do_nothing(
+                        index_elements=[
+                            WikiFolder.knowledge_base_id,
+                            WikiFolder.parent_id,
+                            WikiFolder.name,
+                        ],
+                        index_where=WikiFolder.deleted_at.is_(None),
+                    )
+                    .returning(WikiFolder.id)
+                )
+            ).scalar_one_or_none()
+            parent_condition = (
+                WikiFolder.parent_id.is_(None)
+                if parent_id is None
+                else WikiFolder.parent_id == parent_id
+            )
+            locked = (
+                await session.execute(
+                    select(WikiFolder)
+                    .where(
+                        WikiFolder.tenant_id == scope.tenant_id,
+                        WikiFolder.knowledge_base_id == scope.knowledge_base_id,
+                        parent_condition,
+                        WikiFolder.name == segment,
+                        WikiFolder.deleted_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if locked is None:
+                raise InvariantError("活动同级目录插入后无法锁定")
+            if locked.path != expected_path or locked.depth != expected_depth:
+                raise InvariantError("活动同级目录 path 或 depth 与预期不一致")
+            if returned_id is not None and returned_id != locked.id:
+                raise InvariantError("新建目录 RETURNING id 与锁定目录不一致")
+            parent = locked
+
+        if parent is None:
+            return None, [], f"/{assignment.slug}", 0
+        return (
+            parent.id,
+            [segment for segment in parent.path.split("/") if segment],
+            f"{parent.path}/{assignment.slug}",
+            parent.depth,
+        )
 
     async def enqueue(
         self,
@@ -2159,6 +2282,19 @@ class SqlAlchemyIngestStore:
                         raise PageConflict("已有页面类型与结果 slug 类型不一致")
                     selected_pages.append((row, reduced))
 
+                assignments = _folder_assignments_for_new_topics(
+                    selected_pages,
+                    request.folder_assignments,
+                    completed_id_set,
+                    require_taxonomy=require_taxonomy,
+                )
+                placements = {
+                    assignment.slug: await self._resolve_folder_assignment(
+                        session, scope, assignment
+                    )
+                    for assignment in assignments
+                }
+
                 active_deltas = [
                     delta
                     for delta in request.contribution_deltas
@@ -2242,6 +2378,10 @@ class SqlAlchemyIngestStore:
                     if row is None:
                         if reduced.deleted:
                             continue
+                        folder_id, category_path, wiki_path, depth = placements.get(
+                            reduced.slug,
+                            (None, [], f"/{reduced.slug}", 0),
+                        )
                         row = WikiPage(
                             tenant_id=scope.tenant_id,
                             knowledge_base_id=scope.knowledge_base_id,
@@ -2254,7 +2394,10 @@ class SqlAlchemyIngestStore:
                             aliases=list(reduced.aliases),
                             source_refs=list(reduced.source_refs),
                             chunk_refs=list(reduced.chunk_refs),
-                            wiki_path=f"/{reduced.slug}",
+                            folder_id=folder_id,
+                            category_path=category_path,
+                            wiki_path=wiki_path,
+                            depth=depth,
                             version=1,
                         )
                         session.add(row)

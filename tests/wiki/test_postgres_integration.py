@@ -41,6 +41,7 @@ from app.wiki.ingest.store import (
     ClaimLost,
     InvariantError,
     PageConflict,
+    PendingOpRecord,
     SqlAlchemyIngestStore,
     SqlFinalizationPort,
     build_claim_recovery_dedup_key,
@@ -213,6 +214,777 @@ async def postgres_factory() -> async_sessionmaker[AsyncSession]:
         await _cleanup_postgres_engine(
             engine, schema, schema_created=schema_created
         )
+
+
+async def _claim_taxonomy_ingest(
+    store: SqlAlchemyIngestStore,
+    scope: WikiScope,
+    *,
+    knowledge_id: str,
+) -> PendingOpRecord:
+    knowledge = SourceKnowledge(
+        id=knowledge_id,
+        tenant_id=scope.tenant_id,
+        knowledge_base_id=scope.knowledge_base_id,
+        title=knowledge_id,
+        op_version="version-1",
+    )
+    await store.enqueue_ingest(
+        scope, knowledge, {"knowledge_id": knowledge.id}, delay_seconds=0
+    )
+    pending = (await store.claim_pending(scope, 1, 600))[0]
+    assert pending.claim_token is not None
+    return pending
+
+
+def _taxonomy_apply_request(
+    pending: PendingOpRecord,
+    page: ReducedPage,
+    *,
+    expected: PageExpectation | None = None,
+    folder_assignments: tuple[FolderAssignment, ...] = (),
+    operation_id=None,
+) -> BatchApplyRequest:
+    current = StoredContributionRecord(
+        tenant_id=pending.tenant_id,
+        knowledge_base_id=pending.knowledge_base_id,
+        slug=page.slug,
+        knowledge_id=pending.knowledge_id,
+        op_version=pending.op_version,
+        page_type=page.page_type,
+        state="active",
+        title=page.title,
+        content=page.content,
+        summary=page.summary,
+        aliases=tuple(page.aliases),
+        chunk_refs=tuple(page.chunk_refs),
+    )
+    return BatchApplyRequest(
+        claim_token=pending.claim_token,
+        pages=(page,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="add",
+                slug=page.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=None,
+                current=current,
+            ),
+        ),
+        completed_op_ids=(pending.id,),
+        superseded_op_ids=(),
+        failures=(),
+        expected_pages=(expected or PageExpectation(slug=page.slug),),
+        operation_id=operation_id or uuid4(),
+        folder_assignments=folder_assignments,
+    )
+
+
+@pytest.mark.asyncio
+async def test_atomic_taxonomy_creates_reuses_and_resolves_base_folders(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(tenant_id=41, knowledge_base_id=uuid4(), actor_id="task8")
+    store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+
+    first = await _claim_taxonomy_ingest(store, scope, knowledge_id="taxonomy-first")
+    first_page = ReducedPage(
+        slug="concept/postgresql",
+        title="PostgreSQL",
+        page_type="concept",
+        content="PostgreSQL",
+        summary="Database",
+        contributor_op_ids=[first.id],
+    )
+    first_assignment = FolderAssignment(
+        slug=first_page.slug,
+        contributor_op_ids=(first.id,),
+        new_segments=("Engineering", "Databases"),
+    )
+    first_request = _taxonomy_apply_request(
+        first,
+        first_page,
+        folder_assignments=(first_assignment,),
+    )
+    applied = await store.apply_results_with_outcome(scope, first_request)
+    replay = await store.apply_results_with_outcome(scope, first_request)
+    assert applied.applied is True
+    assert replay.applied is False
+
+    second = await _claim_taxonomy_ingest(store, scope, knowledge_id="taxonomy-second")
+    second_page = ReducedPage(
+        slug="entity/redis",
+        title="Redis",
+        page_type="entity",
+        content="Redis",
+        summary="Cache",
+        contributor_op_ids=[second.id],
+    )
+    await store.apply_results_with_outcome(
+        scope,
+        _taxonomy_apply_request(
+            second,
+            second_page,
+            folder_assignments=(
+                FolderAssignment(
+                    slug=second_page.slug,
+                    contributor_op_ids=(second.id,),
+                    new_segments=("Engineering", "Storage"),
+                ),
+            ),
+        ),
+    )
+
+    async with postgres_factory() as session:
+        engineering = (
+            await session.execute(
+                select(WikiFolder).where(
+                    WikiFolder.tenant_id == scope.tenant_id,
+                    WikiFolder.knowledge_base_id == scope.knowledge_base_id,
+                    WikiFolder.path == "/Engineering",
+                )
+            )
+        ).scalar_one()
+
+    third = await _claim_taxonomy_ingest(store, scope, knowledge_id="taxonomy-third")
+    third_page = ReducedPage(
+        slug="entity/nginx",
+        title="Nginx",
+        page_type="entity",
+        content="Nginx",
+        summary="Proxy",
+        contributor_op_ids=[third.id],
+    )
+    await store.apply_results_with_outcome(
+        scope,
+        _taxonomy_apply_request(
+            third,
+            third_page,
+            folder_assignments=(
+                FolderAssignment(
+                    slug=third_page.slug,
+                    contributor_op_ids=(third.id,),
+                    base_folder_id=engineering.id,
+                    base_path=engineering.path,
+                    base_depth=engineering.depth,
+                    new_segments=("Networks",),
+                ),
+            ),
+        ),
+    )
+
+    root_pending = await _claim_taxonomy_ingest(
+        store, scope, knowledge_id="taxonomy-root"
+    )
+    root_page = ReducedPage(
+        slug="entity/root-topic",
+        title="Root topic",
+        page_type="entity",
+        content="Root",
+        summary="Root",
+        contributor_op_ids=[root_pending.id],
+    )
+    await store.apply_results_with_outcome(
+        scope,
+        _taxonomy_apply_request(
+            root_pending,
+            root_page,
+            folder_assignments=(
+                FolderAssignment(
+                    slug=root_page.slug,
+                    contributor_op_ids=(root_pending.id,),
+                ),
+            ),
+        ),
+    )
+
+    async with postgres_factory() as session:
+        folders = list(
+            (
+                await session.execute(
+                    select(WikiFolder)
+                    .where(
+                        WikiFolder.tenant_id == scope.tenant_id,
+                        WikiFolder.knowledge_base_id == scope.knowledge_base_id,
+                        WikiFolder.deleted_at.is_(None),
+                    )
+                    .order_by(WikiFolder.path)
+                )
+            ).scalars()
+        )
+        assert [folder.path for folder in folders] == [
+            "/Engineering",
+            "/Engineering/Databases",
+            "/Engineering/Networks",
+            "/Engineering/Storage",
+        ]
+        pages = {
+            page.slug: page
+            for page in (
+                await session.execute(
+                    select(WikiPage).where(
+                        WikiPage.tenant_id == scope.tenant_id,
+                        WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                    )
+                )
+            ).scalars()
+        }
+        assert pages[first_page.slug].category_path == ["Engineering", "Databases"]
+        assert pages[first_page.slug].wiki_path == (
+            "/Engineering/Databases/concept/postgresql"
+        )
+        assert pages[first_page.slug].depth == 2
+        assert pages[first_page.slug].version == 1
+        assert pages[second_page.slug].category_path == ["Engineering", "Storage"]
+        assert pages[third_page.slug].category_path == ["Engineering", "Networks"]
+        assert pages[third_page.slug].folder_id == next(
+            folder.id for folder in folders if folder.path == "/Engineering/Networks"
+        )
+        assert pages[root_page.slug].folder_id is None
+        assert pages[root_page.slug].category_path == []
+        assert pages[root_page.slug].wiki_path == f"/{root_page.slug}"
+        assert pages[root_page.slug].depth == 0
+
+
+@pytest.mark.asyncio
+async def test_taxonomy_restores_soft_deleted_page_without_reassigning_folder(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(tenant_id=42, knowledge_base_id=uuid4(), actor_id="task8")
+    store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    async with postgres_factory() as session, session.begin():
+        manual = WikiFolder(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            parent_id=None,
+            name="Manual",
+            path="/Manual",
+            depth=1,
+        )
+        session.add(manual)
+        await session.flush()
+        historical = WikiPage(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            slug="entity/restored",
+            title="Restored",
+            page_type="entity",
+            status="published",
+            content="Same body",
+            summary="Same summary",
+            folder_id=manual.id,
+            category_path=["Manual"],
+            wiki_path="/Manual/entity/restored",
+            depth=1,
+            version=1,
+            deleted_at=datetime.now(UTC),
+        )
+        session.add(historical)
+        await session.flush()
+        historical_id = historical.id
+        manual_id = manual.id
+
+    pending = await _claim_taxonomy_ingest(store, scope, knowledge_id="restore-source")
+    restored = ReducedPage(
+        slug="entity/restored",
+        title="Restored",
+        page_type="entity",
+        content="Same body",
+        summary="Same summary",
+        contributor_op_ids=[pending.id],
+    )
+    await store.apply_results_with_outcome(
+        scope,
+        _taxonomy_apply_request(pending, restored, folder_assignments=()),
+    )
+
+    async with postgres_factory() as session:
+        page = await session.get(WikiPage, historical_id)
+        assert page is not None and page.deleted_at is None
+        assert page.folder_id == manual_id
+        assert page.category_path == ["Manual"]
+        assert page.wiki_path == "/Manual/entity/restored"
+        assert page.depth == 1
+        assert page.version == 2
+        assert (
+            await session.scalar(
+                select(func.count(WikiFolder.id)).where(
+                    WikiFolder.tenant_id == scope.tenant_id,
+                    WikiFolder.knowledge_base_id == scope.knowledge_base_id,
+                )
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_page_create_conflict_rolls_back_new_taxonomy_and_keeps_claim(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(tenant_id=43, knowledge_base_id=uuid4(), actor_id="task8")
+    resolved = asyncio.Event()
+    resume = asyncio.Event()
+
+    class PausingStore(SqlAlchemyIngestStore):
+        async def _resolve_folder_assignment(
+            self,
+            session: AsyncSession,
+            actual_scope: WikiScope,
+            assignment: FolderAssignment,
+        ):
+            placement = await super()._resolve_folder_assignment(
+                session, actual_scope, assignment
+            )
+            resolved.set()
+            await resume.wait()
+            return placement
+
+    store = PausingStore(postgres_factory, SqlFinalizationPort())
+    pending = await _claim_taxonomy_ingest(store, scope, knowledge_id="race-source")
+    page = ReducedPage(
+        slug="entity/raced",
+        title="Store page",
+        page_type="entity",
+        content="Store body",
+        summary="Store summary",
+        contributor_op_ids=[pending.id],
+    )
+    request = _taxonomy_apply_request(
+        pending,
+        page,
+        folder_assignments=(
+            FolderAssignment(
+                slug=page.slug,
+                contributor_op_ids=(pending.id,),
+                new_segments=("Rollback", "Nested"),
+            ),
+        ),
+    )
+    applying = asyncio.create_task(store.apply_results_with_outcome(scope, request))
+    await resolved.wait()
+    try:
+        async with postgres_factory() as session, session.begin():
+            session.add(
+                WikiPage(
+                    tenant_id=scope.tenant_id,
+                    knowledge_base_id=scope.knowledge_base_id,
+                    slug=page.slug,
+                    title="Concurrent winner",
+                    page_type="entity",
+                    status="published",
+                    content="Concurrent",
+                    summary="Concurrent",
+                    wiki_path=f"/{page.slug}",
+                )
+            )
+    finally:
+        resume.set()
+
+    with pytest.raises(PageConflict, match="并发创建"):
+        await applying
+
+    async with postgres_factory() as session:
+        assert (
+            await session.scalar(
+                select(func.count(WikiFolder.id)).where(
+                    WikiFolder.tenant_id == scope.tenant_id,
+                    WikiFolder.knowledge_base_id == scope.knowledge_base_id,
+                )
+            )
+            == 0
+        )
+        assert (
+            await session.scalar(
+                select(func.count(WikiPageContribution.id)).where(
+                    WikiPageContribution.tenant_id == scope.tenant_id,
+                    WikiPageContribution.knowledge_base_id == scope.knowledge_base_id,
+                )
+            )
+            == 0
+        )
+        pending_row = await session.get(WikiPendingOp, pending.id)
+        assert pending_row is not None
+        assert pending_row.fail_count == 0
+        assert pending_row.claim_token == pending.claim_token
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict", ["tenant", "knowledge_base", "moved", "deleted"])
+async def test_invalid_taxonomy_base_rolls_back_without_residual_folder(
+    postgres_factory: async_sessionmaker[AsyncSession],
+    conflict: str,
+) -> None:
+    scope = WikiScope(tenant_id=44, knowledge_base_id=uuid4(), actor_id="task8")
+    folder_tenant = scope.tenant_id + 1 if conflict == "tenant" else scope.tenant_id
+    folder_kb = uuid4() if conflict == "knowledge_base" else scope.knowledge_base_id
+    actual_path = "/Moved" if conflict == "moved" else "/Base"
+    async with postgres_factory() as session, session.begin():
+        base = WikiFolder(
+            tenant_id=folder_tenant,
+            knowledge_base_id=folder_kb,
+            parent_id=None,
+            name=actual_path.removeprefix("/"),
+            path=actual_path,
+            depth=1,
+            deleted_at=datetime.now(UTC) if conflict == "deleted" else None,
+        )
+        session.add(base)
+        await session.flush()
+        base_id = base.id
+
+    store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    pending = await _claim_taxonomy_ingest(
+        store, scope, knowledge_id=f"base-{conflict}"
+    )
+    page = ReducedPage(
+        slug=f"entity/base-{conflict}",
+        title="Base conflict",
+        page_type="entity",
+        content="Base conflict",
+        summary="Base conflict",
+        contributor_op_ids=[pending.id],
+    )
+    assignment = FolderAssignment(
+        slug=page.slug,
+        contributor_op_ids=(pending.id,),
+        base_folder_id=base_id,
+        base_path="/Original" if conflict == "moved" else "/Base",
+        base_depth=1,
+        new_segments=("Residual",),
+    )
+
+    with pytest.raises(PageConflict, match="taxonomy base 目录已移动或失效"):
+        await store.apply_results_with_outcome(
+            scope,
+            _taxonomy_apply_request(
+                pending,
+                page,
+                folder_assignments=(assignment,),
+            ),
+        )
+
+    async with postgres_factory() as session:
+        assert (
+            await session.scalar(
+                select(func.count(WikiFolder.id)).where(WikiFolder.name == "Residual")
+            )
+            == 0
+        )
+        pending_row = await session.get(WikiPendingOp, pending.id)
+        assert pending_row is not None
+        assert pending_row.fail_count == 0
+        assert pending_row.claim_token == pending.claim_token
+
+
+@pytest.mark.asyncio
+async def test_existing_sibling_with_wrong_path_depth_is_not_silently_reused(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(tenant_id=45, knowledge_base_id=uuid4(), actor_id="task8")
+    async with postgres_factory() as session, session.begin():
+        session.add(
+            WikiFolder(
+                tenant_id=scope.tenant_id,
+                knowledge_base_id=scope.knowledge_base_id,
+                parent_id=None,
+                name="Engineering",
+                path="/Wrong",
+                depth=2,
+            )
+        )
+
+    store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    pending = await _claim_taxonomy_ingest(store, scope, knowledge_id="corrupt-folder")
+    page = ReducedPage(
+        slug="entity/corrupt-folder",
+        title="Corrupt folder",
+        page_type="entity",
+        content="Corrupt folder",
+        summary="Corrupt folder",
+        contributor_op_ids=[pending.id],
+    )
+    with pytest.raises(InvariantError, match="path 或 depth"):
+        await store.apply_results_with_outcome(
+            scope,
+            _taxonomy_apply_request(
+                pending,
+                page,
+                folder_assignments=(
+                    FolderAssignment(
+                        slug=page.slug,
+                        contributor_op_ids=(pending.id,),
+                        new_segments=("Engineering",),
+                    ),
+                ),
+            ),
+        )
+
+    async with postgres_factory() as session:
+        pending_row = await session.get(WikiPendingOp, pending.id)
+        assert pending_row is not None and pending_row.fail_count == 0
+
+
+@pytest.mark.asyncio
+async def test_existing_page_folder_cache_does_not_increment_version(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(tenant_id=46, knowledge_base_id=uuid4(), actor_id="task8")
+    async with postgres_factory() as session, session.begin():
+        manual = WikiFolder(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            parent_id=None,
+            name="Manual",
+            path="/Manual",
+            depth=1,
+        )
+        session.add(manual)
+        await session.flush()
+        existing = WikiPage(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            slug="entity/stable-folder",
+            title="Stable",
+            page_type="entity",
+            status="published",
+            content="Stable body",
+            summary="Stable summary",
+            folder_id=manual.id,
+            category_path=["Manual"],
+            wiki_path="/Manual/entity/stable-folder",
+            depth=1,
+            version=1,
+        )
+        session.add(existing)
+        await session.flush()
+        existing_id = existing.id
+
+    store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    pending = await _claim_taxonomy_ingest(store, scope, knowledge_id="stable-source")
+    reduced = ReducedPage(
+        slug="entity/stable-folder",
+        title="Stable",
+        page_type="entity",
+        content="Stable body",
+        summary="Stable summary",
+        contributor_op_ids=[pending.id],
+    )
+    await store.apply_results_with_outcome(
+        scope,
+        _taxonomy_apply_request(
+            pending,
+            reduced,
+            expected=PageExpectation(
+                slug=reduced.slug,
+                page_id=existing_id,
+                version=1,
+            ),
+            folder_assignments=(),
+        ),
+    )
+
+    async with postgres_factory() as session:
+        page = await session.get(WikiPage, existing_id)
+        assert page is not None and page.version == 1
+        assert page.category_path == ["Manual"]
+        assert page.wiki_path == "/Manual/entity/stable-folder"
+        assert page.depth == 1
+
+
+@pytest.mark.asyncio
+async def test_taxonomy_requires_exact_new_topic_assignment_coverage(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(tenant_id=47, knowledge_base_id=uuid4(), actor_id="task8")
+    store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    pending = await _claim_taxonomy_ingest(store, scope, knowledge_id="coverage-source")
+    new_page = ReducedPage(
+        slug="entity/missing-assignment",
+        title="Missing",
+        page_type="entity",
+        content="Missing",
+        summary="Missing",
+        contributor_op_ids=[pending.id],
+    )
+    with pytest.raises(
+        InvariantError,
+        match="folder assignments 必须精确覆盖真正新建 topic 页面",
+    ):
+        await store.apply_results_with_outcome(
+            scope,
+            _taxonomy_apply_request(pending, new_page, folder_assignments=()),
+        )
+
+    async with postgres_factory() as session, session.begin():
+        history = WikiPage(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            slug="entity/history-extra",
+            title="History",
+            page_type="entity",
+            status="published",
+            content="History",
+            summary="History",
+            wiki_path="/entity/history-extra",
+            deleted_at=datetime.now(UTC),
+        )
+        session.add(history)
+
+    history_page = ReducedPage(
+        slug="entity/history-extra",
+        title="History",
+        page_type="entity",
+        content="History",
+        summary="History",
+        contributor_op_ids=[pending.id],
+    )
+    with pytest.raises(
+        InvariantError,
+        match="folder assignments 必须精确覆盖真正新建 topic 页面",
+    ):
+        await store.apply_results_with_outcome(
+            scope,
+            _taxonomy_apply_request(
+                pending,
+                history_page,
+                folder_assignments=(
+                    FolderAssignment(
+                        slug=history_page.slug,
+                        contributor_op_ids=(pending.id,),
+                        new_segments=("MustNotExist",),
+                    ),
+                ),
+            ),
+        )
+
+    async with postgres_factory() as session:
+        assert (
+            await session.scalar(
+                select(func.count(WikiFolder.id)).where(
+                    WikiFolder.tenant_id == scope.tenant_id,
+                    WikiFolder.knowledge_base_id == scope.knowledge_base_id,
+                )
+            )
+            == 0
+        )
+        pending_row = await session.get(WikiPendingOp, pending.id)
+        assert pending_row is not None and pending_row.fail_count == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_superseded_assignment_is_filtered_before_folder_creation(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(tenant_id=48, knowledge_base_id=uuid4(), actor_id="task8")
+    store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    pending = await _claim_taxonomy_ingest(
+        store, scope, knowledge_id="superseded-source"
+    )
+    retract = await store.enqueue_retract(
+        scope,
+        pending.knowledge_id,
+        "delete-1",
+        {"knowledge_id": pending.knowledge_id},
+        delay_seconds=0,
+    )
+    assert retract.id is not None
+    async with postgres_factory() as session, session.begin():
+        await session.execute(
+            update(WikiPendingOp)
+            .where(WikiPendingOp.id == retract.id)
+            .values(enqueued_at=pending.enqueued_at + timedelta(seconds=1))
+        )
+
+    page = ReducedPage(
+        slug="entity/superseded-topic",
+        title="Superseded",
+        page_type="entity",
+        content="Superseded",
+        summary="Superseded",
+        contributor_op_ids=[pending.id],
+    )
+    outcome = await store.apply_results_with_outcome(
+        scope,
+        _taxonomy_apply_request(
+            pending,
+            page,
+            folder_assignments=(
+                FolderAssignment(
+                    slug=page.slug,
+                    contributor_op_ids=(pending.id,),
+                    new_segments=("MustNotExist",),
+                ),
+            ),
+        ),
+    )
+    assert outcome.completed_op_ids == ()
+    assert outcome.superseded_op_ids == (pending.id,)
+
+    async with postgres_factory() as session:
+        assert (
+            await session.scalar(
+                select(func.count(WikiFolder.id)).where(
+                    WikiFolder.tenant_id == scope.tenant_id,
+                    WikiFolder.knowledge_base_id == scope.knowledge_base_id,
+                )
+            )
+            == 0
+        )
+        assert (
+            await session.scalar(
+                select(func.count(WikiPage.id)).where(
+                    WikiPage.tenant_id == scope.tenant_id,
+                    WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                    WikiPage.slug == page.slug,
+                )
+            )
+            == 0
+        )
+        assert await session.get(WikiPendingOp, pending.id) is None
+        assert await session.get(WikiPendingOp, retract.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_legacy_new_page_keeps_root_placement(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(tenant_id=49, knowledge_base_id=uuid4(), actor_id="task8")
+    store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    pending = await _claim_taxonomy_ingest(store, scope, knowledge_id="legacy-source")
+    page = ReducedPage(
+        slug="entity/legacy-root",
+        title="Legacy",
+        page_type="entity",
+        content="Legacy",
+        summary="Legacy",
+        contributor_op_ids=[pending.id],
+    )
+
+    assert await store.apply_results(
+        scope,
+        pending.claim_token,
+        [page],
+        [pending.id],
+        uuid4(),
+        expected_pages={page.slug: None},
+    )
+
+    async with postgres_factory() as session:
+        persisted = (
+            await session.execute(
+                select(WikiPage).where(
+                    WikiPage.tenant_id == scope.tenant_id,
+                    WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                    WikiPage.slug == page.slug,
+                )
+            )
+        ).scalar_one()
+        assert persisted.folder_id is None
+        assert persisted.category_path == []
+        assert persisted.wiki_path == f"/{page.slug}"
+        assert persisted.depth == 0
+        assert persisted.version == 1
 
 
 @pytest.mark.asyncio

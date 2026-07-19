@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import ValidationError
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.wiki.ingest import schemas as ingest_schemas
 from app.wiki.ingest import store as ingest_store
@@ -28,6 +29,7 @@ from app.wiki.ingest.store import (
     EnqueueRecord,
     ExistingPageRecord,
     InvariantError,
+    PageConflict,
     SqlAlchemyIngestStore,
     SqlFinalizationPort,
     build_claim_recovery_dedup_key,
@@ -47,6 +49,7 @@ from app.wiki.models import (
     TaskOutbox,
     WikiLogEntry,
     WikiDeadLetter,
+    WikiFolder,
     WikiPage,
     WikiPageContribution,
     WikiPendingOp,
@@ -1964,6 +1967,235 @@ class _RecordingFinalization:
         return self.release_ok
 
 
+@pytest.mark.asyncio
+async def test_resolve_folder_assignment_keeps_root_without_sql() -> None:
+    session = _ScriptedSession([])
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), SqlFinalizationPort())  # type: ignore[arg-type]
+    assignment = FolderAssignment(
+        slug="entity/acme",
+        contributor_op_ids=(uuid4(),),
+    )
+
+    placement = await store._resolve_folder_assignment(session, SCOPE, assignment)
+
+    assert placement == (None, [], "/entity/acme", 0)
+    assert session.statements == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_folder_assignment_creates_and_locks_each_segment() -> None:
+    root_id, child_id = uuid4(), uuid4()
+    root = WikiFolder(
+        id=root_id,
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        parent_id=None,
+        name="Engineering",
+        path="/Engineering",
+        depth=1,
+    )
+    child = WikiFolder(
+        id=child_id,
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        parent_id=root_id,
+        name="Databases",
+        path="/Engineering/Databases",
+        depth=2,
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(scalar=root_id),
+            _ScriptedResult(scalar=root),
+            _ScriptedResult(scalar=child_id),
+            _ScriptedResult(scalar=child),
+        ]
+    )
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), SqlFinalizationPort())  # type: ignore[arg-type]
+    assignment = FolderAssignment(
+        slug="concept/postgresql",
+        contributor_op_ids=(uuid4(),),
+        new_segments=("Engineering", "Databases"),
+    )
+
+    placement = await store._resolve_folder_assignment(session, SCOPE, assignment)
+
+    assert placement == (
+        child_id,
+        ["Engineering", "Databases"],
+        "/Engineering/Databases/concept/postgresql",
+        2,
+    )
+    assert len(session.statements) == 4
+    for statement in session.statements[::2]:
+        sql = _sql(statement)
+        assert sql.startswith("INSERT INTO wiki_folders")
+        assert "ON CONFLICT (knowledge_base_id, parent_id, name)" in sql
+        assert "WHERE deleted_at IS NULL DO NOTHING" in sql
+        assert "RETURNING wiki_folders.id" in sql
+    for statement in session.statements[1::2]:
+        sql = _sql(statement)
+        assert "wiki_folders.tenant_id" in sql
+        assert "wiki_folders.knowledge_base_id" in sql
+        assert "wiki_folders.deleted_at IS NULL" in sql
+        assert "FOR UPDATE" in sql
+
+
+@pytest.mark.asyncio
+async def test_resolve_folder_assignment_rejects_changed_base_snapshot() -> None:
+    base_id = uuid4()
+    moved = WikiFolder(
+        id=base_id,
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        parent_id=None,
+        name="Moved",
+        path="/Moved",
+        depth=1,
+    )
+    session = _ScriptedSession([_ScriptedResult(scalar=moved)])
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), SqlFinalizationPort())  # type: ignore[arg-type]
+    assignment = FolderAssignment(
+        slug="entity/acme",
+        contributor_op_ids=(uuid4(),),
+        base_folder_id=base_id,
+        base_path="/Engineering",
+        base_depth=1,
+    )
+
+    with pytest.raises(PageConflict, match="taxonomy base 目录已移动或失效"):
+        await store._resolve_folder_assignment(session, SCOPE, assignment)
+
+    assert len(session.statements) == 1
+    assert "FOR UPDATE" in _sql(session.statements[0])
+
+
+@pytest.mark.asyncio
+async def test_resolve_folder_assignment_rejects_locked_path_depth_mismatch() -> None:
+    folder_id = uuid4()
+    corrupted = WikiFolder(
+        id=folder_id,
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        parent_id=None,
+        name="Engineering",
+        path="/unexpected",
+        depth=2,
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(scalar=None),
+            _ScriptedResult(scalar=corrupted),
+        ]
+    )
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), SqlFinalizationPort())  # type: ignore[arg-type]
+    assignment = FolderAssignment(
+        slug="entity/acme",
+        contributor_op_ids=(uuid4(),),
+        new_segments=("Engineering",),
+    )
+
+    with pytest.raises(InvariantError, match="path.*depth"):
+        await store._resolve_folder_assignment(session, SCOPE, assignment)
+
+
+def test_folder_assignments_must_exactly_cover_truly_new_topics() -> None:
+    op_id = uuid4()
+    new_topic = _result_page().model_copy(update={"contributor_op_ids": [op_id]})
+    restored_history = _page(slug="concept/history", page_type="concept")
+    restored_history.deleted_at = NOW
+    restored = ReducedPage(
+        slug=restored_history.slug,
+        title="Restored",
+        page_type="concept",
+        content="Restored",
+        summary="Restored",
+        contributor_op_ids=[op_id],
+    )
+
+    with pytest.raises(
+        InvariantError,
+        match="folder assignments 必须精确覆盖真正新建 topic 页面",
+    ):
+        ingest_store._folder_assignments_for_new_topics(
+            [(None, new_topic), (restored_history, restored)],
+            (),
+            {op_id},
+            require_taxonomy=True,
+        )
+
+    extra = FolderAssignment(
+        slug=restored.slug,
+        contributor_op_ids=(op_id,),
+        new_segments=("Ignored",),
+    )
+    with pytest.raises(
+        InvariantError,
+        match="folder assignments 必须精确覆盖真正新建 topic 页面",
+    ):
+        ingest_store._folder_assignments_for_new_topics(
+            [(None, new_topic), (restored_history, restored)],
+            (
+                FolderAssignment(
+                    slug=new_topic.slug,
+                    contributor_op_ids=(op_id,),
+                ),
+                extra,
+            ),
+            {op_id},
+            require_taxonomy=True,
+        )
+
+
+def test_folder_assignments_filter_superseded_contributors_before_coverage() -> None:
+    superseded_id = uuid4()
+    assignment = FolderAssignment(
+        slug="entity/superseded",
+        contributor_op_ids=(superseded_id,),
+        new_segments=("MustNotExist",),
+    )
+
+    assert (
+        ingest_store._folder_assignments_for_new_topics(
+            [],
+            (assignment,),
+            set(),
+            require_taxonomy=True,
+        )
+        == ()
+    )
+
+
+def test_folder_assignments_are_returned_in_stable_slug_order() -> None:
+    op_id = uuid4()
+    pages = [
+        ReducedPage(
+            slug=slug,
+            title=slug,
+            page_type="entity",
+            content=slug,
+            summary=slug,
+            contributor_op_ids=[op_id],
+        )
+        for slug in ("entity/zeta", "entity/alpha")
+    ]
+    assignments = tuple(
+        FolderAssignment(slug=page.slug, contributor_op_ids=(op_id,)) for page in pages
+    )
+
+    selected = ingest_store._folder_assignments_for_new_topics(
+        [(None, page) for page in pages],
+        assignments,
+        {op_id},
+        require_taxonomy=True,
+    )
+
+    assert [assignment.slug for assignment in selected] == [
+        "entity/alpha",
+        "entity/zeta",
+    ]
+
+
 def _pending(
     *,
     knowledge_id: str = "knowledge-1",
@@ -2060,6 +2292,87 @@ def _knowledge(version: str = "version-2") -> SourceKnowledge:
         title="Document",
         op_version=version,
     )
+
+
+@pytest.mark.asyncio
+async def test_modern_apply_results_writes_resolved_folder_page_cache() -> None:
+    token = uuid4()
+    pending = _pending(claimed=True)
+    pending.claim_token = token
+    page = _result_page().model_copy(update={"contributor_op_ids": [pending.id]})
+    current = _stored_contribution(version=pending.op_version)
+    assignment = FolderAssignment(
+        slug=page.slug,
+        contributor_op_ids=(pending.id,),
+        new_segments=("Engineering", "Databases"),
+    )
+    request = _batch_request(
+        claim_token=token,
+        pages=(page,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="add",
+                slug=page.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=None,
+                current=current,
+            ),
+        ),
+        completed_op_ids=(pending.id,),
+        expected_pages=(PageExpectation(slug=page.slug),),
+        folder_assignments=(assignment,),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(),
+            _ScriptedResult(),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=0),
+        ]
+    )
+    folder_id = uuid4()
+
+    class RecordingStore(SqlAlchemyIngestStore):
+        def __init__(self) -> None:
+            super().__init__(
+                _OneSessionFactory(session),  # type: ignore[arg-type]
+                _RecordingFinalization(session.events),
+            )
+            self.resolved: list[FolderAssignment] = []
+
+        async def _resolve_folder_assignment(
+            self,
+            actual_session: AsyncSession,
+            scope: WikiScope,
+            actual_assignment: FolderAssignment,
+        ) -> tuple[UUID | None, list[str], str, int]:
+            assert actual_session is session
+            assert scope == SCOPE
+            self.resolved.append(actual_assignment)
+            return (
+                folder_id,
+                ["Engineering", "Databases"],
+                "/Engineering/Databases/entity/acme",
+                2,
+            )
+
+    store = RecordingStore()
+
+    assert await store.apply_results_with_outcome(SCOPE, request)
+
+    inserted_page = next(item for item in session.added if isinstance(item, WikiPage))
+    assert store.resolved == [assignment]
+    assert inserted_page.folder_id == folder_id
+    assert inserted_page.category_path == ["Engineering", "Databases"]
+    assert inserted_page.wiki_path == "/Engineering/Databases/entity/acme"
+    assert inserted_page.depth == 2
+    assert inserted_page.version == 1
 
 
 @pytest.mark.asyncio
