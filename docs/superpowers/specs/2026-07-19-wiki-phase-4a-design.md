@@ -141,6 +141,7 @@ async def embed(self, request: EmbeddingRequest) -> EmbeddingOutput: ...
 - `slug`
 - `contributor_op_ids`
 - `base_folder_id`
+- `base_path` 和 `base_depth`：模型计算时看到的 base 快照；根目录分别为 `None` 和 `0`
 - `new_segments`
 
 `BatchApplyRequest` 新增 `folder_assignments`，默认空元组以保持阶段三内部调用兼容。
@@ -175,6 +176,7 @@ fake embedding 输出只用于候选筛选，不能直接决定最终目录。
 默认配置：
 
 - `taxonomy_topic_batch_size=60`，硬上限 60。
+- `taxonomy_parallel=4`，最大 16。
 - `taxonomy_full_catalog_limit=120`。
 - `taxonomy_related_folder_limit=40`。
 
@@ -229,7 +231,7 @@ Store 在锁定 claim 和页面、确定实际可写结果页后处理目录：
 
 1. 再次查询 assignment 对应 slug 的全部页面行，区分真正新建与历史恢复。
 2. 历史软删除页面恢复时保留原 `folder_id`，不应用 taxonomy。
-3. 锁定 assignment 引用的 base 目录，并验证 scope、active、path、depth 和父级身份。
+3. 锁定 assignment 引用的 base 目录，并验证 scope、active、path、depth 和父级身份与 `base_path/base_depth` 快照一致；目录被人工移动后必须报页面冲突并让 claim 重试。
 4. 从浅到深解析 `new_segments`。
 5. 每一级按 scope + `parent_id + name` 复用已有活动兄弟目录；不存在时插入目录。
 6. 并发唯一冲突时按同一兄弟目录身份重新读取，并验证父级、名称、path 和深度完全一致；不一致则报冲突。
