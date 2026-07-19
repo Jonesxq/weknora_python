@@ -19,8 +19,15 @@ from app.wiki.ingest.schemas import (
     BatchApplyOutcome,
     BatchApplyRequest,
     BatchResult,
+    EmbeddingOutput,
+    EmbeddingRequest,
+    FolderCatalogEntry,
     ReducedPage,
     StoredContributionRecord,
+    TaxonomyContext,
+    TaxonomyDecision,
+    TaxonomyOutput,
+    TaxonomyRequest,
     WikiWorkerOptions,
 )
 from app.wiki.ingest.store import (
@@ -40,6 +47,8 @@ CLAIM_TOKEN = UUID("99999999-9999-9999-9999-999999999999")
 OP_A = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 OP_B = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 OP_C = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+FOLDER_ROOT = UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
+FOLDER_CHILD = UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
 SCOPE = WikiScope(tenant_id=1, knowledge_base_id=KB_ID, actor_id="worker")
 NOW = datetime(2026, 7, 17, tzinfo=UTC)
 
@@ -147,7 +156,8 @@ def fake_dataset(
     omitted_merges = omitted_merges or set()
     short_knowledge = short_knowledge or set()
     all_concepts = {slug for slugs in concepts_by_knowledge.values() for slug in slugs}
-    merge_slugs = ({"entity/shared"} if include_shared else set()) | all_concepts
+    taxonomy_slugs = ({"entity/shared"} if include_shared else set()) | all_concepts
+    merge_slugs = set(taxonomy_slugs)
     merge_slugs -= omitted_merges
     if not merge_slugs:
         # The shared fake schema intentionally requires at least one merge response.
@@ -226,6 +236,25 @@ def fake_dataset(
                     }
                     for slug in sorted(merge_slugs)
                 },
+                "taxonomies": {
+                    ",".join(batch): {
+                        "decisions": [
+                            {
+                                "slug": slug,
+                                "base_folder_id": None,
+                                "new_segments": [],
+                            }
+                            for slug in batch
+                        ]
+                    }
+                    for batch_size in range(1, min(60, len(taxonomy_slugs)) + 1)
+                    for start in range(0, len(taxonomy_slugs), batch_size)
+                    if (
+                        batch := tuple(sorted(taxonomy_slugs))[
+                            start : start + batch_size
+                        ]
+                    )
+                },
             },
             "transient_failures": transient_failures or {},
         }
@@ -273,6 +302,9 @@ class WorkerStore:
         conflict: bool = False,
         claim_lost: bool = False,
         apply_outcome: BatchApplyOutcome | None = None,
+        folders: tuple[FolderCatalogEntry, ...] = (),
+        classifiable_slugs: tuple[str, ...] = (),
+        events: list[str] | None = None,
     ) -> None:
         self.records = list(records)
         self.existing = existing or {}
@@ -281,8 +313,12 @@ class WorkerStore:
         self.conflict = conflict
         self.claim_lost = claim_lost
         self.apply_outcome = apply_outcome
+        self.folders = folders
+        self.classifiable_slugs = classifiable_slugs
+        self.events = events
         self.claim_calls: list[tuple[WikiScope, int, int]] = []
         self.find_calls: list[tuple[str, ...]] = []
+        self.taxonomy_context_calls: list[tuple[str, ...]] = []
         self.contribution_calls: list[tuple[str, str]] = []
         self.apply_calls: list[BatchApplyRequest] = []
         self.bool_apply_calls = 0
@@ -307,13 +343,35 @@ class WorkerStore:
         assert scope == SCOPE
         ordered = tuple(slugs)
         self.find_calls.append(ordered)
+        if self.events is not None:
+            self.events.append("existing")
         return {slug: self.existing[slug] for slug in ordered if slug in self.existing}
+
+    async def load_taxonomy_context(
+        self, scope: WikiScope, slugs: list[str]
+    ) -> TaxonomyContext:
+        assert scope == SCOPE
+        ordered = tuple(slugs)
+        self.taxonomy_context_calls.append(ordered)
+        if self.events is not None:
+            self.events.append("taxonomy-context")
+        requested = set(ordered)
+        return TaxonomyContext(
+            folders=self.folders,
+            classifiable_slugs=tuple(
+                slug
+                for slug in self.classifiable_slugs
+                if slug in requested and slug not in self.existing
+            ),
+        )
 
     async def list_source_contributions(
         self, scope: WikiScope, knowledge_id: str, *, state: str
     ) -> list[StoredContributionRecord]:
         assert scope == SCOPE
         self.contribution_calls.append((knowledge_id, state))
+        if self.events is not None:
+            self.events.append(f"contributions:{state}")
         return [
             item
             for item in self.contributions
@@ -382,6 +440,98 @@ class FakeTombstones:
         return threshold is not None and self.calls[knowledge_id] >= threshold
 
 
+class NeverEmbedding:
+    async def embed(self, request: EmbeddingRequest) -> EmbeddingOutput:
+        raise AssertionError(f"embedding 不应被调用: {request}")
+
+
+class FailingEmbedding:
+    def __init__(self, transient_failures: int = 0) -> None:
+        self.transient_failures = transient_failures
+        self.calls = 0
+
+    async def embed(self, request: EmbeddingRequest) -> EmbeddingOutput:
+        self.calls += 1
+        if self.calls <= self.transient_failures:
+            raise TransientModelError("embedding transient")
+        return EmbeddingOutput(
+            vectors={
+                item.key: (1.0, 0.0) if item.key.startswith("topic:") else (0.9, 0.1)
+                for item in request.items
+            }
+        )
+
+
+class OrderedTaxonomyModel(FakeChatModel):
+    def __init__(
+        self,
+        dataset: FakeDataset,
+        *,
+        events: list[str] | None = None,
+        permanent_batches: set[str] | None = None,
+        transient_batches: dict[str, int] | None = None,
+        block_taxonomy: bool = False,
+        started_target: int = 2,
+    ) -> None:
+        super().__init__(dataset)
+        self.events = events
+        self.permanent_batches = permanent_batches or set()
+        self.transient_batches = transient_batches or {}
+        self.block_taxonomy = block_taxonomy
+        self.started_target = started_target
+        self.taxonomy_active = 0
+        self.taxonomy_maximum = 0
+        self.taxonomy_started = asyncio.Event()
+        self.release_taxonomy = asyncio.Event()
+
+    async def extract_candidates(self, *args, **kwargs):
+        if self.events is not None:
+            self.events.append("map")
+        return await super().extract_candidates(*args, **kwargs)
+
+    async def merge_page(self, request):
+        if self.events is not None:
+            self.events.append("reduce")
+        return await super().merge_page(request)
+
+    async def plan_folders(self, request: TaxonomyRequest) -> TaxonomyOutput:
+        snapshot = TaxonomyRequest.model_validate(request.model_dump(mode="python"))
+        self.taxonomy_requests.append(snapshot)
+        batch_key = ",".join(topic.slug for topic in snapshot.topics)
+        self.calls.append(f"taxonomy:{batch_key}")
+        if self.events is not None:
+            self.events.append("taxonomy")
+
+        remaining = self.transient_batches.get(batch_key, 0)
+        if remaining:
+            self.transient_batches[batch_key] = remaining - 1
+            raise TransientModelError("taxonomy transient")
+        if batch_key in self.permanent_batches:
+            raise PermanentModelError("taxonomy permanent")
+
+        self.taxonomy_active += 1
+        self.taxonomy_maximum = max(self.taxonomy_maximum, self.taxonomy_active)
+        if self.taxonomy_active >= self.started_target:
+            self.taxonomy_started.set()
+        try:
+            if self.block_taxonomy:
+                await self.release_taxonomy.wait()
+            base_folder_id = (
+                snapshot.allowed_bases[0].id if snapshot.allowed_bases else None
+            )
+            return TaxonomyOutput(
+                decisions=tuple(
+                    TaxonomyDecision(
+                        slug=topic.slug,
+                        base_folder_id=base_folder_id,
+                    )
+                    for topic in snapshot.topics
+                )
+            )
+        finally:
+            self.taxonomy_active -= 1
+
+
 def contribution(
     knowledge_id: str,
     slug: str,
@@ -413,6 +563,7 @@ def worker(
     options: WikiWorkerOptions | None = None,
     waits: list[int] | None = None,
     tombstones: FakeTombstones | None = None,
+    embedding_model: object | None = None,
 ) -> WikiIngestWorker:
     async def retry_wait(seconds: int) -> None:
         assert waits is not None
@@ -423,6 +574,7 @@ def worker(
         locks=FakeLocks(FakeLease() if lease is None else lease),
         source=source,
         model=model,
+        embedding_model=embedding_model or NeverEmbedding(),
         tombstones=tombstones or FakeTombstones(),
         options=options,
         retry_wait=retry_wait if waits is not None else None,
@@ -592,8 +744,11 @@ async def test_map_tombstone_result_is_superseded_without_failure_or_delta() -> 
 @pytest.mark.asyncio
 async def test_precommit_tombstone_supersedes_and_rereduces_shared_slug() -> None:
     dataset = fake_dataset()
-    model = FakeChatModel(dataset)
-    store = WorkerStore([pending_op(OP_A, "doc-a"), pending_op(OP_B, "doc-b")])
+    model = OrderedTaxonomyModel(dataset)
+    store = WorkerStore(
+        [pending_op(OP_A, "doc-a"), pending_op(OP_B, "doc-b")],
+        classifiable_slugs=("entity/shared",),
+    )
 
     result = await worker(
         store,
@@ -618,6 +773,13 @@ async def test_precommit_tombstone_supersedes_and_rereduces_shared_slug() -> Non
         "summary/doc-b",
         "entity/shared",
     }
+    shared_taxonomy = [
+        taxonomy_request.topics[0]
+        for taxonomy_request in model.taxonomy_requests
+        if [topic.slug for topic in taxonomy_request.topics] == ["entity/shared"]
+    ]
+    assert len(shared_taxonomy) == 2
+    assert request.folder_assignments[0].contributor_op_ids == (OP_B,)
 
 
 @pytest.mark.asyncio
@@ -675,6 +837,7 @@ async def test_unavailable_lock_distinguishes_empty_and_busy_batches(
         locks=FakeLocks(None),
         source=source,
         model=model,
+        embedding_model=NeverEmbedding(),
     )
 
     if busy:
@@ -798,9 +961,12 @@ async def test_reduce_failure_removes_contributor_and_rereduces_mixed_slug() -> 
         concepts_by_knowledge={"doc-a": ("concept/alpha",)},
         omitted_merges={"concept/alpha"},
     )
-    store = WorkerStore([pending_op(OP_A, "doc-a"), pending_op(OP_B, "doc-b")])
+    store = WorkerStore(
+        [pending_op(OP_A, "doc-a"), pending_op(OP_B, "doc-b")],
+        classifiable_slugs=("concept/alpha", "entity/shared"),
+    )
     waits: list[int] = []
-    model = FakeChatModel(dataset)
+    model = OrderedTaxonomyModel(dataset)
 
     result = await worker(
         store, FakeKnowledgeSource(dataset), model, waits=waits
@@ -813,7 +979,7 @@ async def test_reduce_failure_removes_contributor_and_rereduces_mixed_slug() -> 
     shared_requests = [
         request for request in model.merge_requests if request.slug == "entity/shared"
     ]
-    assert len(shared_requests) == 2
+    assert len(shared_requests) >= 2
     assert [
         contribution.knowledge_id for contribution in shared_requests[-1].contributions
     ] == ["doc-b"]
@@ -824,6 +990,261 @@ async def test_reduce_failure_removes_contributor_and_rereduces_mixed_slug() -> 
         "summary/doc-b",
         "entity/shared",
     }
+    taxonomy_topics = [
+        tuple(topic.slug for topic in request.topics)
+        for request in model.taxonomy_requests
+    ]
+    assert taxonomy_topics == [
+        ("concept/alpha", "entity/shared"),
+        ("entity/shared",),
+    ]
+    assert store.apply_calls[0].folder_assignments[0].contributor_op_ids == (OP_B,)
+
+
+@pytest.mark.asyncio
+async def test_taxonomy_runs_after_map_context_and_before_reduce_and_commits_assignment() -> (
+    None
+):
+    events: list[str] = []
+    dataset = fake_dataset(
+        ("doc-a",),
+        concepts_by_knowledge={"doc-a": ("concept/alpha",)},
+        include_shared=False,
+    )
+    model = OrderedTaxonomyModel(dataset, events=events)
+    store = WorkerStore(
+        [pending_op(OP_A, "doc-a")],
+        classifiable_slugs=("concept/alpha",),
+        events=events,
+    )
+
+    result = await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
+
+    assert result.completed_op_ids == (OP_A,)
+    assert len(store.taxonomy_context_calls) == 1
+    assert set(store.taxonomy_context_calls[0]) == {
+        "summary/doc-a",
+        "concept/alpha",
+    }
+    assert events.index("map") < events.index("existing")
+    assert events.index("contributions:active") < events.index("taxonomy-context")
+    assert events.index("taxonomy-context") < events.index("taxonomy")
+    assert events.index("taxonomy") < events.index("reduce")
+    assignment = store.apply_calls[0].folder_assignments[0]
+    assert assignment.slug == "concept/alpha"
+    assert assignment.contributor_op_ids == (OP_A,)
+
+
+@pytest.mark.asyncio
+async def test_existing_topic_is_not_classified_and_empty_catalog_skips_embedding() -> (
+    None
+):
+    dataset = fake_dataset(
+        ("doc-a",),
+        concepts_by_knowledge={"doc-a": ("concept/alpha",)},
+        include_shared=False,
+    )
+    existing = ExistingPageRecord(
+        page_id=uuid4(),
+        version=1,
+        page=ReducedPage(
+            slug="concept/alpha",
+            title="Alpha",
+            page_type="concept",
+            content="Body",
+            summary="Summary",
+            source_refs=("doc-z",),
+        ),
+    )
+    model = OrderedTaxonomyModel(dataset)
+    store = WorkerStore(
+        [pending_op(OP_A, "doc-a")],
+        existing={"concept/alpha": existing},
+        contributions=[contribution("doc-z", "concept/alpha")],
+        classifiable_slugs=("concept/alpha",),
+    )
+
+    result = await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
+
+    assert result.completed_op_ids == (OP_A,)
+    assert model.taxonomy_requests == []
+    assert store.apply_calls[0].folder_assignments == ()
+
+
+@pytest.mark.asyncio
+async def test_taxonomy_batch_failure_isolates_only_contributing_operation() -> None:
+    dataset = fake_dataset(
+        concepts_by_knowledge={
+            "doc-a": ("concept/alpha",),
+            "doc-b": ("concept/beta",),
+        },
+        include_shared=False,
+    )
+    model = OrderedTaxonomyModel(
+        dataset,
+        permanent_batches={"concept/alpha"},
+    )
+    store = WorkerStore(
+        [pending_op(OP_A, "doc-a"), pending_op(OP_B, "doc-b")],
+        classifiable_slugs=("concept/alpha", "concept/beta"),
+    )
+
+    result = await worker(
+        store,
+        FakeKnowledgeSource(dataset),
+        model,
+        options=WikiWorkerOptions(taxonomy_topic_batch_size=1),
+    ).run_batch(SCOPE)
+
+    assert result.completed_op_ids == (OP_B,)
+    assert result.failed_op_ids == (OP_A,)
+    assert [item.slug for item in store.apply_calls[0].folder_assignments] == [
+        "concept/beta"
+    ]
+    assert store.apply_calls[0].failures[0].error_code == "MODEL_PERMANENT"
+
+
+@pytest.mark.asyncio
+async def test_embedding_and_taxonomy_transient_failures_retry_with_existing_backoff() -> (
+    None
+):
+    dataset = fake_dataset(
+        ("doc-a",),
+        concepts_by_knowledge={"doc-a": ("concept/alpha",)},
+        include_shared=False,
+    )
+    folders = (
+        FolderCatalogEntry(
+            id=FOLDER_ROOT,
+            name="Root",
+            path="/Root",
+            depth=1,
+        ),
+        FolderCatalogEntry(
+            id=FOLDER_CHILD,
+            parent_id=FOLDER_ROOT,
+            name="Child",
+            path="/Root/Child",
+            depth=2,
+        ),
+    )
+    embedding = FailingEmbedding(transient_failures=2)
+    model = OrderedTaxonomyModel(
+        dataset,
+        transient_batches={"concept/alpha": 2},
+    )
+    waits: list[int] = []
+    store = WorkerStore(
+        [pending_op(OP_A, "doc-a")],
+        folders=folders,
+        classifiable_slugs=("concept/alpha",),
+    )
+
+    result = await worker(
+        store,
+        FakeKnowledgeSource(dataset),
+        model,
+        embedding_model=embedding,
+        waits=waits,
+        options=WikiWorkerOptions(taxonomy_full_catalog_limit=1),
+    ).run_batch(SCOPE)
+
+    assert result.completed_op_ids == (OP_A,)
+    assert embedding.calls == 3
+    assert model.calls.count("taxonomy:concept/alpha") == 3
+    assert waits == [2, 4, 2, 4]
+
+
+@pytest.mark.asyncio
+async def test_sixty_one_topics_use_configured_batches_and_bounded_parallelism() -> (
+    None
+):
+    slugs = tuple(f"concept/topic-{index:02d}" for index in range(61))
+    dataset = fake_dataset(
+        ("doc-a",),
+        concepts_by_knowledge={"doc-a": slugs},
+        include_shared=False,
+    )
+    model = OrderedTaxonomyModel(dataset, block_taxonomy=True, started_target=2)
+    store = WorkerStore(
+        [pending_op(OP_A, "doc-a")],
+        classifiable_slugs=slugs,
+    )
+    task = asyncio.create_task(
+        worker(
+            store,
+            FakeKnowledgeSource(dataset),
+            model,
+            options=WikiWorkerOptions(
+                taxonomy_topic_batch_size=20,
+                taxonomy_parallel=2,
+            ),
+        ).run_batch(SCOPE)
+    )
+    await asyncio.wait_for(model.taxonomy_started.wait(), timeout=1)
+
+    assert model.taxonomy_maximum == 2
+    model.release_taxonomy.set()
+    result = await asyncio.wait_for(task, timeout=5)
+
+    assert result.completed_op_ids == (OP_A,)
+    assert [len(request.topics) for request in model.taxonomy_requests] == [
+        20,
+        20,
+        20,
+        1,
+    ]
+    assert len(store.apply_calls[0].folder_assignments) == 61
+
+
+@pytest.mark.asyncio
+async def test_taxonomy_child_cancellation_cleans_sibling_and_releases_claim() -> None:
+    dataset = fake_dataset(
+        concepts_by_knowledge={
+            "doc-a": ("concept/alpha",),
+            "doc-b": ("concept/beta",),
+        },
+        include_shared=False,
+    )
+
+    class CancellingTaxonomyModel(OrderedTaxonomyModel):
+        def __init__(self) -> None:
+            super().__init__(dataset)
+            self.sibling_started = asyncio.Event()
+            self.sibling_cleaned = asyncio.Event()
+
+        async def plan_folders(self, request: TaxonomyRequest) -> TaxonomyOutput:
+            slug = request.topics[0].slug
+            if slug == "concept/alpha":
+                await self.sibling_started.wait()
+                raise asyncio.CancelledError
+            self.sibling_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.sibling_cleaned.set()
+            raise AssertionError("unreachable")
+
+    model = CancellingTaxonomyModel()
+    store = WorkerStore(
+        [pending_op(OP_A, "doc-a"), pending_op(OP_B, "doc-b")],
+        classifiable_slugs=("concept/alpha", "concept/beta"),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker(
+            store,
+            FakeKnowledgeSource(dataset),
+            model,
+            options=WikiWorkerOptions(
+                taxonomy_topic_batch_size=1,
+                taxonomy_parallel=2,
+            ),
+        ).run_batch(SCOPE)
+
+    assert model.sibling_cleaned.is_set()
+    assert store.apply_calls == []
+    assert store.release_calls == [(SCOPE, [OP_A, OP_B], CLAIM_TOKEN)]
 
 
 @pytest.mark.asyncio
@@ -1235,7 +1656,9 @@ async def test_parent_cancellation_during_claim_lost_release_takes_precedence() 
 
 
 @pytest.mark.asyncio
-async def test_same_turn_conflict_release_and_parent_cancellation_prefers_cancel() -> None:
+async def test_same_turn_conflict_release_and_parent_cancellation_prefers_cancel() -> (
+    None
+):
     dataset = fake_dataset(("doc-a",))
 
     class BarrierReleaseStore(WorkerStore):
@@ -1273,7 +1696,9 @@ async def test_same_turn_conflict_release_and_parent_cancellation_prefers_cancel
 
 
 @pytest.mark.asyncio
-async def test_same_turn_claim_lost_release_and_parent_cancellation_prefers_cancel() -> None:
+async def test_same_turn_claim_lost_release_and_parent_cancellation_prefers_cancel() -> (
+    None
+):
     dataset = fake_dataset(("doc-a",))
 
     class BarrierReleaseStore(WorkerStore):

@@ -20,6 +20,7 @@ from app.wiki.ingest.errors import WikiBatchBusy
 from app.wiki.ingest.map_document import map_document
 from app.wiki.ingest.ports import (
     ChatModelPort,
+    EmbeddingModelPort,
     KnowledgeSourcePort,
     PermanentModelError,
     TombstonePort,
@@ -31,11 +32,13 @@ from app.wiki.ingest.schemas import (
     BatchApplyRequest,
     BatchResult,
     ContributionDelta,
+    FolderAssignment,
     MapDocumentResult,
     OperationFailure,
     PageExpectation,
     ReducedPage,
     StoredContributionRecord,
+    TaxonomyContext,
     WikiWorkerOptions,
 )
 from app.wiki.ingest.store import (
@@ -44,6 +47,13 @@ from app.wiki.ingest.store import (
     IngestStoreError,
     PageConflict,
     PendingOpRecord,
+)
+from app.wiki.ingest.taxonomy import (
+    build_folder_assignment,
+    build_taxonomy_requests,
+    build_taxonomy_work_items,
+    recover_taxonomy_output,
+    select_allowed_bases,
 )
 from app.wiki.scope import WikiScope
 from app.wiki.tasks.locks import LockLease, LockOwnershipLost, WikiLockManager
@@ -117,6 +127,7 @@ class WikiIngestWorker:
         locks: WikiLockManager,
         source: KnowledgeSourcePort,
         model: ChatModelPort,
+        embedding_model: EmbeddingModelPort,
         tombstones: TombstonePort | None = None,
         options: WikiWorkerOptions | None = None,
         retry_wait: _RetryWait | None = None,
@@ -125,6 +136,7 @@ class WikiIngestWorker:
         self._locks = locks
         self._source = source
         self._model = model
+        self._embedding_model = embedding_model
         self._tombstones = (
             tombstones if tombstones is not None else _NeverDeletedTombstones()
         )
@@ -200,7 +212,15 @@ class WikiIngestWorker:
         active_by_slug = await self._load_active_contributions(
             scope, initial_deltas, existing_pages
         )
+        taxonomy_context = await self._store.load_taxonomy_context(scope, slugs)
         while True:
+            excluded_before = {*failures, *superseded}
+            folder_assignments = await self._plan_folder_assignments(
+                initial_deltas,
+                taxonomy_context,
+                failures,
+                superseded,
+            )
             pages = await self._stabilize_pages(
                 initial_deltas,
                 existing_pages,
@@ -208,10 +228,8 @@ class WikiIngestWorker:
                 failures,
                 superseded,
             )
-            newly_excluded = await self._precommit_ingest_checks(
-                scope, records, failures, superseded
-            )
-            if not newly_excluded:
+            await self._precommit_ingest_checks(scope, records, failures, superseded)
+            if excluded_before == {*failures, *superseded}:
                 break
 
         failed_ids = [record.id for record in records if record.id in failures]
@@ -241,6 +259,7 @@ class WikiIngestWorker:
                 NAMESPACE_URL,
                 f"wiki:{scope.knowledge_base_id}:{claim_token}",
             ),
+            folder_assignments=tuple(folder_assignments),
         )
         await lease.assert_owned()
         outcome = await self._store.apply_results_with_outcome(scope, request)
@@ -359,6 +378,86 @@ class WikiIngestWorker:
                 if record.slug in affected:
                     active_by_slug[record.slug].append(record)
         return active_by_slug
+
+    async def _plan_folder_assignments(
+        self,
+        deltas: Sequence[ContributionDelta],
+        context: TaxonomyContext,
+        failures: dict[UUID, OperationFailure],
+        superseded: set[UUID],
+    ) -> list[FolderAssignment]:
+        excluded = {*failures, *superseded}
+        work_items = build_taxonomy_work_items(
+            (delta for delta in deltas if delta.pending_op_id not in excluded),
+            classifiable_slugs=context.classifiable_slugs,
+        )
+        if not work_items:
+            return []
+
+        try:
+            allowed_bases = await self._retry_model(
+                lambda: select_allowed_bases(
+                    (item.topic for item in work_items),
+                    context.folders,
+                    self._embedding_model,
+                    full_catalog_limit=self._options.taxonomy_full_catalog_limit,
+                    related_limit=self._options.taxonomy_related_folder_limit,
+                )
+            )
+        except Exception as error:
+            if self._is_control_error(error):
+                raise
+            self._fail_taxonomy_work_items(work_items, error, failures)
+            return []
+
+        requests = build_taxonomy_requests(
+            work_items,
+            allowed_bases,
+            batch_size=self._options.taxonomy_topic_batch_size,
+        )
+        semaphore = asyncio.Semaphore(self._options.taxonomy_parallel)
+
+        async def run(request):
+            async with semaphore:
+                try:
+                    output = await self._retry_model(
+                        lambda: self._model.plan_folders(request)  # type: ignore[attr-defined]
+                    )
+                    return recover_taxonomy_output(request, output), None
+                except Exception as error:
+                    if self._is_control_error(error):
+                        raise
+                    return None, error
+
+        outcomes = await _gather_with_cleanup(*(run(request) for request in requests))
+        work_by_slug = {item.topic.slug: item for item in work_items}
+        allowed_by_id = {base.id: base for base in allowed_bases}
+        assignments: list[FolderAssignment] = []
+        for request, (decisions, error) in zip(requests, outcomes, strict=True):
+            batch_items = tuple(work_by_slug[topic.slug] for topic in request.topics)
+            if error is not None:
+                self._fail_taxonomy_work_items(batch_items, error, failures)
+                continue
+            assert decisions is not None
+            assignments.extend(
+                build_folder_assignment(
+                    work_by_slug[topic.slug],
+                    decisions[topic.slug],
+                    allowed_by_id,
+                )
+                for topic in request.topics
+            )
+        return assignments
+
+    @staticmethod
+    def _fail_taxonomy_work_items(
+        work_items,
+        error: Exception,
+        failures: dict[UUID, OperationFailure],
+    ) -> None:
+        for item in work_items:
+            for op_id in item.contributor_op_ids:
+                failures.setdefault(op_id, operation_failure(op_id, error))
 
     async def _stabilize_pages(
         self,
