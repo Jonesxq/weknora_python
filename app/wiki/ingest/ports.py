@@ -13,11 +13,15 @@ from app.wiki.ingest.schemas import (
     DedupOutput,
     DedupRequest,
     DocumentSummary,
+    EmbeddingOutput,
+    EmbeddingRequest,
     FinalizationRequest,
     PageMergeOutput,
     PageMergeRequest,
     SourceChunk,
     SourceKnowledge,
+    TaxonomyOutput,
+    TaxonomyRequest,
     WikiIngestConfig,
 )
 from app.wiki.scope import WikiScope
@@ -70,7 +74,19 @@ class DedupModelPort(Protocol):
 
 
 @runtime_checkable
-class WikiIngestModelPort(ChatModelPort, CitationModelPort, DedupModelPort, Protocol):
+class EmbeddingModelPort(Protocol):
+    async def embed(self, request: EmbeddingRequest) -> EmbeddingOutput: ...
+
+
+@runtime_checkable
+class TaxonomyModelPort(Protocol):
+    async def plan_folders(self, request: TaxonomyRequest) -> TaxonomyOutput: ...
+
+
+@runtime_checkable
+class WikiIngestModelPort(
+    ChatModelPort, CitationModelPort, DedupModelPort, TaxonomyModelPort, Protocol
+):
     pass
 
 

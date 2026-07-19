@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
 from pathlib import Path
 from uuid import UUID
@@ -8,15 +9,24 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from app.wiki.ingest.fakes import FakeChatModel, FakeDataset, FakeKnowledgeSource, load_fake_adapters
+from app.wiki.ingest.fakes import (
+    FakeChatModel,
+    FakeDataset,
+    FakeEmbeddingModel,
+    FakeKnowledgeSource,
+    load_fake_adapters,
+    load_fake_runtime_adapters,
+)
 from app.wiki.ingest.ports import (
     ChatModelPort,
     CitationModelPort,
     DedupModelPort,
+    EmbeddingModelPort,
     KnowledgeSourcePort,
     PermanentModelError,
     TransientModelError,
     TombstonePort,
+    TaxonomyModelPort,
     WikiIngestModelPort,
 )
 from app.wiki.ingest.schemas import (
@@ -26,9 +36,13 @@ from app.wiki.ingest.schemas import (
     DedupCandidateRequest,
     DedupPageCandidate,
     DedupRequest,
+    EmbeddingItem,
+    EmbeddingRequest,
     PageContribution,
     PageMergeRequest,
     TopicCandidate,
+    TaxonomyRequest,
+    TaxonomyTopic,
     WikiIngestConfig,
 )
 from app.wiki.scope import WikiScope
@@ -129,6 +143,173 @@ def merge_request(slug: str = "entity/acme") -> PageMergeRequest:
             )
         ],
     )
+
+
+def taxonomy_request(*slugs: str) -> TaxonomyRequest:
+    return TaxonomyRequest(
+        topics=tuple(
+            TaxonomyTopic(
+                slug=slug,
+                title=slug.rsplit("/", 1)[-1].title(),
+                page_type=slug.split("/", 1)[0],
+                summary="Summary",
+            )
+            for slug in slugs
+        ),
+        allowed_bases=(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_fake_embedding_returns_exact_requested_vectors() -> None:
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["embeddings"] = {
+        "topic:entity/acme": (1.0, 0.0),
+        "folder:00000000-0000-0000-0000-000000000001": (0.5, 0.5),
+    }
+    dataset = FakeDataset.model_validate(payload)
+    model = FakeEmbeddingModel(dataset)
+    request = EmbeddingRequest(items=(EmbeddingItem(key="topic:entity/acme", text="Acme"),))
+
+    output = await model.embed(request)
+
+    assert output.vectors == {"topic:entity/acme": (1.0, 0.0)}
+    assert model.calls == ["embedding:topic:entity/acme"]
+
+
+@pytest.mark.asyncio
+async def test_fake_taxonomy_requires_explicit_batch_response() -> None:
+    model = FakeChatModel(FakeDataset.model_validate(deepcopy(FIXTURE)))
+    request = taxonomy_request("entity/acme")
+
+    with pytest.raises(PermanentModelError, match="taxonomy:entity/acme"):
+        await model.plan_folders(request)
+
+
+@pytest.mark.asyncio
+async def test_fake_embedding_transient_failure_uses_existing_failure_counter() -> None:
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["embeddings"] = {"topic:entity/acme": (1.0, 0.0)}
+    payload["transient_failures"]["embedding:topic:entity/acme"] = 1
+    dataset = FakeDataset.model_validate(payload)
+    model = FakeEmbeddingModel(dataset)
+    request = EmbeddingRequest(items=(EmbeddingItem(key="topic:entity/acme", text="Acme"),))
+
+    with pytest.raises(TransientModelError):
+        await model.embed(request)
+    assert (await model.embed(request)).vectors["topic:entity/acme"] == (1.0, 0.0)
+
+
+def test_embedding_and_taxonomy_ports_are_runtime_checkable() -> None:
+    class IncompleteModel:
+        pass
+
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["embeddings"] = {"topic:entity/acme": (1.0, 0.0)}
+    payload["model_responses"]["taxonomies"] = {
+        "entity/acme": {"decisions": [{"slug": "entity/acme"}]}
+    }
+    dataset = FakeDataset.model_validate(payload)
+
+    assert isinstance(FakeEmbeddingModel(dataset), EmbeddingModelPort)
+    assert isinstance(FakeChatModel(dataset), TaxonomyModelPort)
+    assert isinstance(FakeChatModel(dataset), WikiIngestModelPort)
+    assert not isinstance(IncompleteModel(), EmbeddingModelPort)
+    assert not isinstance(IncompleteModel(), TaxonomyModelPort)
+
+
+@pytest.mark.asyncio
+async def test_fake_embedding_missing_vectors_and_mutations_are_isolated() -> None:
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["embeddings"] = {"topic:entity/acme": (1.0, 0.0)}
+    model = FakeEmbeddingModel(FakeDataset.model_validate(payload))
+    missing = EmbeddingRequest(items=(EmbeddingItem(key="topic:entity/missing", text="Missing"),))
+    request = EmbeddingRequest(items=(EmbeddingItem(key="topic:entity/acme", text="Acme"),))
+
+    with pytest.raises(PermanentModelError, match="embedding:topic:entity/missing"):
+        await model.embed(missing)
+    output = await model.embed(request)
+
+    assert model.requests[1] is not request
+    assert tuple(output.vectors) == ("topic:entity/acme",)
+    with pytest.raises(TypeError):
+        output.vectors["topic:entity/acme"] = (0.0, 1.0)  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_fake_taxonomy_returns_snapshot_and_retries_exactly() -> None:
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["taxonomies"] = {
+        "concept/retrieval,entity/acme": {
+            "decisions": [
+                {"slug": "concept/retrieval", "new_segments": ["Research"]},
+                {"slug": "entity/acme", "new_segments": ["Organizations"]},
+            ]
+        }
+    }
+    payload["transient_failures"]["taxonomy:concept/retrieval,entity/acme"] = 1
+    model = FakeChatModel(FakeDataset.model_validate(payload))
+    request = taxonomy_request("concept/retrieval", "entity/acme")
+
+    with pytest.raises(TransientModelError, match="taxonomy:concept/retrieval,entity/acme"):
+        await model.plan_folders(request)
+    output = await model.plan_folders(request)
+
+    assert [decision.slug for decision in output.decisions] == ["concept/retrieval", "entity/acme"]
+    assert model.taxonomy_requests[0] is not request
+    with pytest.raises(ValidationError):
+        output.decisions = ()
+
+
+@pytest.mark.parametrize(
+    ("embeddings", "taxonomies", "failures"),
+    [
+        ({" topic:entity/acme ": (1.0, 0.0)}, {}, {}),
+        ({"topic:entity/acme": (1.0, 0.0), " topic:entity/acme ": (0.0, 1.0)}, {}, {}),
+        ({"topic:entity/acme,other": (1.0, 0.0)}, {}, {}),
+        ({"topic:entity/acme": ()}, {}, {}),
+        ({"topic:entity/acme": (1.0,), "folder:x": (1.0, 0.0)}, {}, {}),
+        ({"topic:entity/acme": (float("nan"), 0.0)}, {}, {}),
+        ({"topic:entity/acme": (1.0, 0.0)}, {}, {"embedding:topic:entity/missing": 1}),
+        ({"topic:entity/acme": (1.0, 0.0)}, {}, {"embedding:topic:entity/acme,topic:entity/acme": 1}),
+        ({}, {"entity/acme,concept/retrieval": {"decisions": []}}, {}),
+        ({}, {"entity/acme,entity/acme": {"decisions": []}}, {}),
+        ({}, {"entity/acme": {"decisions": [{"slug": "concept/retrieval"}]}}, {}),
+        ({}, {"entity/acme": {"decisions": []}}, {}),
+        ({}, {"concept/retrieval,entity/acme": {"decisions": [{"slug": "entity/acme"}, {"slug": "concept/retrieval"}]}}, {}),
+        ({}, {"entity/acme": {"decisions": [{"slug": "entity/acme"}]}}, {"taxonomy:concept/missing": 1}),
+    ],
+)
+def test_fixture_rejects_invalid_embedding_taxonomy_contracts(
+    embeddings: dict[str, tuple[float, ...]],
+    taxonomies: dict[str, dict],
+    failures: dict[str, int],
+) -> None:
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["embeddings"] = embeddings
+    payload["model_responses"]["taxonomies"] = taxonomies
+    payload["transient_failures"] = failures
+
+    with pytest.raises(ValidationError):
+        FakeDataset.model_validate(payload)
+
+
+def test_load_fake_runtime_adapters_preserves_legacy_shape_and_isolates_state(tmp_path: Path) -> None:
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["embeddings"] = {"topic:entity/acme": (1.0, 0.0)}
+    fixture = tmp_path / "wiki.json"
+    write_fixture(fixture, payload)
+
+    source, chat = load_fake_adapters(fixture)
+    runtime_source, runtime_chat, embedding = load_fake_runtime_adapters(fixture)
+
+    assert isinstance(source, FakeKnowledgeSource)
+    assert isinstance(chat, FakeChatModel)
+    assert isinstance(runtime_source, FakeKnowledgeSource)
+    assert isinstance(runtime_chat, FakeChatModel)
+    assert isinstance(embedding, FakeEmbeddingModel)
+    assert runtime_chat.calls == []
+    assert embedding.calls == []
 
 
 def test_load_fake_adapters_validates_fixture_and_protocols(tmp_path: Path) -> None:

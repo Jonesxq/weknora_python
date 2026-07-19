@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 import re
-from typing import Annotated
+from typing import Annotated, Iterable, Mapping
 from uuid import UUID
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
@@ -18,12 +19,17 @@ from app.wiki.ingest.schemas import (
     DedupOutput,
     DedupRequest,
     DocumentSummary,
+    EmbeddingOutput,
+    EmbeddingRequest,
     PageMergeOutput,
     PageMergeRequest,
     SourceChunk,
     SourceKnowledge,
+    TaxonomyOutput,
+    TaxonomyRequest,
     WikiIngestConfig,
     _StrictModel,
+    _normalize_embedding_key,
     _normalize_slug,
 )
 from app.wiki.scope import WikiScope
@@ -45,6 +51,18 @@ class _ModelResponses(_StrictModel):
     merges: dict[str, PageMergeOutput] = Field(min_length=1)
     citations: dict[str, list[CitationBatchOutput]] = Field(default_factory=dict)
     deduplications: dict[str, DedupDecision] = Field(default_factory=dict)
+    embeddings: dict[str, tuple[float, ...]] = Field(default_factory=dict)
+    taxonomies: dict[str, TaxonomyOutput] = Field(default_factory=dict)
+
+    @field_validator("embeddings", mode="before")
+    @classmethod
+    def validate_embedding_responses(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            raise ValueError("embeddings 响应必须是映射")
+        for raw_key in value:
+            if not isinstance(raw_key, str) or _normalize_embedding_key(raw_key) != raw_key:
+                raise ValueError("embeddings 响应键必须是非空规范 key")
+        return dict(EmbeddingOutput(vectors=value).vectors)
 
 
 FailureCount = Annotated[int, Field(ge=0)]
@@ -94,6 +112,15 @@ class FakeDataset(_StrictModel):
             normalized_slug = _normalize_slug(slug, ("entity", "concept"))
             if normalized_slug != slug or decision.candidate_slug != slug:
                 raise ValueError("deduplications 响应键必须是规范 slug 且等于 candidate_slug")
+        for batch_key, output in self.model_responses.taxonomies.items():
+            slugs = batch_key.split(",")
+            if not batch_key or any(not slug for slug in slugs):
+                raise ValueError("taxonomies 响应 batch key 不能为空")
+            normalized_slugs = [_normalize_slug(slug, ("entity", "concept")) for slug in slugs]
+            if normalized_slugs != slugs or slugs != sorted(slugs) or len(slugs) != len(set(slugs)):
+                raise ValueError("taxonomies 响应 batch key 必须是有序且唯一的规范 slug")
+            if [decision.slug for decision in output.decisions] != slugs:
+                raise ValueError("taxonomies 响应必须按 batch key 顺序完整覆盖 decisions")
         for key in self.transient_failures:
             prefix, _, suffix = key.partition(":")
             if prefix == "extract_candidates" and suffix not in knowledge_ids:
@@ -112,6 +139,16 @@ class FakeDataset(_StrictModel):
                     raise ValueError("citation 瞬时失败键必须引用已知 knowledge_id 和非负 batch")
             if prefix == "dedup" and suffix not in self.model_responses.deduplications:
                 raise ValueError("dedup 瞬时失败键包含未知 slug")
+            if prefix == "embedding":
+                vector_keys = suffix.split(",")
+                if (
+                    any(not vector_key for vector_key in vector_keys)
+                    or len(vector_keys) != len(set(vector_keys))
+                    or any(vector_key not in self.model_responses.embeddings for vector_key in vector_keys)
+                ):
+                    raise ValueError("embedding 瞬时失败键必须引用有序且唯一的已声明 vector key")
+            if prefix == "taxonomy" and suffix not in self.model_responses.taxonomies:
+                raise ValueError("taxonomy 瞬时失败键必须引用已声明 batch")
         return self
 
     @field_validator("transient_failures")
@@ -125,6 +162,8 @@ class FakeDataset(_StrictModel):
                 "merge",
                 "citation",
                 "dedup",
+                "embedding",
+                "taxonomy",
             }:
                 raise ValueError(f"不支持的 transient failure key: {key}")
             if prefix == "merge" and not (
@@ -139,6 +178,18 @@ class FakeDataset(_StrictModel):
                         raise ValueError
                 except ValueError as exc:
                     raise ValueError(f"dedup transient failure key 必须使用页面 slug: {key}") from exc
+            if prefix == "embedding":
+                vector_keys = suffix.split(",")
+                try:
+                    if (
+                        any(_normalize_embedding_key(vector_key) != vector_key for vector_key in vector_keys)
+                        or len(vector_keys) != len(set(vector_keys))
+                    ):
+                        raise ValueError
+                except ValueError as exc:
+                    raise ValueError(
+                        f"embedding transient failure key 必须使用有序且唯一的 vector key: {key}"
+                    ) from exc
         return value
 
 
@@ -203,12 +254,14 @@ class FakeChatModel:
             "merges": self._responses.merges,
             "citations": self._responses.citations,
             "deduplications": self._responses.deduplications,
+            "taxonomies": self._responses.taxonomies,
         }
         self._remaining_failures = dict(dataset.transient_failures)
         self.calls: list[str] = []
         self.merge_requests: list[PageMergeRequest] = []
         self.citation_requests: list[CitationBatchRequest] = []
         self.dedup_requests: list[DedupRequest] = []
+        self.taxonomy_requests: list[TaxonomyRequest] = []
 
     def _record_call(self, key: str) -> None:
         self.calls.append(key)
@@ -273,7 +326,54 @@ class FakeChatModel:
             decisions.append(decision.model_copy(deep=True))
         return DedupOutput(decisions=decisions)
 
+    async def plan_folders(self, request: TaxonomyRequest) -> TaxonomyOutput:
+        snapshot = TaxonomyRequest.model_validate(request.model_dump())
+        self.taxonomy_requests.append(snapshot)
+        key = f"taxonomy:{_batch_key(topic.slug for topic in snapshot.topics)}"
+        self._record_call(key)
+        response = self._responses.taxonomies.get(key.removeprefix("taxonomy:"))
+        if response is None:
+            raise PermanentModelError(f"缺少模型响应: {key}")
+        return response.model_copy(deep=True)
+
+
+def _batch_key(values: Iterable[str]) -> str:
+    return ",".join(values)
+
+
+class FakeEmbeddingModel:
+    def __init__(self, dataset: FakeDataset) -> None:
+        self._vectors = deepcopy(dataset.model_responses.embeddings)
+        self._remaining_failures = deepcopy(dataset.transient_failures)
+        self.calls: list[str] = []
+        self.requests: list[EmbeddingRequest] = []
+
+    def _record_call(self, key: str) -> None:
+        self.calls.append(key)
+        remaining = self._remaining_failures.get(key, 0)
+        if remaining > 0:
+            self._remaining_failures[key] = remaining - 1
+            raise TransientModelError(f"模型调用瞬时失败: {key}")
+
+    async def embed(self, request: EmbeddingRequest) -> EmbeddingOutput:
+        snapshot = EmbeddingRequest.model_validate(request.model_dump())
+        self.requests.append(snapshot)
+        keys = tuple(item.key for item in snapshot.items)
+        key = f"embedding:{_batch_key(keys)}"
+        self._record_call(key)
+        missing = [item_key for item_key in keys if item_key not in self._vectors]
+        if missing:
+            raise PermanentModelError(f"缺少模型响应: {key}")
+        return EmbeddingOutput(vectors={item_key: deepcopy(self._vectors[item_key]) for item_key in keys})
+
 
 def load_fake_adapters(path: str | Path) -> tuple[FakeKnowledgeSource, FakeChatModel]:
     dataset = FakeDataset.model_validate_json(Path(path).read_text(encoding="utf-8"))
     return FakeKnowledgeSource(dataset), FakeChatModel(dataset)
+
+
+def load_fake_runtime_adapters(
+    path: str | Path,
+) -> tuple[FakeKnowledgeSource, FakeChatModel, FakeEmbeddingModel]:
+    dataset = FakeDataset.model_validate_json(Path(path).read_text(encoding="utf-8"))
+    return FakeKnowledgeSource(dataset), FakeChatModel(dataset), FakeEmbeddingModel(dataset)
