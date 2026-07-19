@@ -19,12 +19,12 @@ from app.wiki.errors import WikiValidationError
 from app.wiki.ingest.errors import WikiBatchBusy
 from app.wiki.ingest.map_document import map_document
 from app.wiki.ingest.ports import (
-    ChatModelPort,
     EmbeddingModelPort,
     KnowledgeSourcePort,
     PermanentModelError,
     TombstonePort,
     TransientModelError,
+    WikiIngestModelPort,
 )
 from app.wiki.ingest.reduce_slug import reduce_slug
 from app.wiki.ingest.retract import plan_retract_deltas
@@ -126,7 +126,7 @@ class WikiIngestWorker:
         store: IngestStore,
         locks: WikiLockManager,
         source: KnowledgeSourcePort,
-        model: ChatModelPort,
+        model: WikiIngestModelPort,
         embedding_model: EmbeddingModelPort,
         tombstones: TombstonePort | None = None,
         options: WikiWorkerOptions | None = None,
@@ -212,7 +212,16 @@ class WikiIngestWorker:
         active_by_slug = await self._load_active_contributions(
             scope, initial_deltas, existing_pages
         )
-        taxonomy_context = await self._store.load_taxonomy_context(scope, slugs)
+        has_taxonomy_candidates = any(
+            delta.current is not None
+            and delta.current.page_type in ("entity", "concept")
+            for delta in initial_deltas
+        )
+        taxonomy_context = (
+            await self._store.load_taxonomy_context(scope, slugs)
+            if has_taxonomy_candidates
+            else TaxonomyContext()
+        )
         while True:
             excluded_before = {*failures, *superseded}
             folder_assignments = await self._plan_folder_assignments(
@@ -421,7 +430,7 @@ class WikiIngestWorker:
             async with semaphore:
                 try:
                     output = await self._retry_model(
-                        lambda: self._model.plan_folders(request)  # type: ignore[attr-defined]
+                        lambda: self._model.plan_folders(request)
                     )
                     return recover_taxonomy_output(request, output), None
                 except Exception as error:

@@ -4,6 +4,7 @@ import asyncio
 from collections import defaultdict
 from dataclasses import replace
 from datetime import UTC, datetime
+from typing import get_type_hints
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
@@ -14,7 +15,11 @@ from app.wiki.ingest import worker as worker_module
 from app.wiki.ingest.errors import WikiBatchBusy
 from app.wiki.ingest.enqueue import WikiEnqueueService
 from app.wiki.ingest.fakes import FakeChatModel, FakeDataset, FakeKnowledgeSource
-from app.wiki.ingest.ports import PermanentModelError, TransientModelError
+from app.wiki.ingest.ports import (
+    PermanentModelError,
+    TransientModelError,
+    WikiIngestModelPort,
+)
 from app.wiki.ingest.schemas import (
     BatchApplyOutcome,
     BatchApplyRequest,
@@ -76,6 +81,10 @@ def test_batch_result_uses_disjoint_frozen_operation_sets() -> None:
     ):
         with pytest.raises(ValidationError):
             BatchResult(**kwargs)
+
+
+def test_worker_model_dependency_uses_composite_ingest_protocol() -> None:
+    assert get_type_hints(WikiIngestWorker.__init__)["model"] is WikiIngestModelPort
 
 
 @pytest.mark.parametrize(
@@ -1341,6 +1350,19 @@ async def test_skipped_short_document_completes_without_pages() -> None:
     assert store.find_calls == [()]
     assert store.apply_calls[0].pages == ()
     assert model.calls == []
+
+
+@pytest.mark.asyncio
+async def test_summary_only_batch_skips_taxonomy_context() -> None:
+    dataset = fake_dataset(("doc-a",), include_shared=False)
+    model = FakeChatModel(dataset)
+    store = WorkerStore([pending_op(OP_A, "doc-a")])
+
+    result = await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
+
+    assert result.completed_op_ids == (OP_A,)
+    assert [page.slug for page in store.apply_calls[0].pages] == ["summary/doc-a"]
+    assert store.taxonomy_context_calls == []
 
 
 @pytest.mark.asyncio

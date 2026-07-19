@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from random import Random
 from typing import Any
 from uuid import uuid4
@@ -71,6 +73,29 @@ TEST_DATABASE_URL = os.getenv("GRAPH_TEST_POSTGRES_URL")
 POSTGRES_SKIP_REASON = (
     "未配置 GRAPH_TEST_POSTGRES_URL，不连接默认数据库或使用 SQLite 替代 PostgreSQL"
 )
+
+
+class NeverEmbedding:
+    async def embed(self, _request):
+        raise AssertionError("retract worker 不应调用 embedding")
+
+
+def test_postgres_worker_constructions_supply_embedding_model() -> None:
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    worker_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "WikiIngestWorker"
+    ]
+
+    assert len(worker_calls) == 3
+    assert [
+        node.lineno
+        for node in worker_calls
+        if not any(keyword.arg == "embedding_model" for keyword in node.keywords)
+    ] == []
 
 
 def _plan_nodes(value: object) -> list[dict[str, Any]]:
@@ -2955,6 +2980,7 @@ async def test_retract_worker_minimally_cleans_unique_and_shared_source_pages(
         locks=MemoryWikiLockManager(),
         source=NoReadSource(),  # type: ignore[arg-type]
         model=MergeModel(),  # type: ignore[arg-type]
+        embedding_model=NeverEmbedding(),
         options=WikiWorkerOptions(),
         retry_wait=lambda _seconds: asyncio.sleep(0),
     )
@@ -3062,6 +3088,7 @@ async def test_multiple_retract_versions_for_one_source_complete_in_one_batch(
         locks=MemoryWikiLockManager(),
         source=NoReadSource(),  # type: ignore[arg-type]
         model=NoMergeModel(),  # type: ignore[arg-type]
+        embedding_model=NeverEmbedding(),
         options=WikiWorkerOptions(),
     )
 
@@ -3180,6 +3207,7 @@ async def test_retract_worker_dead_letters_after_five_real_failed_batches(
         locks=MemoryWikiLockManager(),
         source=NoReadSource(),  # type: ignore[arg-type]
         model=model,  # type: ignore[arg-type]
+        embedding_model=NeverEmbedding(),
         options=WikiWorkerOptions(),
         retry_wait=lambda _seconds: asyncio.sleep(0),
     )
