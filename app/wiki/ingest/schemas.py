@@ -1033,8 +1033,8 @@ class FolderAssignment(_FrozenValueModel):
         if len(self.contributor_op_ids) != len(set(self.contributor_op_ids)):
             raise ValueError("folder assignment contributor op id 不能重复")
         root = self.base_folder_id is None
-        if root and (self.base_path not in (None, "") or self.base_depth != 0):
-            raise ValueError("根目录必须使用空或 None base_path 和 base_depth=0")
+        if root and (self.base_path is not None or self.base_depth != 0):
+            raise ValueError("根目录必须使用 None base_path 和 base_depth=0")
         if not root:
             if not self.base_path or self.base_depth == 0:
                 raise ValueError("既有目录必须同时提供 base id、path 和 depth")

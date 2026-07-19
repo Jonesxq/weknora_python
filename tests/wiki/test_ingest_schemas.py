@@ -332,6 +332,141 @@ def test_batch_apply_request_round_trips_folder_assignments() -> None:
     assert BatchApplyRequest.model_validate(request.model_dump()) == request
 
 
+def test_folder_assignment_root_identity_requires_none_base_path() -> None:
+    assignment = FolderAssignment(
+        slug="entity/acme",
+        contributor_op_ids=(uuid4(),),
+        base_folder_id=None,
+        base_path=None,
+        base_depth=0,
+    )
+
+    assert assignment.base_path is None
+    assert FolderAssignment.model_validate(assignment.model_dump()) == assignment
+    with pytest.raises(ValidationError):
+        FolderAssignment(
+            slug="entity/acme",
+            contributor_op_ids=(uuid4(),),
+            base_folder_id=None,
+            base_path="",
+            base_depth=0,
+        )
+
+
+def test_folder_name_limits_and_maximum_reachable_path() -> None:
+    max_name = "n" * 512
+    max_path = "/" + "/".join(("a" * 512, "b" * 512, "c" * 512))
+
+    assert FolderCatalogEntry(
+        id=uuid4(), parent_id=None, name=max_name, path=f"/{max_name}", depth=1
+    ).name == max_name
+    assert AllowedFolderBase(id=uuid4(), path=max_path, depth=3).path == max_path
+    with pytest.raises(ValidationError):
+        FolderCatalogEntry(
+            id=uuid4(), parent_id=None, name="n" * 513, path=f"/{'n' * 513}", depth=1
+        )
+    # depth<=3 且每段<=512，使 1539 成为可达的合法 path 最大长度。
+    with pytest.raises(ValidationError):
+        AllowedFolderBase(id=uuid4(), path=f"{max_path}d", depth=3)
+    # 2048 上限被上述更严格约束支配，不存在合法的 2048 长度 path。
+    with pytest.raises(ValidationError):
+        AllowedFolderBase(id=uuid4(), path=f"/{'x' * 2048}", depth=1)
+
+
+def test_embedding_item_length_boundaries() -> None:
+    assert EmbeddingItem(key="k" * 512, text="t" * 8000).key == "k" * 512
+    with pytest.raises(ValidationError):
+        EmbeddingItem(key="k" * 513, text="valid")
+    with pytest.raises(ValidationError):
+        EmbeddingItem(key="valid", text="t" * 8001)
+
+
+def test_taxonomy_topic_length_boundaries() -> None:
+    assert TaxonomyTopic(
+        slug="entity/acme", title="t" * 512, page_type="entity", summary="s" * 4000
+    ).title == "t" * 512
+    with pytest.raises(ValidationError):
+        TaxonomyTopic(
+            slug="entity/acme", title="t" * 513, page_type="entity", summary=""
+        )
+    with pytest.raises(ValidationError):
+        TaxonomyTopic(
+            slug="entity/acme", title="valid", page_type="entity", summary="s" * 4001
+        )
+
+
+def test_taxonomy_request_topic_count_and_uniqueness_boundaries() -> None:
+    def topics(count: int) -> tuple[TaxonomyTopic, ...]:
+        return tuple(
+            TaxonomyTopic(
+                slug=f"entity/topic-{index}",
+                title=f"Topic {index}",
+                page_type="entity",
+            )
+            for index in range(count)
+        )
+
+    assert len(TaxonomyRequest(topics=topics(1)).topics) == 1
+    assert len(TaxonomyRequest(topics=topics(60)).topics) == 60
+    with pytest.raises(ValidationError):
+        TaxonomyRequest(topics=())
+    with pytest.raises(ValidationError):
+        TaxonomyRequest(topics=topics(61))
+    with pytest.raises(ValidationError):
+        TaxonomyRequest(topics=(topics(1)[0], topics(1)[0]))
+
+
+def test_taxonomy_decision_segment_count_boundaries() -> None:
+    assert TaxonomyDecision(
+        slug="entity/acme", new_segments=("First", "Second")
+    ).new_segments == ("First", "Second")
+    with pytest.raises(ValidationError):
+        TaxonomyDecision(slug="entity/acme", new_segments=("First", "Second", "Third"))
+
+
+def test_folder_assignment_depth_and_wiki_path_boundaries() -> None:
+    base_id = uuid4()
+    assert FolderAssignment(
+        slug="entity/acme",
+        contributor_op_ids=(uuid4(),),
+        base_folder_id=base_id,
+        base_path="/First/Second",
+        base_depth=2,
+        new_segments=("Third",),
+    ).folder_path == "/First/Second/Third"
+    with pytest.raises(ValidationError):
+        FolderAssignment(
+            slug="entity/acme",
+            contributor_op_ids=(uuid4(),),
+            base_folder_id=base_id,
+            base_path="/First/Second/Third",
+            base_depth=3,
+            new_segments=("Fourth",),
+        )
+
+    slug = "entity/" + "s" * 248
+    base_segment = "a" * 512
+    accepted = FolderAssignment(
+        slug=slug,
+        contributor_op_ids=(uuid4(),),
+        base_folder_id=base_id,
+        base_path=f"/{base_segment}",
+        base_depth=1,
+        new_segments=("b" * 254,),
+    )
+
+    assert len(accepted.wiki_path) == 1024
+    with pytest.raises(ValidationError):
+        FolderAssignment(
+            slug=slug,
+            contributor_op_ids=(uuid4(),),
+            base_folder_id=base_id,
+            base_path=f"/{base_segment}",
+            base_depth=1,
+            new_segments=("b" * 255,),
+        )
+
+
 def test_worker_options_read_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GRAPH_WIKI_INGEST_BATCH_SIZE", "7")
     monkeypatch.setenv("GRAPH_WIKI_INGEST_MAP_PARALLEL", "3")
