@@ -289,6 +289,132 @@ def test_completed_noop_without_delta_or_page_remains_valid() -> None:
 
 
 @pytest.mark.parametrize(
+    ("pending_op", "action", "previous", "current"),
+    [
+        ("ingest", "add", None, _stored_contribution(version="version-2")),
+        (
+            "ingest",
+            "replace",
+            _stored_contribution(version="version-1"),
+            _stored_contribution(version="version-2"),
+        ),
+        (
+            "ingest",
+            "retract_stale",
+            _stored_contribution(version="version-1"),
+            None,
+        ),
+        (
+            "retract",
+            "retract",
+            _stored_contribution(version="version-1").model_copy(
+                update={"state": "retract_pending"}
+            ),
+            None,
+        ),
+    ],
+)
+def test_pending_delta_accepts_operation_specific_actions(
+    pending_op: str,
+    action: str,
+    previous: StoredContributionRecord | None,
+    current: StoredContributionRecord | None,
+) -> None:
+    pending = _pending(op=pending_op, version="version-2")
+    delta = ContributionDelta(
+        pending_op_id=pending.id,
+        action=action,
+        slug="entity/acme",
+        knowledge_id=pending.knowledge_id,
+        previous=previous,
+        current=current,
+    )
+
+    ingest_store._validate_delta_for_pending(pending, delta)
+
+
+@pytest.mark.parametrize(
+    ("pending_op", "action", "previous", "current"),
+    [
+        (
+            "retract",
+            "add",
+            None,
+            _stored_contribution(version="delete-1"),
+        ),
+        (
+            "ingest",
+            "retract",
+            _stored_contribution(version="version-1").model_copy(
+                update={"state": "retract_pending"}
+            ),
+            None,
+        ),
+    ],
+)
+def test_pending_delta_rejects_operation_specific_action_mismatch(
+    pending_op: str,
+    action: str,
+    previous: StoredContributionRecord | None,
+    current: StoredContributionRecord | None,
+) -> None:
+    pending = _pending(op=pending_op, version="version-2")
+    delta = ContributionDelta(
+        pending_op_id=pending.id,
+        action=action,
+        slug="entity/acme",
+        knowledge_id=pending.knowledge_id,
+        previous=previous,
+        current=current,
+    )
+
+    with pytest.raises(InvariantError, match="action"):
+        ingest_store._validate_delta_for_pending(pending, delta)
+
+
+def test_pending_delta_rejects_ingest_identity_and_current_version_mismatch() -> None:
+    pending = _pending(op="ingest", version="version-2")
+    current = _stored_contribution(version="version-1")
+    delta = ContributionDelta(
+        pending_op_id=pending.id,
+        action="add",
+        slug=current.slug,
+        knowledge_id=current.knowledge_id,
+        previous=None,
+        current=current,
+    )
+
+    with pytest.raises(InvariantError, match="版本"):
+        ingest_store._validate_delta_for_pending(pending, delta)
+
+    mismatched = delta.model_copy(update={"knowledge_id": "other-knowledge"})
+    with pytest.raises(InvariantError, match="来源"):
+        ingest_store._validate_delta_for_pending(pending, mismatched)
+
+
+def test_pending_delta_rejects_retract_previous_identity_and_state_mismatch() -> None:
+    pending = _pending(op="retract", version="delete-1")
+    previous = _stored_contribution(version="version-1")
+    valid_previous = previous.model_copy(update={"state": "retract_pending"})
+    valid_delta = ContributionDelta(
+        pending_op_id=pending.id,
+        action="retract",
+        slug=previous.slug,
+        knowledge_id=previous.knowledge_id,
+        previous=valid_previous,
+        current=None,
+    )
+
+    invalid_state = valid_delta.model_copy(update={"previous": previous})
+    with pytest.raises(InvariantError, match="状态"):
+        ingest_store._validate_delta_for_pending(pending, invalid_state)
+
+    mismatched = valid_delta.model_copy(update={"knowledge_id": "other-knowledge"})
+    with pytest.raises(InvariantError, match="来源"):
+        ingest_store._validate_delta_for_pending(pending, mismatched)
+
+
+@pytest.mark.parametrize(
     "marker",
     [
         "ClAiM ToKeN",
@@ -320,6 +446,59 @@ def test_safe_error_summary_does_not_truncate_claimant() -> None:
     summary = "claimant completed successfully"
 
     assert ingest_store._safe_error_summary(summary) == summary
+
+
+@pytest.mark.asyncio
+async def test_retract_pending_add_delta_is_rejected_before_any_writes() -> None:
+    token = uuid4()
+    pending = _pending(op="retract", version="delete-1", claimed=True)
+    pending.claim_token = token
+    page = _result_page().model_copy(
+        update={"contributor_op_ids": [pending.id], "deleted": True}
+    )
+    current = _stored_contribution(version=pending.op_version)
+    request = _batch_request(
+        claim_token=token,
+        pages=(page,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="add",
+                slug=page.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=None,
+                current=current,
+            ),
+        ),
+        completed_op_ids=(pending.id,),
+        expected_pages=(PageExpectation(slug=page.slug),),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=0),
+        ]
+    )
+    finalization = _RecordingFinalization(session.events)
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
+
+    error: BaseException | None = None
+    try:
+        await store.apply_results(SCOPE, request)
+    except BaseException as exc:
+        error = exc
+
+    assert isinstance(error, InvariantError)
+    assert session.added == []
+    assert finalization.requests == []
+    assert not any(
+        _sql(statement).startswith(("INSERT", "UPDATE", "DELETE"))
+        for statement in session.statements
+    )
 
 
 @pytest.mark.asyncio

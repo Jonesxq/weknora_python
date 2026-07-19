@@ -36,6 +36,7 @@ from app.wiki.ingest.ports import FinalizationPort
 from app.wiki.ingest.retract import project_active_refs
 from app.wiki.ingest.schemas import (
     BatchApplyRequest,
+    ContributionDelta,
     ContributionState,
     DedupPageCandidate,
     FinalizationRequest,
@@ -653,6 +654,64 @@ def _validate_batch_request(
     if not _legacy_coverage and delta_slugs - page_slugs:
         raise InvariantError("completed contribution delta 必须有对应 page")
     return snapshot
+
+
+def _validate_delta_for_pending(
+    pending: WikiPendingOp, delta: ContributionDelta
+) -> None:
+    if delta.pending_op_id != pending.id:
+        raise InvariantError("贡献 delta pending_op 身份不一致")
+    if delta.knowledge_id != pending.knowledge_id:
+        raise InvariantError("贡献 delta 与 pending 来源不一致")
+
+    records = [
+        record for record in (delta.previous, delta.current) if record is not None
+    ]
+    if any(record.knowledge_id != pending.knowledge_id for record in records):
+        raise InvariantError("贡献 delta record 与 pending 来源不一致")
+    if any(
+        record.tenant_id != pending.tenant_id
+        or record.knowledge_base_id != pending.knowledge_base_id
+        for record in records
+    ):
+        raise InvariantError("贡献 delta 越出 pending scope")
+
+    expected_shapes = {
+        "add": (False, True, None, "active"),
+        "replace": (True, True, "active", "active"),
+        "retract_stale": (True, False, "active", None),
+        "retract": (True, False, "retract_pending", None),
+    }
+    require_previous, require_current, previous_state, current_state = expected_shapes[
+        delta.action
+    ]
+    if (
+        (delta.previous is not None) != require_previous
+        or (delta.current is not None) != require_current
+        or previous_state is not None
+        and delta.previous is not None
+        and delta.previous.state != previous_state
+        or current_state is not None
+        and delta.current is not None
+        and delta.current.state != current_state
+    ):
+        raise InvariantError("贡献 delta action 记录状态或形态无效")
+
+    allowed_actions = (
+        {"add", "replace", "retract_stale"}
+        if pending.op == "ingest"
+        else {"retract"}
+        if pending.op == "retract"
+        else set()
+    )
+    if delta.action not in allowed_actions:
+        raise InvariantError("贡献 delta action 与 pending operation 不匹配")
+    if (
+        pending.op == "ingest"
+        and delta.current is not None
+        and delta.current.op_version != pending.op_version
+    ):
+        raise InvariantError("current contribution 版本与 ingest pending 不一致")
 
 
 def _validate_batch_inputs(
@@ -1671,6 +1730,10 @@ class SqlAlchemyIngestStore:
                 if {row.id for row in pending_rows} != requested_ids:
                     raise ClaimLost("批次必须完整覆盖当前 scope 和 claim 的 pending-op")
                 pending_by_id = {row.id: row for row in pending_rows}
+                for delta in request.contribution_deltas:
+                    _validate_delta_for_pending(
+                        pending_by_id[delta.pending_op_id], delta
+                    )
 
                 completed_ingest = [
                     pending_by_id[op_id]
@@ -1822,20 +1885,6 @@ class SqlAlchemyIngestStore:
                 ]
                 deleted_contributions = False
                 for delta in active_deltas:
-                    pending = pending_by_id[delta.pending_op_id]
-                    if pending.knowledge_id != delta.knowledge_id:
-                        raise InvariantError("贡献 delta 与 pending 来源不一致")
-                    records = [
-                        record
-                        for record in (delta.previous, delta.current)
-                        if record is not None
-                    ]
-                    if any(
-                        record.tenant_id != scope.tenant_id
-                        or record.knowledge_base_id != scope.knowledge_base_id
-                        for record in records
-                    ):
-                        raise InvariantError("贡献 delta 越出当前 scope")
                     if delta.previous is not None:
                         previous = delta.previous
                         statement = delete(WikiPageContribution).where(
@@ -1862,11 +1911,6 @@ class SqlAlchemyIngestStore:
                     current = delta.current
                     if current is None:
                         continue
-                    pending = pending_by_id[delta.pending_op_id]
-                    if current.op_version != pending.op_version:
-                        raise InvariantError(
-                            "current contribution 版本与 pending 不一致"
-                        )
                     session.add(
                         WikiPageContribution(
                             tenant_id=scope.tenant_id,
