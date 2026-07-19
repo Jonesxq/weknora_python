@@ -60,10 +60,6 @@ def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
         left_value * right_value
         for left_value, right_value in zip(left_unit, right_unit)
     )
-    if math.isclose(similarity, 1.0):
-        return 1.0
-    if math.isclose(similarity, -1.0):
-        return -1.0
     return max(-1.0, min(1.0, similarity))
 
 

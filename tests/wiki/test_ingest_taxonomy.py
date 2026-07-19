@@ -580,10 +580,43 @@ async def test_select_allowed_bases_tie_breaks_and_requests_are_input_order_inde
     assert first_embedding.requests == second_embedding.requests
 
 
+@pytest.mark.asyncio
+async def test_select_allowed_bases_preserves_nearby_score_order_before_path() -> None:
+    embedding = RecordingEmbedding(
+        _vectors(
+            {
+                "topic:entity/acme": (1.0, 0.0),
+                f"folder:{ALPHA_APPS_ID}": (1.0, 2e-5),
+                f"folder:{BETA_SERVICES_ID}": (1.0, 1e-5),
+                f"folder:{ALPHA_CLOUD_ID}": (0.0, 1.0),
+            }
+        )
+    )
+
+    selected = await select_allowed_bases(
+        (_topic(),), _folders(), embedding, full_catalog_limit=2, related_limit=1
+    )
+
+    assert [base.id for base in selected] == [
+        ROOT_ALPHA_ID,
+        ROOT_BETA_ID,
+        BETA_SERVICES_ID,
+    ]
+
+
 def test_cosine_similarity_handles_zero_orthogonal_and_equal_vectors() -> None:
     assert cosine_similarity((0.0, 0.0), (1.0, 0.0)) == 0.0
     assert cosine_similarity((1.0, 0.0), (0.0, 1.0)) == 0.0
-    assert cosine_similarity((1.0, 2.0), (1.0, 2.0)) == 1.0
+    assert cosine_similarity((1.0, 2.0), (1.0, 2.0)) == pytest.approx(1.0)
+
+
+def test_cosine_similarity_preserves_distinct_near_one_scores() -> None:
+    closer = cosine_similarity((1.0, 0.0), (1.0, 1e-5))
+    farther = cosine_similarity((1.0, 0.0), (1.0, 2e-5))
+
+    assert math.isfinite(closer)
+    assert math.isfinite(farther)
+    assert farther < closer <= 1.0
 
 
 def test_cosine_similarity_is_stable_for_large_finite_vectors() -> None:
