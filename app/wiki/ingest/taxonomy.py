@@ -1,17 +1,24 @@
-"""Taxonomy topic 聚合与模型输出恢复。"""
+"""Taxonomy topic 聚合、目录候选筛选与模型输出恢复。"""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+import math
 from uuid import UUID
 
 from pydantic import ValidationError
 from pydantic_core import PydanticSerializationError
 
 from app.wiki.errors import WikiValidationError
+from app.wiki.ingest.ports import EmbeddingModelPort
 from app.wiki.ingest.schemas import (
     AllowedFolderBase,
     ContributionDelta,
+    EmbeddingItem,
+    EmbeddingOutput,
+    EmbeddingRequest,
+    FolderCatalogEntry,
     TaxonomyDecision,
+    TaxonomyContext,
     TaxonomyOutput,
     TaxonomyRequest,
     TaxonomyTopic,
@@ -22,6 +29,173 @@ from app.wiki.ingest.schemas import (
 class TaxonomyWorkItem:
     topic: TaxonomyTopic
     contributor_op_ids: tuple[UUID, ...]
+
+
+def cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+    """返回两个有限、等维向量的余弦相似度。"""
+    if not left or not right or len(left) != len(right):
+        _embedding_invalid("embedding 向量维度必须一致且不能为空")
+    try:
+        if not all(math.isfinite(value) for value in left) or not all(
+            math.isfinite(value) for value in right
+        ):
+            _embedding_invalid("embedding 向量必须全部为有限数")
+    except TypeError as exc:
+        raise WikiValidationError(
+            "EMBEDDING_OUTPUT_INVALID", "embedding 向量必须全部为有限数"
+        ) from exc
+
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm == 0.0 or right_norm == 0.0:
+        return 0.0
+    similarity = sum(
+        left_value * right_value for left_value, right_value in zip(left, right)
+    ) / (
+        left_norm * right_norm
+    )
+    if math.isclose(similarity, 1.0):
+        return 1.0
+    if math.isclose(similarity, -1.0):
+        return -1.0
+    return similarity
+
+
+async def select_allowed_bases(
+    topics: Iterable[TaxonomyTopic],
+    folders: Iterable[FolderCatalogEntry],
+    embedding: EmbeddingModelPort,
+    *,
+    full_catalog_limit: int,
+    related_limit: int,
+) -> tuple[AllowedFolderBase, ...]:
+    """为 taxonomy 模型选择稳定且可追溯的目录候选集。"""
+    if full_catalog_limit <= 0 or related_limit <= 0:
+        raise ValueError("full_catalog_limit 和 related_limit 必须为正数")
+
+    topic_snapshots, folder_snapshots = _snapshot_selection_inputs(topics, folders)
+    ordered_folders = tuple(sorted(folder_snapshots, key=_folder_sort_key))
+    if len(ordered_folders) <= full_catalog_limit:
+        return _allowed_bases(ordered_folders)
+
+    roots = tuple(folder for folder in ordered_folders if folder.depth == 1)
+    deep_folders = tuple(folder for folder in ordered_folders if folder.depth > 1)
+    if not deep_folders:
+        return _allowed_bases(roots)
+    if not topic_snapshots:
+        _embedding_invalid("embedding 选择深层目录时 topic 不能为空")
+
+    items = tuple(
+        [
+            EmbeddingItem(
+                key=f"topic:{topic.slug}",
+                text=f"{topic.title}\n{topic.summary}".strip(),
+            )
+            for topic in topic_snapshots
+        ]
+        + [
+            EmbeddingItem(key=f"folder:{folder.id}", text=folder.path)
+            for folder in deep_folders
+        ]
+    )
+    request = EmbeddingRequest(items=items)
+    output = await embedding.embed(request)
+    vectors = _recover_embedding_output(request, output)
+
+    topic_vectors = tuple(vectors[f"topic:{topic.slug}"] for topic in topic_snapshots)
+    ranked = sorted(
+        (
+            (
+                max(
+                    cosine_similarity(vectors[f"folder:{folder.id}"], topic_vector)
+                    for topic_vector in topic_vectors
+                ),
+                folder,
+            )
+            for folder in deep_folders
+        ),
+        key=lambda item: (-item[0], *_folder_sort_key(item[1])),
+    )
+    selected_ids = {folder.id for _, folder in ranked[:related_limit]}
+    selected_ids.update(folder.id for folder in roots)
+    by_id = {folder.id: folder for folder in ordered_folders}
+    for folder_id in tuple(selected_ids):
+        current = by_id[folder_id]
+        while current.parent_id is not None:
+            current = by_id[current.parent_id]
+            selected_ids.add(current.id)
+    return _allowed_bases(folder for folder in ordered_folders if folder.id in selected_ids)
+
+
+def _snapshot_selection_inputs(
+    topics: Iterable[TaxonomyTopic], folders: Iterable[FolderCatalogEntry]
+) -> tuple[tuple[TaxonomyTopic, ...], tuple[FolderCatalogEntry, ...]]:
+    try:
+        raw_topics = tuple(topics)
+        raw_folders = tuple(folders)
+    except TypeError as exc:
+        raise WikiValidationError(
+            "EMBEDDING_OUTPUT_INVALID", "embedding 输入目录或 topic 结构无效"
+        ) from exc
+    if not all(isinstance(topic, TaxonomyTopic) for topic in raw_topics) or not all(
+        isinstance(folder, FolderCatalogEntry) for folder in raw_folders
+    ):
+        _embedding_invalid("embedding 输入目录或 topic 结构无效")
+    try:
+        topic_snapshots = tuple(
+            TaxonomyTopic.model_validate(
+                topic.model_dump(mode="python", warnings="error")
+            )
+            for topic in raw_topics
+        )
+        context = TaxonomyContext.model_validate(
+            {
+                "folders": [
+                    folder.model_dump(mode="python", warnings="error")
+                    for folder in raw_folders
+                ],
+                "classifiable_slugs": (),
+            }
+        )
+    except (ValidationError, PydanticSerializationError) as exc:
+        raise WikiValidationError(
+            "EMBEDDING_OUTPUT_INVALID", "embedding 输入目录或 topic 结构无效"
+        ) from exc
+    if len({topic.slug for topic in topic_snapshots}) != len(topic_snapshots):
+        _embedding_invalid("embedding topic slug 不能重复")
+    return tuple(sorted(topic_snapshots, key=lambda topic: topic.slug)), context.folders
+
+
+def _recover_embedding_output(
+    request: EmbeddingRequest, output: EmbeddingOutput
+) -> dict[str, tuple[float, ...]]:
+    if not isinstance(output, EmbeddingOutput):
+        _embedding_invalid("embedding 输出结构无效")
+    try:
+        output_snapshot = EmbeddingOutput.model_validate(
+            output.model_dump(mode="python", warnings="error")
+        )
+    except (ValidationError, PydanticSerializationError) as exc:
+        raise WikiValidationError(
+            "EMBEDDING_OUTPUT_INVALID", "embedding 输出结构无效"
+        ) from exc
+    requested_keys = {item.key for item in request.items}
+    if set(output_snapshot.vectors) != requested_keys:
+        _embedding_invalid("embedding 输出必须完整且恰好覆盖请求 key")
+    return dict(output_snapshot.vectors)
+
+
+def _folder_sort_key(folder: FolderCatalogEntry) -> tuple[int, str, str]:
+    return folder.depth, folder.path, str(folder.id)
+
+
+def _allowed_bases(
+    folders: Iterable[FolderCatalogEntry],
+) -> tuple[AllowedFolderBase, ...]:
+    return tuple(
+        AllowedFolderBase(id=folder.id, path=folder.path, depth=folder.depth)
+        for folder in folders
+    )
 
 
 def build_taxonomy_work_items(
@@ -163,3 +337,7 @@ def _folder_path(
 
 def _invalid(message: str) -> None:
     raise WikiValidationError("TAXONOMY_OUTPUT_INVALID", message)
+
+
+def _embedding_invalid(message: str) -> None:
+    raise WikiValidationError("EMBEDDING_OUTPUT_INVALID", message)

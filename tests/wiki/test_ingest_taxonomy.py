@@ -1,3 +1,5 @@
+import asyncio
+import math
 from dataclasses import FrozenInstanceError
 from uuid import UUID
 import warnings
@@ -9,6 +11,9 @@ from app.wiki.errors import WikiValidationError
 from app.wiki.ingest.schemas import (
     AllowedFolderBase,
     ContributionDelta,
+    EmbeddingOutput,
+    EmbeddingRequest,
+    FolderCatalogEntry,
     StoredContributionRecord,
     TaxonomyDecision,
     TaxonomyOutput,
@@ -18,7 +23,9 @@ from app.wiki.ingest.schemas import (
 from app.wiki.ingest.taxonomy import (
     TaxonomyWorkItem,
     build_taxonomy_work_items,
+    cosine_similarity,
     recover_taxonomy_output,
+    select_allowed_bases,
 )
 
 
@@ -27,6 +34,86 @@ OP_A = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 OP_B = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 OP_C = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
 BASE_ID = UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
+ROOT_ALPHA_ID = UUID("10000000-0000-0000-0000-000000000001")
+ROOT_BETA_ID = UUID("20000000-0000-0000-0000-000000000001")
+ALPHA_APPS_ID = UUID("10000000-0000-0000-0000-000000000002")
+ALPHA_CLOUD_ID = UUID("10000000-0000-0000-0000-000000000003")
+BETA_SERVICES_ID = UUID("20000000-0000-0000-0000-000000000002")
+
+
+class RecordingEmbedding:
+    def __init__(self, response: object) -> None:
+        self.response = response
+        self.requests: list[EmbeddingRequest] = []
+
+    async def embed(self, request: EmbeddingRequest) -> EmbeddingOutput:
+        snapshot = EmbeddingRequest.model_validate(
+            request.model_dump(mode="python", warnings="error")
+        )
+        self.requests.append(snapshot)
+        if isinstance(self.response, BaseException):
+            raise self.response
+        if callable(self.response):
+            return self.response(snapshot)  # type: ignore[no-any-return]
+        return self.response  # type: ignore[return-value]
+
+
+def _folders() -> tuple[FolderCatalogEntry, ...]:
+    return (
+        FolderCatalogEntry(
+            id=ROOT_ALPHA_ID,
+            parent_id=None,
+            name="Alpha",
+            path="/Alpha",
+            depth=1,
+        ),
+        FolderCatalogEntry(
+            id=ROOT_BETA_ID,
+            parent_id=None,
+            name="Beta",
+            path="/Beta",
+            depth=1,
+        ),
+        FolderCatalogEntry(
+            id=ALPHA_APPS_ID,
+            parent_id=ROOT_ALPHA_ID,
+            name="Apps",
+            path="/Alpha/Apps",
+            depth=2,
+        ),
+        FolderCatalogEntry(
+            id=ALPHA_CLOUD_ID,
+            parent_id=ALPHA_APPS_ID,
+            name="Cloud",
+            path="/Alpha/Apps/Cloud",
+            depth=3,
+        ),
+        FolderCatalogEntry(
+            id=BETA_SERVICES_ID,
+            parent_id=ROOT_BETA_ID,
+            name="Services",
+            path="/Beta/Services",
+            depth=2,
+        ),
+    )
+
+
+def _topic(slug: str = "entity/acme", title: str = "Acme") -> TaxonomyTopic:
+    return TaxonomyTopic(
+        slug=slug,
+        title=title,
+        page_type=slug.split("/", maxsplit=1)[0],
+        summary="Summary",
+    )
+
+
+def _vectors(values: dict[str, tuple[float, ...]]) -> object:
+    def response(request: EmbeddingRequest) -> EmbeddingOutput:
+        return EmbeddingOutput(
+            vectors={item.key: values[item.key] for item in request.items}
+        )
+
+    return response
 
 
 def _add_delta(
@@ -403,3 +490,256 @@ def test_recover_taxonomy_output_does_not_hide_programming_value_errors() -> Non
 
     with pytest.raises(ValueError, match="programming error"):
         recover_taxonomy_output(request, output)
+
+
+@pytest.mark.asyncio
+async def test_select_allowed_bases_returns_small_catalog_without_embedding() -> None:
+    embedding = RecordingEmbedding(object())
+
+    selected = await select_allowed_bases(
+        (_topic(),),
+        tuple(reversed(_folders())),
+        embedding,
+        full_catalog_limit=5,
+        related_limit=1,
+    )
+
+    assert [(base.depth, base.path, base.id) for base in selected] == [
+        (1, "/Alpha", ROOT_ALPHA_ID),
+        (1, "/Beta", ROOT_BETA_ID),
+        (2, "/Alpha/Apps", ALPHA_APPS_ID),
+        (2, "/Beta/Services", BETA_SERVICES_ID),
+        (3, "/Alpha/Apps/Cloud", ALPHA_CLOUD_ID),
+    ]
+    assert embedding.requests == []
+
+
+@pytest.mark.asyncio
+async def test_select_allowed_bases_keeps_roots_and_selected_ancestors() -> None:
+    embedding = RecordingEmbedding(
+        _vectors(
+            {
+                "topic:entity/acme": (1.0, 0.0),
+                f"folder:{ALPHA_APPS_ID}": (0.7, 0.7),
+                f"folder:{ALPHA_CLOUD_ID}": (0.99, 0.1),
+                f"folder:{BETA_SERVICES_ID}": (0.1, 0.99),
+            }
+        )
+    )
+
+    selected = await select_allowed_bases(
+        (_topic(),), _folders(), embedding, full_catalog_limit=2, related_limit=1
+    )
+
+    assert [base.id for base in selected] == [
+        ROOT_ALPHA_ID,
+        ROOT_BETA_ID,
+        ALPHA_APPS_ID,
+        ALPHA_CLOUD_ID,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_select_allowed_bases_tie_breaks_and_requests_are_input_order_independent() -> None:
+    vectors = {
+        "topic:concept/beta": (1.0, 0.0),
+        "topic:entity/acme": (1.0, 0.0),
+        f"folder:{ALPHA_APPS_ID}": (1.0, 0.0),
+        f"folder:{ALPHA_CLOUD_ID}": (1.0, 0.0),
+        f"folder:{BETA_SERVICES_ID}": (1.0, 0.0),
+    }
+    topics = (_topic("entity/acme"), _topic("concept/beta", "Beta"))
+    first_embedding = RecordingEmbedding(_vectors(vectors))
+    second_embedding = RecordingEmbedding(_vectors(vectors))
+
+    first = await select_allowed_bases(
+        topics, _folders(), first_embedding, full_catalog_limit=2, related_limit=2
+    )
+    second = await select_allowed_bases(
+        tuple(reversed(topics)),
+        tuple(reversed(_folders())),
+        second_embedding,
+        full_catalog_limit=2,
+        related_limit=2,
+    )
+
+    assert first == second
+    assert [base.id for base in first] == [
+        ROOT_ALPHA_ID,
+        ROOT_BETA_ID,
+        ALPHA_APPS_ID,
+        BETA_SERVICES_ID,
+    ]
+    assert [item.key for item in first_embedding.requests[0].items] == [
+        "topic:concept/beta",
+        "topic:entity/acme",
+        f"folder:{ALPHA_APPS_ID}",
+        f"folder:{BETA_SERVICES_ID}",
+        f"folder:{ALPHA_CLOUD_ID}",
+    ]
+    assert first_embedding.requests == second_embedding.requests
+
+
+def test_cosine_similarity_handles_zero_orthogonal_and_equal_vectors() -> None:
+    assert cosine_similarity((0.0, 0.0), (1.0, 0.0)) == 0.0
+    assert cosine_similarity((1.0, 0.0), (0.0, 1.0)) == 0.0
+    assert cosine_similarity((1.0, 2.0), (1.0, 2.0)) == 1.0
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [((1.0,), (1.0, 0.0)), ((), (1.0,)), ((math.nan,), (1.0,)), ((math.inf,), (1.0,))],
+)
+def test_cosine_similarity_rejects_invalid_vectors(
+    left: tuple[float, ...], right: tuple[float, ...]
+) -> None:
+    with pytest.raises(WikiValidationError) as exc_info:
+        cosine_similarity(left, right)
+
+    assert exc_info.value.code == "EMBEDDING_OUTPUT_INVALID"
+
+
+@pytest.mark.asyncio
+async def test_select_allowed_bases_scores_each_folder_against_best_topic() -> None:
+    embedding = RecordingEmbedding(
+        _vectors(
+            {
+                "topic:concept/beta": (0.0, 1.0),
+                "topic:entity/acme": (1.0, 0.0),
+                f"folder:{ALPHA_APPS_ID}": (0.2, 0.1),
+                f"folder:{ALPHA_CLOUD_ID}": (0.1, 0.2),
+                f"folder:{BETA_SERVICES_ID}": (0.0, 1.0),
+            }
+        )
+    )
+
+    selected = await select_allowed_bases(
+        (_topic(), _topic("concept/beta", "Beta")),
+        _folders(),
+        embedding,
+        full_catalog_limit=2,
+        related_limit=1,
+    )
+
+    assert BETA_SERVICES_ID in {base.id for base in selected}
+
+
+@pytest.mark.asyncio
+async def test_select_allowed_bases_requests_only_topics_and_deep_folders_with_text() -> None:
+    embedding = RecordingEmbedding(
+        _vectors(
+            {
+                "topic:entity/acme": (1.0, 0.0),
+                f"folder:{ALPHA_APPS_ID}": (1.0, 0.0),
+                f"folder:{ALPHA_CLOUD_ID}": (1.0, 0.0),
+                f"folder:{BETA_SERVICES_ID}": (1.0, 0.0),
+            }
+        )
+    )
+
+    await select_allowed_bases(
+        (_topic(),), _folders(), embedding, full_catalog_limit=2, related_limit=3
+    )
+
+    assert [(item.key, item.text) for item in embedding.requests[0].items] == [
+        ("topic:entity/acme", "Acme\nSummary"),
+        (f"folder:{ALPHA_APPS_ID}", "/Alpha/Apps"),
+        (f"folder:{BETA_SERVICES_ID}", "/Beta/Services"),
+        (f"folder:{ALPHA_CLOUD_ID}", "/Alpha/Apps/Cloud"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["missing", "extra", "wrong_type", "polluted"])
+async def test_select_allowed_bases_normalizes_invalid_model_outputs_without_warnings(
+    mode: str,
+) -> None:
+    def invalid_response(request: EmbeddingRequest) -> object:
+        keys = [item.key for item in request.items]
+        vectors = {key: (1.0, 0.0) for key in keys}
+        if mode == "missing":
+            vectors.pop(keys[-1])
+            return EmbeddingOutput(vectors=vectors)
+        if mode == "extra":
+            vectors["extra"] = (1.0, 0.0)
+            return EmbeddingOutput(vectors=vectors)
+        if mode == "wrong_type":
+            return object()
+        return EmbeddingOutput.model_construct(vectors=object())
+
+    embedding = RecordingEmbedding(invalid_response)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(WikiValidationError) as exc_info:
+            await select_allowed_bases(
+                (_topic(),), _folders(), embedding, full_catalog_limit=2, related_limit=1
+            )
+
+    assert exc_info.value.code == "EMBEDDING_OUTPUT_INVALID"
+    assert caught == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError("transient"), ValueError("permanent")])
+async def test_select_allowed_bases_propagates_model_failures(failure: Exception) -> None:
+    with pytest.raises(type(failure), match=str(failure)):
+        await select_allowed_bases(
+            (_topic(),),
+            _folders(),
+            RecordingEmbedding(failure),
+            full_catalog_limit=2,
+            related_limit=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_select_allowed_bases_propagates_cancellation() -> None:
+    with pytest.raises(asyncio.CancelledError):
+        await select_allowed_bases(
+            (_topic(),),
+            _folders(),
+            RecordingEmbedding(asyncio.CancelledError()),
+            full_catalog_limit=2,
+            related_limit=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_select_allowed_bases_handles_roots_only_and_invalid_arguments() -> None:
+    roots = _folders()[:2]
+    embedding = RecordingEmbedding(object())
+
+    selected = await select_allowed_bases(
+        (), roots, embedding, full_catalog_limit=1, related_limit=1
+    )
+
+    assert [base.id for base in selected] == [ROOT_ALPHA_ID, ROOT_BETA_ID]
+    assert embedding.requests == []
+    with pytest.raises(WikiValidationError) as exc_info:
+        await select_allowed_bases(
+            (), _folders(), embedding, full_catalog_limit=2, related_limit=1
+        )
+    assert exc_info.value.code == "EMBEDDING_OUTPUT_INVALID"
+    for full_catalog_limit, related_limit in ((0, 1), (1, 0)):
+        with pytest.raises(ValueError):
+            await select_allowed_bases(
+                (_topic(),),
+                _folders(),
+                embedding,
+                full_catalog_limit=full_catalog_limit,
+                related_limit=related_limit,
+            )
+
+
+@pytest.mark.asyncio
+async def test_select_allowed_bases_rejects_incomplete_folder_tree() -> None:
+    with pytest.raises(WikiValidationError) as exc_info:
+        await select_allowed_bases(
+            (_topic(),),
+            (_folders()[2],),
+            RecordingEmbedding(object()),
+            full_catalog_limit=2,
+            related_limit=1,
+        )
+
+    assert exc_info.value.code == "EMBEDDING_OUTPUT_INVALID"
