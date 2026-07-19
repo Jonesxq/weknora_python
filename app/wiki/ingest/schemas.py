@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 import copy
+import math
 import os
 import re
 from types import MappingProxyType
@@ -87,6 +88,53 @@ class _FrozenMapping(Mapping[str, tuple[str, ...]]):
         return type(self)(copy.deepcopy(self._items, memo))
 
 
+class _FrozenVectorMapping(Mapping[str, tuple[float, ...]]):
+    """可深拷贝且可序列化的只读嵌入向量映射。"""
+
+    __slots__ = ("_items", "_lookup")
+
+    def __init__(
+        self,
+        values: (
+            Mapping[str, tuple[float, ...]]
+            | Iterable[tuple[str, tuple[float, ...]]]
+        ),
+    ) -> None:
+        source = values.items() if isinstance(values, Mapping) else values
+        items = tuple((key, tuple(value)) for key, value in source)
+        object.__setattr__(self, "_items", items)
+        object.__setattr__(self, "_lookup", MappingProxyType(dict(items)))
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("embedding 向量映射不可修改")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("embedding 向量映射不可修改")
+
+    def __getitem__(self, key: str) -> tuple[float, ...]:
+        return self._lookup[key]
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        return (key for key, _ in self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def _iter_pairs(self) -> Iterable[tuple[str, tuple[float, ...]]]:
+        return iter(self._items)
+
+    def __copy__(self) -> Self:
+        return self
+
+    def __reduce__(
+        self,
+    ) -> tuple[type[Self], tuple[tuple[tuple[str, tuple[float, ...]], ...]]]:
+        return type(self), (self._items,)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Self:
+        return type(self)(copy.deepcopy(self._items, memo))
+
+
 def _normalize_slug(value: str, allowed_prefixes: tuple[str, ...]) -> str:
     slug = value.strip().casefold()
     if len(slug) > 255 or not _SLUG_PATTERN.fullmatch(slug):
@@ -94,6 +142,35 @@ def _normalize_slug(value: str, allowed_prefixes: tuple[str, ...]) -> str:
     if not any(slug.startswith(f"{prefix}/") for prefix in allowed_prefixes):
         raise ValueError(f"slug 必须使用以下前缀之一: {', '.join(allowed_prefixes)}")
     return slug
+
+
+def _folder_name(value: str) -> str:
+    name = value.strip()
+    if not name or len(name) > 512:
+        raise ValueError("目录名长度必须在 1 到 512 之间")
+    if name in {".", ".."} or "/" in name or "\\" in name:
+        raise ValueError("目录名不能包含路径分隔符或保留路径名")
+    if any(ord(character) < 32 or ord(character) == 127 for character in name):
+        raise ValueError("目录名不能包含控制字符")
+    return name
+
+
+def _normalize_folder_path(value: str) -> str:
+    path = value.strip()
+    if not 1 <= len(path) <= 2048:
+        raise ValueError("目录 path 长度必须在 1 到 2048 之间")
+    if not path.startswith("/") or path.endswith("/"):
+        raise ValueError("目录 path 必须以 / 开头且不能以 / 结尾")
+    segments = path[1:].split("/")
+    if not segments or any(not segment for segment in segments):
+        raise ValueError("目录 path 不能包含空路径段")
+    for segment in segments:
+        _folder_name(segment)
+    return "/" + "/".join(segments)
+
+
+def _folder_path_segments(path: str) -> tuple[str, ...]:
+    return tuple(path[1:].split("/"))
 
 
 def _stable_clean_strings(values: list[str]) -> list[str]:
@@ -135,6 +212,10 @@ class WikiWorkerOptions(_StrictModel):
     citation_parallel: int = Field(default=4, ge=1, le=32)
     dedup_candidate_limit: int = Field(default=20, ge=1, le=20)
     tombstone_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
+    taxonomy_topic_batch_size: int = Field(default=60, ge=1, le=60)
+    taxonomy_parallel: int = Field(default=4, ge=1, le=16)
+    taxonomy_full_catalog_limit: int = Field(default=120, ge=1, le=5000)
+    taxonomy_related_folder_limit: int = Field(default=40, ge=1, le=500)
 
     @classmethod
     def from_env(cls) -> Self:
@@ -161,6 +242,16 @@ class WikiWorkerOptions(_StrictModel):
                 ),
                 "tombstone_ttl_seconds": os.getenv(
                     "GRAPH_WIKI_TOMBSTONE_TTL_SECONDS", "3600"
+                ),
+                "taxonomy_topic_batch_size": os.getenv(
+                    "GRAPH_WIKI_TAXONOMY_TOPIC_BATCH_SIZE", "60"
+                ),
+                "taxonomy_parallel": os.getenv("GRAPH_WIKI_TAXONOMY_PARALLEL", "4"),
+                "taxonomy_full_catalog_limit": os.getenv(
+                    "GRAPH_WIKI_TAXONOMY_FULL_CATALOG_LIMIT", "120"
+                ),
+                "taxonomy_related_folder_limit": os.getenv(
+                    "GRAPH_WIKI_TAXONOMY_RELATED_FOLDER_LIMIT", "40"
                 ),
             }
         )
@@ -675,6 +766,300 @@ class DedupOutput(_FrozenValueModel):
         return self
 
 
+class FolderCatalogEntry(_FrozenValueModel):
+    id: UUID
+    parent_id: UUID | None = None
+    name: str
+    path: str
+    depth: int = Field(ge=1, le=3)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        return _folder_name(value)
+
+    @field_validator("path")
+    @classmethod
+    def normalize_path(cls, value: str) -> str:
+        return _normalize_folder_path(value)
+
+    @model_validator(mode="after")
+    def validate_catalog_identity(self) -> Self:
+        segments = _folder_path_segments(self.path)
+        if len(segments) != self.depth:
+            raise ValueError("目录 path 段数必须与 depth 一致")
+        if segments[-1] != self.name:
+            raise ValueError("目录 path 末段必须与 name 一致")
+        if self.parent_id == self.id:
+            raise ValueError("目录 parent_id 不能指向自身")
+        return self
+
+
+class TaxonomyContext(_FrozenValueModel):
+    folders: tuple[FolderCatalogEntry, ...] = ()
+    classifiable_slugs: tuple[str, ...] = ()
+
+    @field_validator("classifiable_slugs")
+    @classmethod
+    def normalize_classifiable_slugs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(_normalize_slug(slug, ("entity", "concept")) for slug in value)
+
+    @model_validator(mode="after")
+    def validate_catalog_tree(self) -> Self:
+        folder_ids = [folder.id for folder in self.folders]
+        paths = [folder.path for folder in self.folders]
+        if len(folder_ids) != len(set(folder_ids)):
+            raise ValueError("taxonomy folder id 不能重复")
+        if len(paths) != len(set(paths)):
+            raise ValueError("taxonomy folder path 不能重复")
+        if len(self.classifiable_slugs) != len(set(self.classifiable_slugs)):
+            raise ValueError("classifiable slug 不能重复")
+
+        by_id = {folder.id: folder for folder in self.folders}
+        by_path = {folder.path: folder for folder in self.folders}
+        for folder in self.folders:
+            if folder.depth == 1:
+                if folder.parent_id is not None:
+                    raise ValueError("一级目录 parent_id 必须为空")
+                continue
+            parent_path = "/" + "/".join(_folder_path_segments(folder.path)[:-1])
+            parent = by_path.get(parent_path)
+            if parent is None or parent.depth != folder.depth - 1:
+                raise ValueError("二三级目录必须包含完整且一致的祖先链")
+            if folder.parent_id != parent.id or by_id.get(folder.parent_id) != parent:
+                raise ValueError("目录 parent_id 必须与 path 祖先一致")
+        return self
+
+
+class EmbeddingItem(_FrozenValueModel):
+    key: str
+    text: str
+
+    @field_validator("key")
+    @classmethod
+    def normalize_key(cls, value: str) -> str:
+        key = value.strip()
+        if not 1 <= len(key) <= 512 or "," in key:
+            raise ValueError("embedding key 长度必须在 1 到 512 之间且不能包含逗号")
+        return key
+
+    @field_validator("text")
+    @classmethod
+    def normalize_text(cls, value: str) -> str:
+        text = value.strip()
+        if not 1 <= len(text) <= 8000:
+            raise ValueError("embedding text 长度必须在 1 到 8000 之间")
+        return text
+
+
+class EmbeddingRequest(_FrozenValueModel):
+    items: tuple[EmbeddingItem, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_keys(self) -> Self:
+        keys = [item.key for item in self.items]
+        if len(keys) != len(set(keys)):
+            raise ValueError("embedding item key 不能重复")
+        return self
+
+
+class EmbeddingOutput(_FrozenValueModel):
+    vectors: Mapping[str, tuple[float, ...]]
+
+    @field_serializer("vectors")
+    def serialize_vectors(
+        self, value: Mapping[str, tuple[float, ...]]
+    ) -> dict[str, tuple[float, ...]]:
+        if isinstance(value, _FrozenVectorMapping):
+            return dict(value._iter_pairs())
+        return dict(value)
+
+    @field_validator("vectors")
+    @classmethod
+    def normalize_vectors(
+        cls, value: Mapping[object, object]
+    ) -> Mapping[str, tuple[float, ...]]:
+        if not value:
+            raise ValueError("embedding vectors 不能为空")
+        vectors: dict[str, tuple[float, ...]] = {}
+        dimension: int | None = None
+        for raw_key, raw_vector in value.items():
+            key = str(raw_key)
+            if key in vectors:
+                raise ValueError("embedding vector key 不能重复")
+            if isinstance(raw_vector, (str, bytes, Mapping)):
+                raise ValueError("embedding vector 必须是数值序列")
+            try:
+                vector = tuple(float(component) for component in raw_vector)  # type: ignore[union-attr]
+            except (TypeError, ValueError) as exc:
+                raise ValueError("embedding vector 必须是数值序列") from exc
+            if not vector or not all(math.isfinite(component) for component in vector):
+                raise ValueError("embedding vector 必须非空且全部为有限数")
+            if dimension is None:
+                dimension = len(vector)
+            elif len(vector) != dimension:
+                raise ValueError("embedding vector 维度必须一致")
+            vectors[key] = vector
+        return _FrozenVectorMapping(vectors)
+
+
+class TaxonomyTopic(_FrozenValueModel):
+    slug: str
+    title: str
+    page_type: TopicPageType
+    summary: str = ""
+
+    @field_validator("slug")
+    @classmethod
+    def normalize_slug(cls, value: str) -> str:
+        return _normalize_slug(value, ("entity", "concept"))
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        title = " ".join(value.split())
+        if not 1 <= len(title) <= 512:
+            raise ValueError("taxonomy title 长度必须在 1 到 512 之间")
+        return title
+
+    @field_validator("summary")
+    @classmethod
+    def normalize_summary(cls, value: str) -> str:
+        summary = value.strip()
+        if len(summary) > 4000:
+            raise ValueError("taxonomy summary 长度不能超过 4000")
+        return summary
+
+    @model_validator(mode="after")
+    def validate_page_type_prefix(self) -> Self:
+        if not self.slug.startswith(f"{self.page_type}/"):
+            raise ValueError("slug 前缀必须与 page_type 一致")
+        return self
+
+
+class AllowedFolderBase(_FrozenValueModel):
+    id: UUID
+    path: str
+    depth: int = Field(ge=1, le=3)
+
+    @field_validator("path")
+    @classmethod
+    def normalize_path(cls, value: str) -> str:
+        return _normalize_folder_path(value)
+
+    @model_validator(mode="after")
+    def validate_path_depth(self) -> Self:
+        if len(_folder_path_segments(self.path)) != self.depth:
+            raise ValueError("目录 path 段数必须与 depth 一致")
+        return self
+
+
+class TaxonomyRequest(_FrozenValueModel):
+    topics: tuple[TaxonomyTopic, ...] = Field(min_length=1, max_length=60)
+    allowed_bases: tuple[AllowedFolderBase, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_request_identities(self) -> Self:
+        topic_slugs = [topic.slug for topic in self.topics]
+        ids = [base.id for base in self.allowed_bases]
+        paths = [base.path for base in self.allowed_bases]
+        if len(topic_slugs) != len(set(topic_slugs)):
+            raise ValueError("taxonomy topic slug 不能重复")
+        if len(ids) != len(set(ids)) or len(paths) != len(set(paths)):
+            raise ValueError("allowed base id 和 path 不能重复")
+        return self
+
+
+class TaxonomyDecision(_FrozenValueModel):
+    slug: str
+    base_folder_id: UUID | None = None
+    new_segments: tuple[str, ...] = Field(default=(), max_length=2)
+
+    @field_validator("slug")
+    @classmethod
+    def normalize_slug(cls, value: str) -> str:
+        return _normalize_slug(value, ("entity", "concept"))
+
+    @field_validator("new_segments")
+    @classmethod
+    def normalize_segments(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(_folder_name(segment) for segment in value)
+
+    @model_validator(mode="after")
+    def validate_segment_adjacency(self) -> Self:
+        if any(
+            current.casefold() == following.casefold()
+            for current, following in zip(self.new_segments, self.new_segments[1:])
+        ):
+            raise ValueError("相邻目录段不能仅大小写不同")
+        return self
+
+
+class TaxonomyOutput(_FrozenValueModel):
+    decisions: tuple[TaxonomyDecision, ...] = ()
+
+
+class FolderAssignment(_FrozenValueModel):
+    slug: str
+    contributor_op_ids: tuple[UUID, ...] = Field(min_length=1)
+    base_folder_id: UUID | None = None
+    base_path: str = ""
+    base_depth: int = Field(default=0, ge=0, le=3)
+    new_segments: tuple[str, ...] = Field(default=(), max_length=2)
+
+    @field_validator("slug")
+    @classmethod
+    def normalize_slug(cls, value: str) -> str:
+        return _normalize_slug(value, ("entity", "concept"))
+
+    @field_validator("base_path")
+    @classmethod
+    def normalize_base_path(cls, value: str) -> str:
+        return "" if not value.strip() else _normalize_folder_path(value)
+
+    @field_validator("new_segments")
+    @classmethod
+    def normalize_segments(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(_folder_name(segment) for segment in value)
+
+    @model_validator(mode="after")
+    def validate_assignment(self) -> Self:
+        if len(self.contributor_op_ids) != len(set(self.contributor_op_ids)):
+            raise ValueError("folder assignment contributor op id 不能重复")
+        root = self.base_folder_id is None
+        if root and (self.base_path != "" or self.base_depth != 0):
+            raise ValueError("根目录必须使用空 base_path 和 base_depth=0")
+        if not root:
+            if not self.base_path or self.base_depth == 0:
+                raise ValueError("既有目录必须同时提供 base id、path 和 depth")
+            if len(_folder_path_segments(self.base_path)) != self.base_depth:
+                raise ValueError("base path 段数必须与 base depth 一致")
+        if self.base_depth + len(self.new_segments) > 3:
+            raise ValueError("目录总深度不能超过 3")
+        if any(
+            current.casefold() == following.casefold()
+            for current, following in zip(self.new_segments, self.new_segments[1:])
+        ):
+            raise ValueError("相邻目录段不能仅大小写不同")
+        if len(self.folder_path) > 2048:
+            raise ValueError("目录 path 长度不能超过 2048")
+        if len(self.wiki_path) > 1024:
+            raise ValueError("最终 wiki_path 长度不能超过 1024")
+        return self
+
+    @property
+    def folder_path(self) -> str:
+        segments = [
+            *(_folder_path_segments(self.base_path) if self.base_path else ()),
+            *self.new_segments,
+        ]
+        return "/" + "/".join(segments) if segments else ""
+
+    @property
+    def wiki_path(self) -> str:
+        return f"{self.folder_path}/{self.slug}" if self.folder_path else f"/{self.slug}"
+
+
 ContributionAction = Literal["add", "replace", "retract_stale", "retract"]
 ContributionState = Literal["active", "retract_pending"]
 
@@ -896,6 +1281,7 @@ class BatchApplyRequest(_FrozenValueModel):
     failures: tuple[OperationFailure, ...]
     expected_pages: tuple[PageExpectation, ...]
     operation_id: UUID
+    folder_assignments: tuple[FolderAssignment, ...] = ()
 
     @field_validator("pages", mode="before")
     @classmethod

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from collections.abc import ItemsView
 import json
+import math
 import pickle
 from uuid import UUID, uuid4
 
@@ -10,6 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.wiki.ingest.schemas import (
+    AllowedFolderBase,
     BatchApplyRequest,
     BatchResult,
     CandidateExtraction,
@@ -23,7 +25,12 @@ from app.wiki.ingest.schemas import (
     DedupPageCandidate,
     DedupRequest,
     DocumentSummary,
+    EmbeddingItem,
+    EmbeddingOutput,
+    EmbeddingRequest,
     FinalizationRequest,
+    FolderAssignment,
+    FolderCatalogEntry,
     MapDocumentResult,
     PageContribution,
     PageMergeOutput,
@@ -35,6 +42,10 @@ from app.wiki.ingest.schemas import (
     SourceChunk,
     SourceKnowledge,
     StoredContributionRecord,
+    TaxonomyDecision,
+    TaxonomyOutput,
+    TaxonomyRequest,
+    TaxonomyTopic,
     TopicCandidate,
     WikiIngestConfig,
     WikiWorkerOptions,
@@ -67,7 +78,97 @@ def test_ingest_config_and_worker_options_use_safe_defaults() -> None:
         "citation_parallel": 4,
         "dedup_candidate_limit": 20,
         "tombstone_ttl_seconds": 3600,
+        "taxonomy_topic_batch_size": 60,
+        "taxonomy_parallel": 4,
+        "taxonomy_full_catalog_limit": 120,
+        "taxonomy_related_folder_limit": 40,
     }
+
+
+def test_phase_four_a_options_defaults_and_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GRAPH_WIKI_TAXONOMY_TOPIC_BATCH_SIZE", "40")
+    monkeypatch.setenv("GRAPH_WIKI_TAXONOMY_PARALLEL", "3")
+    monkeypatch.setenv("GRAPH_WIKI_TAXONOMY_FULL_CATALOG_LIMIT", "80")
+    monkeypatch.setenv("GRAPH_WIKI_TAXONOMY_RELATED_FOLDER_LIMIT", "24")
+
+    options = WikiWorkerOptions.from_env()
+
+    assert options.taxonomy_topic_batch_size == 40
+    assert options.taxonomy_parallel == 3
+    assert options.taxonomy_full_catalog_limit == 80
+    assert options.taxonomy_related_folder_limit == 24
+
+
+def test_embedding_output_is_complete_finite_and_deeply_immutable() -> None:
+    request = EmbeddingRequest(
+        items=(EmbeddingItem(key="topic:entity/acme", text="Acme"),)
+    )
+    output = EmbeddingOutput(vectors={"topic:entity/acme": (1.0, 0.0)})
+
+    assert tuple(output.vectors) == ("topic:entity/acme",)
+    with pytest.raises(TypeError):
+        output.vectors["topic:entity/acme"] = (0.0, 1.0)  # type: ignore[index]
+    with pytest.raises(ValidationError):
+        EmbeddingOutput(vectors={"topic:entity/acme": (math.nan, 0.0)})
+    assert request.items[0].key == "topic:entity/acme"
+    assert output.model_dump() == {"vectors": {"topic:entity/acme": (1.0, 0.0)}}
+
+
+def test_taxonomy_request_and_assignment_require_canonical_identities() -> None:
+    folder_id = uuid4()
+    op_id = uuid4()
+    base = AllowedFolderBase(id=folder_id, path="/Organizations", depth=1)
+    request = TaxonomyRequest(
+        topics=(
+            TaxonomyTopic(
+                slug="entity/acme",
+                title="Acme",
+                page_type="entity",
+                summary="Organization",
+            ),
+        ),
+        allowed_bases=(base,),
+    )
+    output = TaxonomyOutput(
+        decisions=(
+            TaxonomyDecision(
+                slug="entity/acme",
+                base_folder_id=folder_id,
+                new_segments=("Products",),
+            ),
+        )
+    )
+    assignment = FolderAssignment(
+        slug="entity/acme",
+        contributor_op_ids=(op_id,),
+        base_folder_id=folder_id,
+        base_path="/Organizations",
+        base_depth=1,
+        new_segments=("Products",),
+    )
+
+    assert request.topics[0].slug == output.decisions[0].slug == assignment.slug
+    with pytest.raises(ValidationError):
+        FolderAssignment(
+            slug="entity/acme",
+            contributor_op_ids=(op_id,),
+            base_folder_id=None,
+            base_path="/forged",
+            base_depth=0,
+        )
+
+
+def test_folder_catalog_rejects_invalid_path_depth_and_name() -> None:
+    with pytest.raises(ValidationError):
+        FolderCatalogEntry(
+            id=uuid4(), parent_id=None, name="bad/name", path="/bad/name", depth=1
+        )
+    with pytest.raises(ValidationError, match="相邻"):
+        TaxonomyDecision(
+            slug="entity/acme", new_segments=("Products", "products")
+        )
 
 
 def test_worker_options_read_environment(monkeypatch: pytest.MonkeyPatch) -> None:
