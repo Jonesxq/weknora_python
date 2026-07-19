@@ -1108,6 +1108,15 @@ def _enqueue_scope_lock_key(scope: WikiScope) -> int:
     return int.from_bytes(hashlib.sha256(identity).digest()[:8], "big", signed=True)
 
 
+def _taxonomy_scope_lock_key(scope: WikiScope) -> int:
+    """按 tenant+KB 串行目录规划；64 位摘要碰撞只会导致额外串行。"""
+
+    identity = f"wiki-taxonomy:{scope.tenant_id}:{scope.knowledge_base_id}".encode(
+        "ascii"
+    )
+    return int.from_bytes(hashlib.sha256(identity).digest()[:8], "big", signed=True)
+
+
 def _validate_pending_row(
     row: WikiPendingOp, scope: WikiScope, knowledge_id: str
 ) -> None:
@@ -2288,6 +2297,14 @@ class SqlAlchemyIngestStore:
                     completed_id_set,
                     require_taxonomy=require_taxonomy,
                 )
+                if assignments:
+                    await session.execute(
+                        select(
+                            func.pg_advisory_xact_lock(
+                                _taxonomy_scope_lock_key(scope)
+                            )
+                        )
+                    )
                 placements = {
                     assignment.slug: await self._resolve_folder_assignment(
                         session, scope, assignment

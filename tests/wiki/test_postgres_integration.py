@@ -281,6 +281,209 @@ def _taxonomy_apply_request(
     )
 
 
+def _taxonomy_multi_apply_request(
+    pending: PendingOpRecord,
+    pages: tuple[ReducedPage, ...],
+    assignments: tuple[FolderAssignment, ...],
+) -> BatchApplyRequest:
+    deltas = tuple(
+        ContributionDelta(
+            pending_op_id=pending.id,
+            action="add",
+            slug=page.slug,
+            knowledge_id=pending.knowledge_id,
+            previous=None,
+            current=StoredContributionRecord(
+                tenant_id=pending.tenant_id,
+                knowledge_base_id=pending.knowledge_base_id,
+                slug=page.slug,
+                knowledge_id=pending.knowledge_id,
+                op_version=pending.op_version,
+                page_type=page.page_type,
+                state="active",
+                title=page.title,
+                content=page.content,
+                summary=page.summary,
+                aliases=tuple(page.aliases),
+                chunk_refs=tuple(page.chunk_refs),
+            ),
+        )
+        for page in pages
+    )
+    return BatchApplyRequest(
+        claim_token=pending.claim_token,
+        pages=pages,
+        contribution_deltas=deltas,
+        completed_op_ids=(pending.id,),
+        superseded_op_ids=(),
+        failures=(),
+        expected_pages=tuple(PageExpectation(slug=page.slug) for page in pages),
+        operation_id=uuid4(),
+        folder_assignments=assignments,
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_crossed_folder_assignments_are_serialized_per_scope(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(tenant_id=50, knowledge_base_id=uuid4(), actor_id="task8-lock")
+    async with postgres_factory() as session, session.begin():
+        folder_a = WikiFolder(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            parent_id=None,
+            name="A",
+            path="/A",
+            depth=1,
+        )
+        folder_c = WikiFolder(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            parent_id=None,
+            name="C",
+            path="/C",
+            depth=1,
+        )
+        session.add_all([folder_a, folder_c])
+        await session.flush()
+        folder_a_id, folder_c_id = folder_a.id, folder_c.id
+
+    class DelayingStore(SqlAlchemyIngestStore):
+        def __init__(self) -> None:
+            super().__init__(postgres_factory, SqlFinalizationPort())
+            self.resolve_count = 0
+
+        async def _resolve_folder_assignment(
+            self,
+            session: AsyncSession,
+            actual_scope: WikiScope,
+            assignment: FolderAssignment,
+        ):
+            placement = await super()._resolve_folder_assignment(
+                session, actual_scope, assignment
+            )
+            self.resolve_count += 1
+            if self.resolve_count == 1:
+                await asyncio.sleep(0.2)
+            return placement
+
+    first_store = DelayingStore()
+    second_store = DelayingStore()
+    first_pending = await _claim_taxonomy_ingest(
+        first_store, scope, knowledge_id="cross-lock-first"
+    )
+    second_pending = await _claim_taxonomy_ingest(
+        second_store, scope, knowledge_id="cross-lock-second"
+    )
+    first_pages = tuple(
+        ReducedPage(
+            slug=slug,
+            title=slug,
+            page_type="entity",
+            content=slug,
+            summary=slug,
+            contributor_op_ids=[first_pending.id],
+        )
+        for slug in ("entity/a-first", "entity/z-first")
+    )
+    second_pages = tuple(
+        ReducedPage(
+            slug=slug,
+            title=slug,
+            page_type="entity",
+            content=slug,
+            summary=slug,
+            contributor_op_ids=[second_pending.id],
+        )
+        for slug in ("entity/a-second", "entity/z-second")
+    )
+    first_request = _taxonomy_multi_apply_request(
+        first_pending,
+        first_pages,
+        (
+            FolderAssignment(
+                slug=first_pages[0].slug,
+                contributor_op_ids=(first_pending.id,),
+                base_folder_id=folder_a_id,
+                base_path="/A",
+                base_depth=1,
+            ),
+            FolderAssignment(
+                slug=first_pages[1].slug,
+                contributor_op_ids=(first_pending.id,),
+                base_folder_id=folder_c_id,
+                base_path="/C",
+                base_depth=1,
+            ),
+        ),
+    )
+    second_request = _taxonomy_multi_apply_request(
+        second_pending,
+        second_pages,
+        (
+            FolderAssignment(
+                slug=second_pages[0].slug,
+                contributor_op_ids=(second_pending.id,),
+                base_folder_id=folder_c_id,
+                base_path="/C",
+                base_depth=1,
+            ),
+            FolderAssignment(
+                slug=second_pages[1].slug,
+                contributor_op_ids=(second_pending.id,),
+                base_folder_id=folder_a_id,
+                base_path="/A",
+                base_depth=1,
+            ),
+        ),
+    )
+
+    outcomes = await asyncio.wait_for(
+        asyncio.gather(
+            first_store.apply_results_with_outcome(scope, first_request),
+            second_store.apply_results_with_outcome(scope, second_request),
+        ),
+        timeout=10,
+    )
+    assert all(outcome.applied for outcome in outcomes)
+
+    async with postgres_factory() as session:
+        pages = {
+            page.slug: page
+            for page in (
+                await session.execute(
+                    select(WikiPage).where(
+                        WikiPage.tenant_id == scope.tenant_id,
+                        WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                        WikiPage.slug.in_(
+                            [page.slug for page in (*first_pages, *second_pages)]
+                        ),
+                    )
+                )
+            ).scalars()
+        }
+        expected = {
+            first_pages[0].slug: (folder_a_id, ["A"], f"/A/{first_pages[0].slug}"),
+            first_pages[1].slug: (folder_c_id, ["C"], f"/C/{first_pages[1].slug}"),
+            second_pages[0].slug: (
+                folder_c_id,
+                ["C"],
+                f"/C/{second_pages[0].slug}",
+            ),
+            second_pages[1].slug: (
+                folder_a_id,
+                ["A"],
+                f"/A/{second_pages[1].slug}",
+            ),
+        }
+        for slug, (folder_id, category_path, wiki_path) in expected.items():
+            assert pages[slug].folder_id == folder_id
+            assert pages[slug].category_path == category_path
+            assert pages[slug].wiki_path == wiki_path
+            assert pages[slug].depth == 1
+
+
 @pytest.mark.asyncio
 async def test_atomic_taxonomy_creates_reuses_and_resolves_base_folders(
     postgres_factory: async_sessionmaker[AsyncSession],

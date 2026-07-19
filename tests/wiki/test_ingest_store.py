@@ -954,6 +954,30 @@ async def test_operation_lock_is_first_stable_global_sql_for_operation_id() -> N
     assert -(2**63) <= first < 2**63
 
 
+def test_taxonomy_scope_lock_key_is_stable_and_scope_specific() -> None:
+    other_tenant = WikiScope(
+        tenant_id=SCOPE.tenant_id + 1,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        actor_id="other",
+    )
+    other_kb = WikiScope(
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=uuid4(),
+        actor_id="other",
+    )
+
+    assert ingest_store._taxonomy_scope_lock_key(SCOPE) == 7561626728492530037
+    assert ingest_store._taxonomy_scope_lock_key(SCOPE) == (
+        ingest_store._taxonomy_scope_lock_key(SCOPE)
+    )
+    assert ingest_store._taxonomy_scope_lock_key(other_tenant) != (
+        ingest_store._taxonomy_scope_lock_key(SCOPE)
+    )
+    assert ingest_store._taxonomy_scope_lock_key(other_kb) != (
+        ingest_store._taxonomy_scope_lock_key(SCOPE)
+    )
+
+
 @pytest.mark.asyncio
 async def test_modern_apply_results_rejects_an_incompletely_covered_claim() -> None:
     token = uuid4()
@@ -2354,6 +2378,7 @@ async def test_modern_apply_results_writes_resolved_folder_page_cache() -> None:
         ) -> tuple[UUID | None, list[str], str, int]:
             assert actual_session is session
             assert scope == SCOPE
+            session.events.append(f"RESOLVE:{actual_assignment.slug}")
             self.resolved.append(actual_assignment)
             return (
                 folder_id,
@@ -2373,6 +2398,68 @@ async def test_modern_apply_results_writes_resolved_folder_page_cache() -> None:
     assert inserted_page.wiki_path == "/Engineering/Databases/entity/acme"
     assert inserted_page.depth == 2
     assert inserted_page.version == 1
+    advisory_indexes = [
+        index
+        for index, event in enumerate(session.events)
+        if "pg_advisory_xact_lock" in event
+    ]
+    assert len(advisory_indexes) == 2
+    assert advisory_indexes[-1] < session.events.index(
+        f"RESOLVE:{assignment.slug}"
+    )
+    advisory_statements = [
+        statement
+        for statement in session.statements
+        if "pg_advisory_xact_lock" in _sql(statement)
+    ]
+    taxonomy_params = advisory_statements[-1].compile(
+        dialect=postgresql.dialect()
+    ).params
+    assert next(iter(taxonomy_params.values())) == (
+        ingest_store._taxonomy_scope_lock_key(SCOPE)
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_new_page_does_not_take_taxonomy_scope_lock() -> None:
+    token = uuid4()
+    pending = _pending(claimed=True)
+    pending.claim_token = token
+    page = _result_page().model_copy(
+        update={"contributor_op_ids": [pending.id]}
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(),
+            _ScriptedResult(),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=0),
+        ]
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), _RecordingFinalization(session.events)
+    )  # type: ignore[arg-type]
+
+    assert await store.apply_results(
+        SCOPE,
+        token,
+        [page],
+        [pending.id],
+        uuid4(),
+        expected_pages={page.slug: None},
+    )
+
+    inserted_page = next(item for item in session.added if isinstance(item, WikiPage))
+    assert inserted_page.wiki_path == f"/{page.slug}"
+    assert (
+        sum("pg_advisory_xact_lock" in _sql(item) for item in session.statements)
+        == 1
+    )
 
 
 @pytest.mark.asyncio
