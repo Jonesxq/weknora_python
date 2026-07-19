@@ -1036,9 +1036,7 @@ async def test_taxonomy_runs_after_map_context_and_before_reduce_and_commits_ass
 
 
 @pytest.mark.asyncio
-async def test_existing_topic_is_not_classified_and_empty_catalog_skips_embedding() -> (
-    None
-):
+async def test_existing_topic_is_not_classified() -> None:
     dataset = fake_dataset(
         ("doc-a",),
         concepts_by_knowledge={"doc-a": ("concept/alpha",)},
@@ -1067,6 +1065,52 @@ async def test_existing_topic_is_not_classified_and_empty_catalog_skips_embeddin
     result = await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
 
     assert result.completed_op_ids == (OP_A,)
+    assert model.taxonomy_requests == []
+    assert store.apply_calls[0].folder_assignments == ()
+
+
+@pytest.mark.asyncio
+async def test_empty_catalog_skips_embedding_but_still_classifies_new_topic() -> None:
+    dataset = fake_dataset(
+        ("doc-a",),
+        concepts_by_knowledge={"doc-a": ("concept/alpha",)},
+        include_shared=False,
+    )
+    model = OrderedTaxonomyModel(dataset)
+    store = WorkerStore(
+        [pending_op(OP_A, "doc-a")],
+        folders=(),
+        classifiable_slugs=("concept/alpha",),
+    )
+
+    result = await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
+
+    assert result.completed_op_ids == (OP_A,)
+    assert len(model.taxonomy_requests) == 1
+    assert model.taxonomy_requests[0].allowed_bases == ()
+    assignment = store.apply_calls[0].folder_assignments[0]
+    assert assignment.slug == "concept/alpha"
+    assert assignment.contributor_op_ids == (OP_A,)
+
+
+@pytest.mark.asyncio
+async def test_historical_only_topic_is_excluded_by_taxonomy_context() -> None:
+    dataset = fake_dataset(
+        ("doc-a",),
+        concepts_by_knowledge={"doc-a": ("concept/alpha",)},
+        include_shared=False,
+    )
+    model = OrderedTaxonomyModel(dataset)
+    store = WorkerStore(
+        [pending_op(OP_A, "doc-a")],
+        existing={},
+        classifiable_slugs=(),
+    )
+
+    result = await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
+
+    assert result.completed_op_ids == (OP_A,)
+    assert "concept/alpha" in store.taxonomy_context_calls[0]
     assert model.taxonomy_requests == []
     assert store.apply_calls[0].folder_assignments == ()
 
