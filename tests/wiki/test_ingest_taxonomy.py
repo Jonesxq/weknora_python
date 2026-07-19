@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError
 from uuid import UUID
+import warnings
 
 import pytest
 from pydantic import ValidationError
@@ -278,3 +279,62 @@ def test_recover_taxonomy_output_rebuilds_strict_snapshots() -> None:
     assert isinstance(recovered["entity/acme"], TaxonomyDecision)
     with pytest.raises(ValidationError, match="frozen"):
         recovered["entity/acme"].slug = "entity/other"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("request_value", "output_value"),
+    [
+        (None, "valid"),
+        (object(), "valid"),
+        ("valid", None),
+        ("valid", object()),
+    ],
+)
+def test_recover_taxonomy_output_normalizes_wrong_boundary_types(
+    request_value: object, output_value: object
+) -> None:
+    request = _request(
+        TaxonomyTopic(slug="entity/acme", title="Acme", page_type="entity")
+    )
+    output = TaxonomyOutput(
+        decisions=(TaxonomyDecision(slug="entity/acme"),)
+    )
+
+    with pytest.raises(
+        WikiValidationError, match="taxonomy 请求或输出结构无效"
+    ) as exc_info:
+        recover_taxonomy_output(
+            request if request_value == "valid" else request_value,  # type: ignore[arg-type]
+            output if output_value == "valid" else output_value,  # type: ignore[arg-type]
+        )
+
+    assert exc_info.value.code == "TAXONOMY_OUTPUT_INVALID"
+
+
+@pytest.mark.parametrize("polluted_field", ["decisions", "topics", "allowed_bases"])
+def test_recover_taxonomy_output_normalizes_polluted_constructs_without_warnings(
+    polluted_field: str,
+) -> None:
+    topic = TaxonomyTopic(slug="entity/acme", title="Acme", page_type="entity")
+    request = _request(topic)
+    output = TaxonomyOutput(decisions=(TaxonomyDecision(slug=topic.slug),))
+    if polluted_field == "decisions":
+        output = TaxonomyOutput.model_construct(decisions=object())
+    elif polluted_field == "topics":
+        request = TaxonomyRequest.model_construct(
+            topics=object(), allowed_bases=()
+        )
+    else:
+        request = TaxonomyRequest.model_construct(
+            topics=(topic,), allowed_bases=object()
+        )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(
+            WikiValidationError, match="taxonomy 请求或输出结构无效"
+        ) as exc_info:
+            recover_taxonomy_output(request, output)
+
+    assert exc_info.value.code == "TAXONOMY_OUTPUT_INVALID"
+    assert caught == []

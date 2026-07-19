@@ -4,6 +4,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from uuid import UUID
 
+from pydantic import ValidationError
+from pydantic_core import PydanticSerializationError
+
 from app.wiki.errors import WikiValidationError
 from app.wiki.ingest.schemas import (
     AllowedFolderBase,
@@ -79,8 +82,27 @@ def recover_taxonomy_output(
     request: TaxonomyRequest, output: TaxonomyOutput
 ) -> dict[str, TaxonomyDecision]:
     """验证模型 taxonomy 输出，并返回与调用者隔离的严格快照。"""
-    request_snapshot = TaxonomyRequest.model_validate(request.model_dump(mode="python"))
-    output_snapshot = TaxonomyOutput.model_validate(output.model_dump(mode="python"))
+    try:
+        if not isinstance(request, TaxonomyRequest) or not isinstance(
+            output, TaxonomyOutput
+        ):
+            raise TypeError("taxonomy 请求与输出类型不正确")
+        request_snapshot = TaxonomyRequest.model_validate(
+            request.model_dump(mode="python", warnings="error")
+        )
+        output_snapshot = TaxonomyOutput.model_validate(
+            output.model_dump(mode="python", warnings="error")
+        )
+    except (
+        AttributeError,
+        ValidationError,
+        PydanticSerializationError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise WikiValidationError(
+            "TAXONOMY_OUTPUT_INVALID", "taxonomy 请求或输出结构无效"
+        ) from exc
 
     requested_slugs = {topic.slug for topic in request_snapshot.topics}
     decisions = output_snapshot.decisions
