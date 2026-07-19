@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -11,6 +12,7 @@ from pydantic import ValidationError
 from app.wiki.errors import WikiValidationError
 from app.wiki.ingest import worker as worker_module
 from app.wiki.ingest.errors import WikiBatchBusy
+from app.wiki.ingest.enqueue import WikiEnqueueService
 from app.wiki.ingest.fakes import FakeChatModel, FakeDataset, FakeKnowledgeSource
 from app.wiki.ingest.ports import PermanentModelError, TransientModelError
 from app.wiki.ingest.schemas import (
@@ -23,6 +25,7 @@ from app.wiki.ingest.schemas import (
 )
 from app.wiki.ingest.store import (
     ClaimLost,
+    EnqueueRecord,
     ExistingPageRecord,
     PageConflict,
     PendingOpRecord,
@@ -1343,3 +1346,198 @@ async def test_same_turn_cancellation_retrieves_release_failure_as_cause() -> No
         await asyncio.wait_for(task, timeout=1)
     assert isinstance(error.value.__cause__, ReleaseFailure)
     assert store.release_calls == [(SCOPE, [OP_A], CLAIM_TOKEN)]
+
+
+@pytest.mark.asyncio
+async def test_ingest_mapped_before_retract_tombstone_finishes_superseded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = fake_dataset(("doc-a",))
+    source = FakeKnowledgeSource(dataset)
+    mapped = asyncio.Event()
+    release_map = asyncio.Event()
+
+    class MutableTombstones:
+        def __init__(self) -> None:
+            self.deleted: set[str] = set()
+
+        async def mark_deleted(self, scope: WikiScope, knowledge_id: str) -> None:
+            assert scope == SCOPE
+            self.deleted.add(knowledge_id)
+
+        async def is_deleted(self, scope: WikiScope, knowledge_id: str) -> bool:
+            assert scope == SCOPE
+            return knowledge_id in self.deleted
+
+    class BarrierStore(WorkerStore):
+        def __init__(self) -> None:
+            super().__init__([pending_op(OP_A, "doc-a")])
+            self.retract_enqueues: list[tuple[str, str]] = []
+
+        async def enqueue_retract(
+            self,
+            scope: WikiScope,
+            knowledge_id: str,
+            op_version: str,
+            payload: dict[str, object],
+            *,
+            delay_seconds: int = 30,
+        ) -> EnqueueRecord:
+            assert scope == SCOPE
+            assert payload == {"knowledge_id": knowledge_id}
+            assert delay_seconds == 30
+            self.retract_enqueues.append((knowledge_id, op_version))
+            return EnqueueRecord(
+                id=OP_B,
+                tenant_id=scope.tenant_id,
+                knowledge_base_id=scope.knowledge_base_id,
+                knowledge_id=knowledge_id,
+                op_version=op_version,
+                payload=payload,
+                outbox_event_id=uuid4(),
+                deduplicated=False,
+            )
+
+    original_map_document = worker_module.map_document
+
+    async def paused_map_document(*args, **kwargs):
+        result = await original_map_document(*args, **kwargs)
+        mapped.set()
+        await release_map.wait()
+        return result
+
+    monkeypatch.setattr(worker_module, "map_document", paused_map_document)
+    tombstones = MutableTombstones()
+    store = BarrierStore()
+    ingest_worker = worker(
+        store,
+        source,
+        FakeChatModel(dataset),
+        tombstones=tombstones,  # type: ignore[arg-type]
+    )
+    task = asyncio.create_task(ingest_worker.run_batch(SCOPE))
+    await asyncio.wait_for(mapped.wait(), timeout=1)
+    enqueue_result = await WikiEnqueueService(
+        source,
+        store,
+        tombstones,  # type: ignore[arg-type]
+    ).enqueue_retract(SCOPE, "doc-a", "delete-v2")
+    release_map.set()
+    result = await asyncio.wait_for(task, timeout=1)
+
+    assert enqueue_result.pending_op_id == OP_B
+    assert store.retract_enqueues == [("doc-a", "delete-v2")]
+    assert result.superseded_op_ids == (OP_A,)
+    assert result.completed_op_ids == result.failed_op_ids == ()
+    assert store.contributions == []
+    assert store.apply_calls[0].contribution_deltas == ()
+    assert store.apply_calls[0].failures == ()
+
+
+@pytest.mark.asyncio
+async def test_single_citation_batch_permanent_failure_still_completes_ingest() -> None:
+    dataset = fake_dataset(("doc-a",))
+    model = FakeChatModel(dataset)
+    store = WorkerStore([pending_op(OP_A, "doc-a")])
+
+    result = await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
+
+    assert result.completed_op_ids == (OP_A,)
+    assert result.failed_op_ids == result.superseded_op_ids == ()
+    assert model.calls.count("citation:doc-a:0") == 1
+    shared = next(
+        page for page in store.apply_calls[0].pages if page.slug == "entity/shared"
+    )
+    assert shared.chunk_refs == ()
+
+
+@pytest.mark.asyncio
+async def test_summary_transient_failure_uses_exactly_three_map_attempts() -> None:
+    dataset = fake_dataset(("doc-a",), transient_failures={"summarize:doc-a": 2})
+    model = FakeChatModel(dataset)
+    waits: list[int] = []
+
+    result = await worker(
+        WorkerStore([pending_op(OP_A, "doc-a")]),
+        FakeKnowledgeSource(dataset),
+        model,
+        waits=waits,
+    ).run_batch(SCOPE)
+
+    assert result.completed_op_ids == (OP_A,)
+    assert model.calls.count("summarize:doc-a") == 3
+    assert waits == [2, 4]
+
+
+@pytest.mark.asyncio
+async def test_retract_reduce_failure_reaches_dead_letter_after_five_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = fake_dataset(("doc-a",), include_shared=False)
+    retract_pending = contribution("doc-a", "entity/retract", state="retract_pending")
+    existing = ExistingPageRecord(
+        page_id=uuid4(),
+        version=1,
+        page=ReducedPage(
+            slug="entity/retract",
+            title="Retract",
+            page_type="entity",
+            content="Body",
+            summary="Summary",
+            source_refs=["doc-a"],
+        ),
+    )
+
+    class RetryingRetractStore(WorkerStore):
+        def __init__(self) -> None:
+            super().__init__(
+                [pending_op(OP_A, "doc-a", op="retract")],
+                existing={"entity/retract": existing},
+                contributions=[retract_pending],
+            )
+            self.dead: list[UUID] = []
+
+        async def apply_results_with_outcome(
+            self, scope: WikiScope, request: BatchApplyRequest
+        ) -> BatchApplyOutcome:
+            assert scope == SCOPE
+            call = BatchApplyRequest.model_validate(request.model_dump(mode="python"))
+            self.apply_calls.append(call)
+            assert len(call.failures) == 1
+            current = self.records[0]
+            next_count = current.fail_count + 1
+            if next_count == 5:
+                self.dead.append(current.id)
+                self.records = []
+            else:
+                self.records = [
+                    replace(
+                        current,
+                        fail_count=next_count,
+                        claimed_at=NOW,
+                        claim_token=CLAIM_TOKEN,
+                    )
+                ]
+            return BatchApplyOutcome(
+                applied=True,
+                failed_op_ids=(current.id,),
+            )
+
+    async def failing_reduce(*args, **kwargs):
+        raise PermanentModelError("retract reduce failed")
+
+    monkeypatch.setattr(worker_module, "reduce_slug", failing_reduce)
+    store = RetryingRetractStore()
+    results = []
+    for expected_fail_count in range(1, 6):
+        result = await worker(
+            store, FakeKnowledgeSource(dataset), FakeChatModel(dataset)
+        ).run_batch(SCOPE)
+        results.append(result)
+        if expected_fail_count < 5:
+            assert store.records[0].fail_count == expected_fail_count
+
+    assert [result.failed_op_ids for result in results] == [(OP_A,)] * 5
+    assert store.dead == [OP_A]
+    assert store.records == []
+    assert all(call.failures for call in store.apply_calls)

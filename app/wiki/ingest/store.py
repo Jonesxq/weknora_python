@@ -300,8 +300,11 @@ def build_dedup_candidate_statement(
         raise ValueError("dedup query_name 不能为空")
     expression = _dedup_names_expression()
     distance = expression.op("<->")(func.lower(query))
-    return (
-        select(WikiPage, distance.label("dedup_distance"))
+    ranked = (
+        select(
+            WikiPage.id.label("page_id"),
+            distance.label("dedup_distance"),
+        )
         .where(
             WikiPage.tenant_id == scope.tenant_id,
             WikiPage.knowledge_base_id == scope.knowledge_base_id,
@@ -309,8 +312,14 @@ def build_dedup_candidate_statement(
             WikiPage.status == literal_column("'published'"),
             WikiPage.page_type == literal_column(f"'{candidate.page_type}'"),
         )
-        .order_by(distance, WikiPage.slug)
+        .order_by(distance)
         .limit(checked_limit)
+        .subquery("dedup_ranked")
+    )
+    return (
+        select(WikiPage, ranked.c.dedup_distance)
+        .join(ranked, ranked.c.page_id == WikiPage.id)
+        .order_by(ranked.c.dedup_distance, WikiPage.slug)
     )
 
 

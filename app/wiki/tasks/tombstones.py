@@ -135,13 +135,22 @@ class RedisTombstones:
             socket_connect_timeout=self._socket_timeout,
             socket_timeout=self._socket_timeout,
         )
-        if inspect.isawaitable(client):
+        required_methods = ("set", "get", "aclose")
+        missing_methods = [
+            method_name
+            for method_name in required_methods
+            if not callable(getattr(client, method_name, None))
+        ]
+        if inspect.isawaitable(client) and missing_methods:
             if inspect.iscoroutine(client):
                 client.close()
+            else:
+                cancel = getattr(client, "cancel", None)
+                if callable(cancel):
+                    cancel()
             raise TypeError("client_factory 不能返回 awaitable")
-        for method_name in ("set", "get", "aclose"):
-            if not callable(getattr(client, method_name, None)):
-                raise TypeError(f"Redis 客户端缺少可调用的 {method_name}")
+        if missing_methods:
+            raise TypeError(f"Redis 客户端缺少可调用的 {missing_methods[0]}")
         return client
 
     async def mark_deleted(self, scope: WikiScope, knowledge_id: str) -> None:

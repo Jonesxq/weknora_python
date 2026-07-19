@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 from collections.abc import Callable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
+from redis.asyncio import Redis
 
 from app.wiki.ingest.ports import TombstonePort
 from app.wiki.scope import WikiScope
@@ -16,6 +18,7 @@ from app.wiki.tasks.tombstones import MemoryTombstones, RedisTombstones, tombsto
 
 KB_ID = UUID("11111111-1111-1111-1111-111111111111")
 OTHER_KB_ID = UUID("22222222-2222-2222-2222-222222222222")
+TEST_REDIS_URL = os.getenv("GRAPH_TEST_REDIS_URL")
 
 
 def scope(*, tenant_id: int = 7, knowledge_base_id: UUID = KB_ID) -> WikiScope:
@@ -97,6 +100,16 @@ class StatefulFakeRedisClient(FakeRedisClient):
             self.state.values.pop(key, None)
             return None
         return value[0]
+
+
+class AwaitableRedisClient(FakeRedisClient):
+    """模拟 redis.asyncio.Redis：实例可 await，同时直接提供命令方法。"""
+
+    def __await__(self):
+        async def resolve() -> AwaitableRedisClient:
+            return self
+
+        return resolve().__await__()
 
 
 class BlockingCloseClient(FakeRedisClient):
@@ -505,6 +518,32 @@ async def test_redis_rejects_async_factory_without_runtime_warning(
     assert not [warning for warning in recwarn if warning.category is RuntimeWarning]
 
 
+@pytest.mark.asyncio
+async def test_redis_accepts_awaitable_official_client_shape() -> None:
+    client = AwaitableRedisClient(get_result="1")
+    tombstones = RedisTombstones(
+        "redis://example",
+        client_factory=lambda *args, **kwargs: client,
+    )
+
+    await tombstones.mark_deleted(scope(), "knowledge-1")
+    assert await tombstones.is_deleted(scope(), "knowledge-1")
+    assert client.closed == 2
+
+
+@pytest.mark.asyncio
+async def test_redis_rejects_and_cancels_future_factory_result() -> None:
+    future = asyncio.get_running_loop().create_future()
+
+    with pytest.raises(TypeError, match="client_factory 不能返回 awaitable"):
+        RedisTombstones(
+            "redis://example",
+            client_factory=lambda *args, **kwargs: future,  # type: ignore[arg-type]
+        )._new_client()
+
+    assert future.cancelled()
+
+
 @pytest.mark.parametrize("client", [object(), object()])
 def test_redis_rejects_invalid_client_shape(client: object) -> None:
     with pytest.raises(TypeError, match="Redis 客户端缺少"):
@@ -542,3 +581,42 @@ def test_redis_rejects_invalid_ttl_with_valid_timeout(ttl: object) -> None:
 def test_redis_rejects_invalid_timeout_with_valid_ttl(timeout: object) -> None:
     with pytest.raises((TypeError, ValueError)):
         RedisTombstones("redis://example", ttl_seconds=3600, socket_timeout=timeout)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not TEST_REDIS_URL,
+    reason="未配置 GRAPH_TEST_REDIS_URL，不连接默认开发 Redis",
+)
+async def test_real_redis_refreshes_short_ttl_and_isolates_keys_without_persistent_client() -> (
+    None
+):
+    assert TEST_REDIS_URL is not None
+    first_scope = scope(knowledge_base_id=uuid4())
+    other_scope = scope(knowledge_base_id=uuid4())
+    first_source = f"task13-{uuid4().hex}"
+    other_source = f"task13-{uuid4().hex}"
+    keys = (
+        tombstone_key(first_scope, first_source),
+        tombstone_key(first_scope, other_source),
+        tombstone_key(other_scope, first_source),
+    )
+    tombstones = RedisTombstones(TEST_REDIS_URL, ttl_seconds=3)
+    cleanup = Redis.from_url(TEST_REDIS_URL, decode_responses=True)
+    try:
+        await cleanup.delete(*keys)
+        await tombstones.mark_deleted(first_scope, first_source)
+        assert await tombstones.is_deleted(first_scope, first_source)
+        assert not await tombstones.is_deleted(first_scope, other_source)
+        assert not await tombstones.is_deleted(other_scope, first_source)
+
+        await asyncio.sleep(1)
+        first_ttl = await cleanup.ttl(keys[0])
+        await tombstones.mark_deleted(first_scope, first_source)
+        second_ttl = await cleanup.ttl(keys[0])
+
+        assert second_ttl >= first_ttl > 0
+        assert not hasattr(tombstones, "_client")
+    finally:
+        await cleanup.delete(*keys)
+        await cleanup.aclose()
