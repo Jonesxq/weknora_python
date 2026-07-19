@@ -12,7 +12,12 @@ import pytest_asyncio
 from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.infrastructure.database.base import Base
 from app.schemas.wiki.pages import WikiPageCreateRequest, WikiPageUpdateRequest
@@ -58,9 +63,8 @@ from app.wiki.sql_page_store import SqlAlchemyPageStore
 from app.wiki.tasks.locks import MemoryWikiLockManager
 
 TEST_DATABASE_URL = os.getenv("GRAPH_TEST_POSTGRES_URL")
-pytestmark = pytest.mark.skipif(
-    not TEST_DATABASE_URL,
-    reason="未配置 GRAPH_TEST_POSTGRES_URL，不连接默认数据库或使用 SQLite 替代 PostgreSQL",
+POSTGRES_SKIP_REASON = (
+    "未配置 GRAPH_TEST_POSTGRES_URL，不连接默认数据库或使用 SQLite 替代 PostgreSQL"
 )
 
 
@@ -87,50 +91,124 @@ def _plan_nodes(value: object) -> list[dict[str, Any]]:
     return nodes
 
 
+async def _drop_test_schema(engine: AsyncEngine, schema: str) -> None:
+    async with engine.begin() as connection:
+        await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+
+
+async def _cleanup_postgres_engine(
+    engine: AsyncEngine, schema: str, *, schema_created: bool
+) -> None:
+    try:
+        if schema_created:
+            await _drop_test_schema(engine, schema)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_postgres_cleanup_disposes_when_schema_setup_never_completed() -> None:
+    class Engine:
+        def __init__(self) -> None:
+            self.begin_calls = 0
+            self.dispose_calls = 0
+
+        def begin(self):
+            self.begin_calls += 1
+            raise AssertionError("schema 未创建时不应执行 DROP")
+
+        async def dispose(self) -> None:
+            self.dispose_calls += 1
+
+    engine = Engine()
+
+    await _cleanup_postgres_engine(engine, "not-created", schema_created=False)
+
+    assert engine.begin_calls == 0
+    assert engine.dispose_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_postgres_cleanup_disposes_when_drop_schema_fails() -> None:
+    class Connection:
+        async def execute(self, _statement) -> None:
+            raise RuntimeError("drop failed")
+
+    class Begin:
+        async def __aenter__(self) -> Connection:
+            return Connection()
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+    class Engine:
+        def __init__(self) -> None:
+            self.dispose_calls = 0
+
+        def begin(self) -> Begin:
+            return Begin()
+
+        async def dispose(self) -> None:
+            self.dispose_calls += 1
+
+    engine = Engine()
+
+    with pytest.raises(RuntimeError, match="drop failed"):
+        await _cleanup_postgres_engine(engine, "created", schema_created=True)
+
+    assert engine.dispose_calls == 1
+
+
 @pytest_asyncio.fixture
 async def postgres_session() -> AsyncSession:
-    assert TEST_DATABASE_URL is not None
+    if TEST_DATABASE_URL is None:
+        pytest.skip(POSTGRES_SKIP_REASON)
     schema = f"wiki_test_{uuid4().hex}"
     engine = create_async_engine(
         TEST_DATABASE_URL,
         connect_args={"server_settings": {"search_path": f"{schema},public"}},
     )
-    async with engine.begin() as connection:
-        await connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-        await connection.run_sync(Base.metadata.create_all)
-
-    factory = async_sessionmaker(engine, expire_on_commit=False)
+    schema_created = False
     try:
+        async with engine.begin() as connection:
+            await connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+            schema_created = True
+            await connection.run_sync(Base.metadata.create_all)
+
+        factory = async_sessionmaker(engine, expire_on_commit=False)
         async with factory() as session:
             yield session
     finally:
-        async with engine.begin() as connection:
-            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
-        await engine.dispose()
+        await _cleanup_postgres_engine(
+            engine, schema, schema_created=schema_created
+        )
 
 
 @pytest_asyncio.fixture
 async def postgres_factory() -> async_sessionmaker[AsyncSession]:
     """为自行管理短 session 的摄取仓储提供真实 PostgreSQL 工厂。"""
 
-    assert TEST_DATABASE_URL is not None
+    if TEST_DATABASE_URL is None:
+        pytest.skip(POSTGRES_SKIP_REASON)
     schema = f"wiki_ingest_test_{uuid4().hex}"
     engine = create_async_engine(
         TEST_DATABASE_URL,
         connect_args={"server_settings": {"search_path": f"{schema},public"}},
     )
-    async with engine.begin() as connection:
-        await connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
-        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-        await connection.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    schema_created = False
     try:
+        async with engine.begin() as connection:
+            await connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+            schema_created = True
+            await connection.run_sync(Base.metadata.create_all)
+        factory = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
         yield factory
     finally:
-        async with engine.begin() as connection:
-            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
-        await engine.dispose()
+        await _cleanup_postgres_engine(
+            engine, schema, schema_created=schema_created
+        )
 
 
 @pytest.mark.asyncio

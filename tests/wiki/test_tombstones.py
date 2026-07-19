@@ -583,6 +583,33 @@ def test_redis_rejects_invalid_timeout_with_valid_ttl(timeout: object) -> None:
         RedisTombstones("redis://example", ttl_seconds=3600, socket_timeout=timeout)  # type: ignore[arg-type]
 
 
+async def _delete_and_close(client: Redis, keys: tuple[str, ...]) -> None:
+    try:
+        await client.delete(*keys)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_real_redis_cleanup_closes_when_delete_fails() -> None:
+    class CleanupClient:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def delete(self, *_keys: str) -> None:
+            raise RuntimeError("delete failed")
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    cleanup = CleanupClient()
+
+    with pytest.raises(RuntimeError, match="delete failed"):
+        await _delete_and_close(cleanup, ("key",))
+
+    assert cleanup.close_calls == 1
+
+
 @pytest.mark.asyncio
 @pytest.mark.skipif(
     not TEST_REDIS_URL,
@@ -618,5 +645,4 @@ async def test_real_redis_refreshes_short_ttl_and_isolates_keys_without_persiste
         assert second_ttl >= first_ttl > 0
         assert not hasattr(tombstones, "_client")
     finally:
-        await cleanup.delete(*keys)
-        await cleanup.aclose()
+        await _delete_and_close(cleanup, keys)
