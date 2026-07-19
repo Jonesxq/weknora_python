@@ -45,6 +45,33 @@ class _FrozenValueModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class _TaxonomyValueModel(_FrozenValueModel):
+    """对 taxonomy DTO 的 model_copy update 重新执行完整验证。"""
+
+    def model_copy(
+        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
+    ) -> Self:
+        if not update:
+            return super().model_copy(deep=deep)
+
+        source = super().model_copy(deep=deep)
+        payload = {
+            field_name: getattr(source, field_name)
+            for field_name in type(self).model_fields
+        }
+        payload.update(update)
+        validated = type(self).model_validate(payload)
+        object.__setattr__(
+            validated,
+            "__pydantic_fields_set__",
+            source.model_fields_set | set(update),
+        )
+        private_state = getattr(source, "__pydantic_private__", None)
+        if private_state is not None:
+            object.__setattr__(validated, "__pydantic_private__", private_state)
+        return validated
+
+
 class _FrozenMapping(Mapping[str, tuple[str, ...]]):
     """可深拷贝且不继承 dict 的只读映射。"""
 
@@ -775,7 +802,7 @@ class DedupOutput(_FrozenValueModel):
         return self
 
 
-class FolderCatalogEntry(_FrozenValueModel):
+class FolderCatalogEntry(_TaxonomyValueModel):
     id: UUID
     parent_id: UUID | None = None
     name: str
@@ -804,7 +831,7 @@ class FolderCatalogEntry(_FrozenValueModel):
         return self
 
 
-class TaxonomyContext(_FrozenValueModel):
+class TaxonomyContext(_TaxonomyValueModel):
     folders: tuple[FolderCatalogEntry, ...] = ()
     classifiable_slugs: tuple[str, ...] = ()
 
@@ -840,7 +867,7 @@ class TaxonomyContext(_FrozenValueModel):
         return self
 
 
-class EmbeddingItem(_FrozenValueModel):
+class EmbeddingItem(_TaxonomyValueModel):
     key: str
     text: str
 
@@ -858,7 +885,7 @@ class EmbeddingItem(_FrozenValueModel):
         return text
 
 
-class EmbeddingRequest(_FrozenValueModel):
+class EmbeddingRequest(_TaxonomyValueModel):
     items: tuple[EmbeddingItem, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -869,7 +896,7 @@ class EmbeddingRequest(_FrozenValueModel):
         return self
 
 
-class EmbeddingOutput(_FrozenValueModel):
+class EmbeddingOutput(_TaxonomyValueModel):
     vectors: Mapping[str, tuple[float, ...]]
 
     @field_serializer("vectors")
@@ -909,7 +936,7 @@ class EmbeddingOutput(_FrozenValueModel):
         return _FrozenVectorMapping(vectors)
 
 
-class TaxonomyTopic(_FrozenValueModel):
+class TaxonomyTopic(_TaxonomyValueModel):
     slug: str
     title: str
     page_type: TopicPageType
@@ -943,7 +970,7 @@ class TaxonomyTopic(_FrozenValueModel):
         return self
 
 
-class AllowedFolderBase(_FrozenValueModel):
+class AllowedFolderBase(_TaxonomyValueModel):
     id: UUID
     path: str
     depth: int = Field(ge=1, le=3)
@@ -960,7 +987,7 @@ class AllowedFolderBase(_FrozenValueModel):
         return self
 
 
-class TaxonomyRequest(_FrozenValueModel):
+class TaxonomyRequest(_TaxonomyValueModel):
     topics: tuple[TaxonomyTopic, ...] = Field(min_length=1, max_length=60)
     allowed_bases: tuple[AllowedFolderBase, ...] = ()
 
@@ -976,7 +1003,7 @@ class TaxonomyRequest(_FrozenValueModel):
         return self
 
 
-class TaxonomyDecision(_FrozenValueModel):
+class TaxonomyDecision(_TaxonomyValueModel):
     slug: str
     base_folder_id: UUID | None = None
     new_segments: tuple[str, ...] = Field(default=(), max_length=2)
@@ -1001,11 +1028,18 @@ class TaxonomyDecision(_FrozenValueModel):
         return self
 
 
-class TaxonomyOutput(_FrozenValueModel):
+class TaxonomyOutput(_TaxonomyValueModel):
     decisions: tuple[TaxonomyDecision, ...] = ()
 
+    @model_validator(mode="after")
+    def validate_decision_slugs(self) -> Self:
+        slugs = [decision.slug for decision in self.decisions]
+        if len(slugs) != len(set(slugs)):
+            raise ValueError("taxonomy decision slug 不能重复")
+        return self
 
-class FolderAssignment(_FrozenValueModel):
+
+class FolderAssignment(_TaxonomyValueModel):
     slug: str
     contributor_op_ids: tuple[UUID, ...] = Field(min_length=1)
     base_folder_id: UUID | None = None
@@ -1069,6 +1103,17 @@ class FolderAssignment(_FrozenValueModel):
     @property
     def wiki_path(self) -> str:
         return f"{self.folder_path}/{self.slug}" if self.folder_path else f"/{self.slug}"
+
+
+class _FolderAssignmentsPayload(_TaxonomyValueModel):
+    items: tuple[FolderAssignment, ...]
+
+    @model_validator(mode="after")
+    def validate_unique_slugs(self) -> Self:
+        slugs = [assignment.slug for assignment in self.items]
+        if len(slugs) != len(set(slugs)):
+            raise ValueError("folder assignment slug 不能重复")
+        return self
 
 
 ContributionAction = Literal["add", "replace", "retract_stale", "retract"]
@@ -1294,6 +1339,17 @@ class BatchApplyRequest(_FrozenValueModel):
     operation_id: UUID
     folder_assignments: tuple[FolderAssignment, ...] = ()
 
+    def model_copy(
+        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
+    ) -> Self:
+        if not update or "folder_assignments" not in update:
+            return super().model_copy(update=update, deep=deep)
+        validated_update = dict(update)
+        validated_update["folder_assignments"] = _FolderAssignmentsPayload(
+            items=validated_update["folder_assignments"]
+        ).items
+        return super().model_copy(update=validated_update, deep=deep)
+
     @field_validator("pages", mode="before")
     @classmethod
     def snapshot_pages(cls, value: object) -> object:
@@ -1322,6 +1378,7 @@ class BatchApplyRequest(_FrozenValueModel):
             raise ValueError("pages slug 不能重复")
         if len(expected_slugs) != len(set(expected_slugs)):
             raise ValueError("expected_pages slug 不能重复")
+        _FolderAssignmentsPayload(items=self.folder_assignments)
         return self
 
 

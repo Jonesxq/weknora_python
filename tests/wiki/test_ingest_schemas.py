@@ -467,6 +467,153 @@ def test_folder_assignment_depth_and_wiki_path_boundaries() -> None:
         )
 
 
+def test_embedding_output_model_copy_validates_and_refreezes_vector_updates() -> None:
+    output = EmbeddingOutput(vectors={"original": (1.0, 0.0)})
+
+    updated = output.model_copy(update={"vectors": {"x": [1.0, 2.0]}})
+
+    assert tuple(updated.vectors) == ("x",)
+    assert updated.vectors["x"] == (1.0, 2.0)
+    with pytest.raises(TypeError):
+        updated.vectors["x"] = (2.0, 1.0)  # type: ignore[index]
+    for invalid_vectors in (
+        {"x": [math.nan, 0.0]},
+        {"x": [1.0], "y": [1.0, 2.0]},
+        {"invalid,key": [1.0, 2.0]},
+    ):
+        with pytest.raises(ValidationError):
+            output.model_copy(update={"vectors": invalid_vectors})
+
+
+def test_embedding_output_model_copy_keeps_shallow_and_deep_copy_semantics() -> None:
+    output = EmbeddingOutput(vectors={"x": (1.0, 2.0)})
+
+    shallow = output.model_copy()
+    deep = output.model_copy(deep=True)
+
+    assert shallow is not output
+    assert shallow.vectors is output.vectors
+    assert deep is not output
+    assert deep.vectors is not output.vectors
+    assert deep == output
+
+
+def test_taxonomy_dto_model_copy_refreezes_tuple_fields() -> None:
+    folder = FolderCatalogEntry(
+        id=uuid4(), parent_id=None, name="Organizations", path="/Organizations", depth=1
+    )
+    topic = TaxonomyTopic(
+        slug="entity/acme", title="Acme", page_type="entity", summary="Organization"
+    )
+    base = AllowedFolderBase(id=folder.id, path=folder.path, depth=folder.depth)
+    decision = TaxonomyDecision(slug=topic.slug, new_segments=("Products",))
+    assignment = FolderAssignment(
+        slug=topic.slug,
+        contributor_op_ids=(uuid4(),),
+        base_folder_id=None,
+        base_path=None,
+        base_depth=0,
+    )
+    cases = (
+        (
+            TaxonomyContext(),
+            {"folders": [folder], "classifiable_slugs": [topic.slug]},
+            ("folders", "classifiable_slugs"),
+        ),
+        (
+            EmbeddingRequest(items=(EmbeddingItem(key="x", text="X"),)),
+            {"items": [{"key": "y", "text": "Y"}]},
+            ("items",),
+        ),
+        (
+            TaxonomyRequest(topics=(topic,), allowed_bases=(base,)),
+            {"topics": [topic], "allowed_bases": [base]},
+            ("topics", "allowed_bases"),
+        ),
+        (decision, {"new_segments": ["Services"]}, ("new_segments",)),
+        (
+            TaxonomyOutput(decisions=(decision,)),
+            {"decisions": [decision]},
+            ("decisions",),
+        ),
+        (
+            assignment,
+            {
+                "contributor_op_ids": [assignment.contributor_op_ids[0]],
+                "new_segments": ["Products"],
+            },
+            ("contributor_op_ids", "new_segments"),
+        ),
+    )
+
+    for model, update, tuple_fields in cases:
+        copied = model.model_copy(update=update)  # type: ignore[attr-defined]
+        for field in tuple_fields:
+            assert isinstance(getattr(copied, field), tuple)
+
+
+def test_taxonomy_dto_model_copy_preserves_deep_nested_copy_semantics() -> None:
+    folder = FolderCatalogEntry(
+        id=uuid4(), parent_id=None, name="Organizations", path="/Organizations", depth=1
+    )
+    context = TaxonomyContext(folders=(folder,))
+
+    copied = context.model_copy(
+        update={"classifiable_slugs": ["entity/acme"]}, deep=True
+    )
+
+    assert copied.folders[0] is not context.folders[0]
+    assert copied.classifiable_slugs == ("entity/acme",)
+
+
+def test_taxonomy_output_rejects_duplicate_slugs_on_init_and_model_copy() -> None:
+    decision = TaxonomyDecision(slug="entity/acme")
+    output = TaxonomyOutput(decisions=(decision,))
+
+    with pytest.raises(ValidationError):
+        TaxonomyOutput(decisions=(decision, decision))
+    with pytest.raises(ValidationError):
+        output.model_copy(update={"decisions": [decision, decision]})
+
+
+def test_batch_apply_request_validates_folder_assignment_copy_updates() -> None:
+    assignment = FolderAssignment(
+        slug="entity/acme",
+        contributor_op_ids=(uuid4(),),
+        base_folder_id=None,
+        base_path=None,
+        base_depth=0,
+    )
+    request = BatchApplyRequest(
+        claim_token=uuid4(),
+        pages=(),
+        contribution_deltas=(),
+        completed_op_ids=(),
+        superseded_op_ids=(),
+        failures=(),
+        expected_pages=(),
+        operation_id=uuid4(),
+        folder_assignments=(assignment,),
+    )
+    duplicate = assignment.model_copy(update={"contributor_op_ids": [uuid4()]})
+
+    updated = request.model_copy(
+        update={"folder_assignments": [assignment.model_dump()]}
+    )
+
+    assert isinstance(updated.folder_assignments, tuple)
+    assert isinstance(updated.folder_assignments[0], FolderAssignment)
+    with pytest.raises(ValidationError):
+        BatchApplyRequest(
+            **{
+                **request.model_dump(),
+                "folder_assignments": [assignment, duplicate],
+            }
+        )
+    with pytest.raises(ValidationError):
+        request.model_copy(update={"folder_assignments": [assignment, duplicate]})
+
+
 def test_worker_options_read_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GRAPH_WIKI_INGEST_BATCH_SIZE", "7")
     monkeypatch.setenv("GRAPH_WIKI_INGEST_MAP_PARALLEL", "3")
