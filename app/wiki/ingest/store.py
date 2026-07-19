@@ -19,6 +19,8 @@ from pydantic import ValidationError
 from sqlalchemy import (
     Select,
     Text,
+    any_,
+    bindparam,
     cast,
     delete,
     func,
@@ -1703,7 +1705,14 @@ class SqlAlchemyIngestStore:
                                 WikiPage.tenant_id == scope.tenant_id,
                                 WikiPage.knowledge_base_id
                                 == scope.knowledge_base_id,
-                                WikiPage.slug.in_(requested_slugs),
+                                WikiPage.slug
+                                == any_(
+                                    bindparam(
+                                        "taxonomy_context_slugs",
+                                        requested_slugs,
+                                        type_=postgresql.ARRAY(Text),
+                                    )
+                                ),
                             )
                             .order_by(WikiPage.slug)
                         )

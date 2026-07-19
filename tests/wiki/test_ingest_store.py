@@ -908,6 +908,38 @@ async def test_load_taxonomy_context_filters_history_and_returns_stable_narrow_s
 
 
 @pytest.mark.asyncio
+async def test_load_taxonomy_context_binds_large_slug_iterable_as_one_parameter() -> (
+    None
+):
+    slug_count = 32_766
+    session = _ScriptedSession(
+        [_ScriptedResult(rows=[]), _ScriptedResult(rows=[])]
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
+
+    context = await store.load_taxonomy_context(
+        SCOPE, (f"entity/item-{index:05d}" for index in range(slug_count))
+    )
+
+    assert len(context.classifiable_slugs) == slug_count
+    assert context.classifiable_slugs[0] == "entity/item-00000"
+    assert context.classifiable_slugs[-1] == "entity/item-32765"
+    page_statement = session.statements[1]
+    compiled = page_statement.compile(
+        dialect=postgresql.dialect(),
+        compile_kwargs={"render_postcompile": True},
+    )
+    assert len(compiled.params) == 3
+    sql = " ".join(str(compiled).split())
+    assert "wiki_pages.slug = ANY" in sql
+    assert "wiki_pages.tenant_id" in sql
+    assert "wiki_pages.knowledge_base_id" in sql
+    assert "wiki_pages.deleted_at" not in sql
+
+
+@pytest.mark.asyncio
 async def test_load_taxonomy_context_uses_topic_candidate_slug_boundary() -> None:
     session = _ScriptedSession([])
     store = SqlAlchemyIngestStore(
