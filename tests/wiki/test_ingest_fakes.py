@@ -261,6 +261,54 @@ async def test_fake_taxonomy_returns_snapshot_and_retries_exactly() -> None:
         output.decisions = ()
 
 
+@pytest.mark.asyncio
+async def test_fake_taxonomy_canonicalizes_unsorted_request_batch_without_reordering_snapshot() -> None:
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["taxonomies"] = {
+        "concept/z,entity/a": {
+            "decisions": [
+                {"slug": "concept/z", "new_segments": ["Concepts"]},
+                {"slug": "entity/a", "new_segments": ["Entities"]},
+            ]
+        }
+    }
+    model = FakeChatModel(FakeDataset.model_validate(payload))
+    request = taxonomy_request("entity/a", "concept/z")
+
+    output = await model.plan_folders(request)
+
+    assert [decision.slug for decision in output.decisions] == ["concept/z", "entity/a"]
+    assert [topic.slug for topic in model.taxonomy_requests[0].topics] == [
+        "entity/a",
+        "concept/z",
+    ]
+    assert model.calls == ["taxonomy:concept/z,entity/a"]
+
+
+@pytest.mark.asyncio
+async def test_fake_taxonomy_unsorted_request_uses_canonical_transient_failure_key() -> None:
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["taxonomies"] = {
+        "concept/z,entity/a": {
+            "decisions": [{"slug": "concept/z"}, {"slug": "entity/a"}]
+        }
+    }
+    payload["transient_failures"]["taxonomy:concept/z,entity/a"] = 1
+    model = FakeChatModel(FakeDataset.model_validate(payload))
+    request = taxonomy_request("entity/a", "concept/z")
+
+    with pytest.raises(TransientModelError, match="taxonomy:concept/z,entity/a"):
+        await model.plan_folders(request)
+    output = await model.plan_folders(request)
+
+    assert [decision.slug for decision in output.decisions] == ["concept/z", "entity/a"]
+    assert [tuple(topic.slug for topic in snapshot.topics) for snapshot in model.taxonomy_requests] == [
+        ("entity/a", "concept/z"),
+        ("entity/a", "concept/z"),
+    ]
+    assert model.calls == ["taxonomy:concept/z,entity/a", "taxonomy:concept/z,entity/a"]
+
+
 @pytest.mark.parametrize(
     ("embeddings", "taxonomies", "failures"),
     [

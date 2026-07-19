@@ -329,9 +329,10 @@ class FakeChatModel:
     async def plan_folders(self, request: TaxonomyRequest) -> TaxonomyOutput:
         snapshot = TaxonomyRequest.model_validate(request.model_dump())
         self.taxonomy_requests.append(snapshot)
-        key = f"taxonomy:{_batch_key(topic.slug for topic in snapshot.topics)}"
+        batch_key = _batch_key(sorted(topic.slug for topic in snapshot.topics))
+        key = f"taxonomy:{batch_key}"
         self._record_call(key)
-        response = self._responses.taxonomies.get(key.removeprefix("taxonomy:"))
+        response = self._responses.taxonomies.get(batch_key)
         if response is None:
             raise PermanentModelError(f"缺少模型响应: {key}")
         return response.model_copy(deep=True)
