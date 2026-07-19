@@ -229,6 +229,7 @@ class WikiLogEntry(Base):
     action: Mapped[str] = mapped_column(String(64), nullable=False)
     message: Mapped[str] = mapped_column(Text, nullable=False)
     pages_affected: Mapped[list[dict[str, str]]] = mapped_column(JSONB, nullable=False, default=list)
+    result_outcome: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     actor_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

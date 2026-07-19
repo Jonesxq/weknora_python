@@ -572,6 +572,7 @@ async def test_modern_apply_results_returns_idempotent_noop_for_same_scope_log(
     session = Session()
     store = SqlAlchemyIngestStore(lambda: session, SqlFinalizationPort())  # type: ignore[arg-type]
     request = _batch_request(operation_id=operation_id)
+    assert existing_log.result_outcome is None
 
     if detailed:
         outcome = await store.apply_results_with_outcome(SCOPE, request)
@@ -583,6 +584,71 @@ async def test_modern_apply_results_returns_idempotent_noop_for_same_scope_log(
         assert await store.apply_results(SCOPE, request) is False  # type: ignore[call-arg]
     assert session.begin_count == 1
     assert session.execute_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result_outcome",
+    [
+        {
+            "completed_op_ids": [],
+            "superseded_op_ids": [],
+            "failed_op_ids": [],
+            "unexpected": [],
+        },
+        {
+            "completed_op_ids": ["not-a-uuid"],
+            "superseded_op_ids": [],
+            "failed_op_ids": [],
+        },
+        {
+            "completed_op_ids": [
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            ],
+            "superseded_op_ids": [],
+            "failed_op_ids": [],
+        },
+        {
+            "completed_op_ids": ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"],
+            "superseded_op_ids": ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"],
+            "failed_op_ids": [],
+        },
+        {
+            "completed_op_ids": ("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",),
+            "superseded_op_ids": [],
+            "failed_op_ids": [],
+        },
+        {
+            "completed_op_ids": ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"],
+            "superseded_op_ids": [],
+            "failed_op_ids": [],
+        },
+    ],
+)
+async def test_idempotent_replay_rejects_corrupt_persisted_outcome(
+    result_outcome: object,
+) -> None:
+    operation_id = uuid4()
+    existing_log = WikiLogEntry(
+        tenant_id=SCOPE.tenant_id,
+        knowledge_base_id=SCOPE.knowledge_base_id,
+        operation_id=operation_id,
+        action="wiki_ingest_batch",
+        message="已完成",
+        pages_affected=[],
+        result_outcome=result_outcome,  # type: ignore[arg-type]
+        actor_id=SCOPE.actor_id,
+    )
+    session = _ScriptedSession([_ScriptedResult(scalar=existing_log)])
+    store = SqlAlchemyIngestStore(_OneSessionFactory(session), SqlFinalizationPort())  # type: ignore[arg-type]
+
+    with pytest.raises(InvariantError, match="终态"):
+        await store.apply_results_with_outcome(
+            SCOPE, _batch_request(operation_id=operation_id)
+        )
+
+    assert len(session.statements) == 2
 
 
 @pytest.mark.asyncio
@@ -2027,6 +2093,23 @@ async def test_later_retract_supersedes_ingest_without_writing_its_slug(
     ]
     log = next(item for item in session.added if isinstance(item, WikiLogEntry))
     assert "跳过 1" in log.message
+    expected_outcome = {
+        "completed_op_ids": [],
+        "superseded_op_ids": [str(ingest.id)],
+        "failed_op_ids": [],
+    }
+    assert log.result_outcome == expected_outcome
+    if detailed:
+        replay_session = _ScriptedSession([_ScriptedResult(scalar=log)])
+        replay_store = SqlAlchemyIngestStore(
+            _OneSessionFactory(replay_session), SqlFinalizationPort()
+        )  # type: ignore[arg-type]
+
+        replay = await replay_store.apply_results_with_outcome(SCOPE, request)
+
+        assert replay.applied is False
+        assert replay.completed_op_ids == replay.failed_op_ids == ()
+        assert replay.superseded_op_ids == (ingest.id,)
 
 
 @pytest.mark.asyncio
@@ -2112,6 +2195,7 @@ async def test_modern_operation_id_reuse_across_scope_rolls_back() -> None:
         action="wiki_ingest_batch",
         message="foreign",
         pages_affected=[],
+        result_outcome={"corrupt": True},
     )
     session = _ScriptedSession([_ScriptedResult(scalar=foreign_log)])
     store = SqlAlchemyIngestStore(_OneSessionFactory(session), SqlFinalizationPort())  # type: ignore[arg-type]

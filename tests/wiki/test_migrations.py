@@ -13,7 +13,14 @@ def test_alembic_has_single_phase_three_head() -> None:
     config = Config("alembic.ini")
     scripts = ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ["20260718_03"]
+    assert scripts.get_heads() == ["20260719_04"]
+    outcome_revision = scripts.get_revision("20260719_04")
+    assert outcome_revision is not None
+    assert outcome_revision.down_revision == "20260718_03"
+    assert outcome_revision.doc == "为 Wiki 操作日志增加批次终态快照"
+    assert callable(outcome_revision.module.upgrade)
+    assert callable(outcome_revision.module.downgrade)
+
     revision = scripts.get_revision("20260718_03")
     assert revision is not None
     assert revision.down_revision == "20260714_02"
@@ -47,6 +54,7 @@ def test_phase_three_upgrade_generates_expected_offline_sql() -> None:
 
     assert "CREATE TABLE wiki_page_contributions" in sql
     assert "CREATE TABLE wiki_dead_letters" in sql
+    assert "ALTER TABLE wiki_log_entries ADD COLUMN result_outcome JSONB" in sql
     assert "CONSTRAINT uq_wiki_page_contributions_version UNIQUE" in sql
     assert "CONSTRAINT uq_wiki_dead_letters_pending_op UNIQUE (pending_op_id)" in sql
     contributions_sql = _create_table_sql(sql, "wiki_page_contributions")
@@ -102,6 +110,32 @@ def test_phase_three_downgrade_generates_expected_offline_sql() -> None:
     assert dead_letters in sql
     assert contributions in sql
     assert sql.index(dedup_index) < sql.index(dead_letters) < sql.index(contributions)
+
+
+def test_result_outcome_downgrade_drops_only_log_snapshot_column() -> None:
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "alembic",
+            "downgrade",
+            "20260719_04:20260718_03",
+            "--sql",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    sql = " ".join(result.stdout.split())
+    assert "ALTER TABLE wiki_log_entries DROP COLUMN result_outcome" in sql
+    assert "DROP TABLE" not in sql
 
 
 def test_phase_two_upgrade_generates_expected_offline_sql() -> None:

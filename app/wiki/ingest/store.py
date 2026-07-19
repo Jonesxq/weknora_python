@@ -686,6 +686,49 @@ def _batch_apply_outcome(
     )
 
 
+_BATCH_OUTCOME_KEYS = {
+    "completed_op_ids",
+    "superseded_op_ids",
+    "failed_op_ids",
+}
+
+
+def _serialize_batch_outcome(outcome: BatchApplyOutcome) -> dict[str, object]:
+    return outcome.model_dump(mode="json", exclude={"applied"})
+
+
+def _restore_batch_outcome(
+    value: object, request: BatchApplyRequest
+) -> BatchApplyOutcome:
+    if not isinstance(value, dict) or set(value) != _BATCH_OUTCOME_KEYS:
+        raise InvariantError("操作日志批次终态结构损坏")
+    if any(
+        not isinstance(value[key], list)
+        or any(not isinstance(item, str) for item in value[key])
+        for key in _BATCH_OUTCOME_KEYS
+    ):
+        raise InvariantError("操作日志批次终态结构损坏")
+    try:
+        outcome = BatchApplyOutcome.model_validate({"applied": False, **value})
+    except (ValidationError, TypeError, ValueError) as exc:
+        raise InvariantError("操作日志批次终态内容损坏") from exc
+    if _serialize_batch_outcome(outcome) != value:
+        raise InvariantError("操作日志批次终态 UUID 不规范")
+    persisted_ids = {
+        *outcome.completed_op_ids,
+        *outcome.superseded_op_ids,
+        *outcome.failed_op_ids,
+    }
+    requested_ids = {
+        *request.completed_op_ids,
+        *request.superseded_op_ids,
+        *(failure.pending_op_id for failure in request.failures),
+    }
+    if persisted_ids != requested_ids:
+        raise InvariantError("操作日志批次终态未覆盖请求操作")
+    return outcome
+
+
 def _validate_delta_for_pending(
     pending: WikiPendingOp, delta: ContributionDelta
 ) -> None:
@@ -1753,6 +1796,10 @@ class SqlAlchemyIngestStore:
                         or existing_log.knowledge_base_id != scope.knowledge_base_id
                     ):
                         raise InvariantError("operation_id 已被其他 scope 使用")
+                    if existing_log.result_outcome is not None:
+                        return _restore_batch_outcome(
+                            existing_log.result_outcome, request
+                        )
                     return _batch_apply_outcome(request, applied=False)
                 requested_ids = {
                     *request.completed_op_ids,
@@ -2059,6 +2106,12 @@ class SqlAlchemyIngestStore:
                             build_link_backfill_statement(scope, row.slug, row.id)
                         )
 
+                actual_outcome = _batch_apply_outcome(
+                    request,
+                    applied=True,
+                    completed_op_ids=completed_ids,
+                    superseded_op_ids=superseded_ids,
+                )
                 op_kinds = {row.op for row in pending_rows}
                 action = (
                     "wiki_ingest_batch"
@@ -2080,6 +2133,7 @@ class SqlAlchemyIngestStore:
                         pages_affected=[
                             {"slug": page.slug, "title": page.title} for page in pages
                         ],
+                        result_outcome=_serialize_batch_outcome(actual_outcome),
                         actor_id=scope.actor_id,
                     )
                 )
@@ -2181,12 +2235,7 @@ class SqlAlchemyIngestStore:
                 if remaining:
                     await _enqueue_follow_up(session, scope, request.operation_id)
                 await session.flush()
-                return _batch_apply_outcome(
-                    request,
-                    applied=True,
-                    completed_op_ids=completed_ids,
-                    superseded_op_ids=superseded_ids,
-                )
+                return actual_outcome
 
     async def pending_count(self, scope: WikiScope) -> int:
         async with self._session_factory() as session:

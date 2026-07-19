@@ -49,6 +49,15 @@ def test_phase_one_models_are_scoped_by_tenant_and_knowledge_base() -> None:
     assert "knowledge_base_id" in WikiLink.__table__.columns
 
 
+def test_wiki_log_result_outcome_is_nullable_jsonb_without_defaults() -> None:
+    column = WikiLogEntry.__table__.c.result_outcome
+
+    assert isinstance(column.type, postgresql.JSONB)
+    assert column.nullable is True
+    assert column.default is None
+    assert column.server_default is None
+
+
 def test_orm_metadata_tracks_search_indexes_created_by_migration() -> None:
     index_names = {index.name for index in WikiPage.__table__.indexes}
 
