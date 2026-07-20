@@ -13,7 +13,9 @@ _AUTOLINK_RE = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^\x00-\x20\x7f<>]*>")
 _REFERENCE_DEFINITION_RE = re.compile(r"(?m)^[ \t]{0,3}\[[^\]\r\n]+\]:[^\r\n]*(?:\r\n|\r|\n|$)")
 _WIKI_TARGET_RE = r"[^\]|\r\n]+"
 _WIKI_DISPLAY_RE = r"[^\]\r\n]*"
-_WIKI_LINK_RE = re.compile(rf"\[\[({_WIKI_TARGET_RE})(?:\|{_WIKI_DISPLAY_RE})?\]\]")
+_WIKI_LINK_RE = re.compile(
+    rf"\[\[({_WIKI_TARGET_RE})(?:\|({_WIKI_DISPLAY_RE}))?\]\]"
+)
 _WIKI_PROTECTED_MARKUP_RE = re.compile(r"\[\[[^\]\r\n]*\]\]")
 _MULTILINE_WIKI_MARKUP_RE = re.compile(r"\[\[[^\]]*[\r\n][^\]]*\]\]")
 _ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_]")
@@ -45,6 +47,28 @@ def extract_safe_wiki_links(content: str) -> tuple[str, ...]:
     """Return distinct normalized Wiki targets found in safe body text."""
 
     return _extract_safe_wiki_links(content, _unsafe_body_spans(content))
+
+
+def wiki_link_text_projection(content: str) -> str:
+    """Project safe, valid Wiki links back to their visible source text."""
+
+    unsafe_body_spans = _unsafe_body_spans(content)
+    pieces: list[str] = []
+    cursor = 0
+    for match in _WIKI_LINK_RE.finditer(content):
+        if _overlaps_protected(unsafe_body_spans, match.start(), match.end()):
+            continue
+        try:
+            normalize_slug(match.group(1))
+        except WikiSlugError:
+            continue
+        pieces.append(content[cursor : match.start()])
+        pieces.append(match.group(1) if match.group(2) is None else match.group(2))
+        cursor = match.end()
+    if not pieces:
+        return content
+    pieces.append(content[cursor:])
+    return "".join(pieces)
 
 
 def _extract_safe_wiki_links(

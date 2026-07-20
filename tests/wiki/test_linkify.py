@@ -22,6 +22,36 @@ def _linkify(content: str, *, current_slug: str, candidates):
     return _api().linkify_markdown(content, current_slug=current_slug, candidates=candidates)
 
 
+def _projection(content: str) -> str:
+    return _api().wiki_link_text_projection(content)
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("Before [[concept/postgresql|PostgreSQL]] after", "Before PostgreSQL after"),
+        ("Before [[concept/postgresql]] after", "Before concept/postgresql after"),
+        ("[[ Concept/My Topic ]]", " Concept/My Topic "),
+    ],
+)
+def test_wiki_link_text_projection_restores_visible_text(
+    content: str, expected: str
+) -> None:
+    assert _projection(content) == expected
+    assert _projection(_projection(content)) == expected
+
+
+def test_wiki_link_text_projection_preserves_protected_and_malformed_markup() -> None:
+    content = (
+        "`[[concept/code|Code]]`\n"
+        "```md\n[[concept/fenced|Fenced]]\n```\n"
+        "[label [[concept/markdown|Markdown]]](https://example.test)\n"
+        "[[concept/live|Live]] [[|bad]] [[concept/broken\nlink]]"
+    )
+
+    assert _projection(content) == content.replace("[[concept/live|Live]]", "Live")
+
+
 def test_linkify_prefers_longer_display_and_adds_each_slug_once() -> None:
     result = _linkify(
         "机器学习依赖学习。机器学习再次出现。",

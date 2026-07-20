@@ -67,7 +67,11 @@ from app.wiki.models import (
     WikiPageContribution,
     WikiPendingOp,
 )
-from app.wiki.linkify import LinkCandidate, linkify_markdown
+from app.wiki.linkify import (
+    LinkCandidate,
+    linkify_markdown,
+    wiki_link_text_projection,
+)
 from app.wiki.scope import WikiScope
 from app.wiki.sql_page_store import (
     SqlAlchemyPageStore,
@@ -247,7 +251,11 @@ def _build_link_candidates_by_source(
 def _semantic_content_changed(
     old_content: str, semantic_content: str, persisted_content: str
 ) -> bool:
-    return old_content != semantic_content and old_content != persisted_content
+    if old_content == semantic_content or old_content == persisted_content:
+        return False
+    return wiki_link_text_projection(old_content) != wiki_link_text_projection(
+        semantic_content
+    )
 
 
 def _build_old_link_candidate_edges_statement(
@@ -2700,7 +2708,6 @@ class SqlAlchemyIngestStore:
 
                 now = datetime.now(UTC)
                 persisted: list[tuple[WikiPage, object]] = []
-                linkify_results_by_slug = {}
                 for row, reduced in selected_pages:
                     if row is None:
                         if reduced.deleted:
@@ -2715,7 +2722,6 @@ class SqlAlchemyIngestStore:
                             candidates=link_candidates_by_source[reduced.slug],
                         )
                         persisted_content = linkify_result.content
-                        linkify_results_by_slug[reduced.slug] = linkify_result
                     if row is None:
                         folder_id, category_path, wiki_path, depth = placements.get(
                             reduced.slug,

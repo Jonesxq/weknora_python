@@ -2131,7 +2131,11 @@ class _ScriptedSession:
         results,
         events: list[str] | None = None,
         *,
-        statement_results: dict[str, list[_ScriptedResult]] | None = None,
+        statement_results: dict[
+            str, list[_ScriptedResult | BaseException]
+        ]
+        | None = None,
+        allow_empty_link_candidates: bool = False,
     ) -> None:
         self.results = list(results)
         self.statement_results = {
@@ -2142,6 +2146,7 @@ class _ScriptedSession:
         self.events = events if events is not None else []
         self.rolled_back = False
         self.added = []
+        self.allow_empty_link_candidates = allow_empty_link_candidates
 
     async def __aenter__(self):
         return self
@@ -2164,8 +2169,13 @@ class _ScriptedSession:
             if pattern in sql:
                 if not values:
                     raise AssertionError(f"exhausted scripted SQL pattern: {pattern}")
-                return values.pop(0)
-        if sql.startswith("SELECT wiki_links.source_page_id, wiki_links.target_slug"):
+                result = values.pop(0)
+                if isinstance(result, BaseException):
+                    raise result
+                return result
+        if self.allow_empty_link_candidates and sql.startswith(
+            "SELECT wiki_links.source_page_id, wiki_links.target_slug"
+        ):
             return _ScriptedResult()
         if not self.results:
             raise AssertionError(f"unexpected SQL: {sql}")
@@ -2186,6 +2196,10 @@ class _ScriptedSession:
         for value in values:
             self.add(value)
 
+    def assert_consumed(self) -> None:
+        assert self.results == []
+        assert all(values == [] for values in self.statement_results.values())
+
 
 class _OneSessionFactory:
     def __init__(self, session: _ScriptedSession) -> None:
@@ -2193,6 +2207,17 @@ class _OneSessionFactory:
 
     def __call__(self):
         return self.session
+
+
+@pytest.mark.asyncio
+async def test_scripted_session_requires_explicit_link_candidate_results() -> None:
+    session = _ScriptedSession([])
+    statement = ingest_store._build_old_link_candidate_edges_statement(
+        SCOPE, (uuid4(),)
+    )
+
+    with pytest.raises(AssertionError, match="unexpected SQL"):
+        await session.execute(statement)
 
 
 class _RecordingFinalization:
@@ -2546,6 +2571,24 @@ def _knowledge(version: str = "version-2") -> SourceKnowledge:
     )
 
 
+def _current_for_reduced(
+    pending: WikiPendingOp, page: ReducedPage
+) -> StoredContributionRecord:
+    return _stored_contribution(
+        knowledge_id=pending.knowledge_id, version=pending.op_version
+    ).model_copy(
+        update={
+            "slug": page.slug,
+            "page_type": page.page_type,
+            "title": page.title,
+            "content": page.content,
+            "summary": page.summary,
+            "aliases": tuple(page.aliases),
+            "chunk_refs": tuple(page.chunk_refs),
+        }
+    )
+
+
 def test_link_candidates_merge_fresh_and_per_source_history_deterministically() -> None:
     source_python = "concept/python"
     source_go = "concept/go"
@@ -2831,7 +2874,14 @@ async def test_load_selected_link_candidates_queries_only_eligible_existing_sour
         contributor_op_ids=[uuid4()],
         deleted=True,
     )
-    session = _ScriptedSession([])
+    session = _ScriptedSession(
+        [],
+        statement_results={
+            "SELECT wiki_links.source_page_id, wiki_links.target_slug": [
+                _ScriptedResult()
+            ]
+        },
+    )
 
     candidates = await ingest_store._load_selected_link_candidates(
         session,
@@ -2886,7 +2936,31 @@ async def test_load_selected_link_candidates_rejects_dirty_query_rows() -> None:
             "[[concept/postgresql|PostgreSQL]]",
             False,
         ),
+        (
+            "[[concept/postgresql|PostgreSQL]]",
+            "PostgreSQL",
+            "PostgreSQL",
+            False,
+        ),
+        (
+            "[[concept/postgresql|Postgres]]",
+            "Postgres",
+            "[[concept/database|Postgres]]",
+            False,
+        ),
         ("Old semantic", "PostgreSQL", "[[concept/postgresql|PostgreSQL]]", True),
+        (
+            "[[concept/postgresql|Postgres]]",
+            "PostgreSQL",
+            "[[concept/postgresql|PostgreSQL]]",
+            True,
+        ),
+        (
+            "`[[concept/postgresql|PostgreSQL]]`",
+            "`PostgreSQL`",
+            "`PostgreSQL`",
+            True,
+        ),
     ],
 )
 def test_semantic_content_change_ignores_automatic_markup_only(
@@ -3036,6 +3110,355 @@ async def test_modern_apply_linkifies_final_selected_pages_without_version_bump(
         if isinstance(item, WikiPage) and item.slug == fresh.slug
     )
     assert inserted.version == 1
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
+async def test_modern_apply_excludes_failed_and_superseded_pages_from_fresh_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = uuid4()
+    completed = _pending(knowledge_id="knowledge-completed", claimed=True)
+    failed = _pending(knowledge_id="knowledge-failed", claimed=True)
+    superseded = _pending(knowledge_id="knowledge-superseded", claimed=True)
+    for pending in (completed, failed, superseded):
+        pending.claim_token = token
+
+    source = _page(slug="concept/source", page_type="concept")
+    source.title = "Source"
+    source.content = "Failed Exclusive and Superseded Exclusive"
+    source.summary = "Source"
+    source.aliases = []
+    source.source_refs = [completed.knowledge_id]
+    source.chunk_refs = ["chunk:source"]
+    source_reduced = ReducedPage(
+        slug=source.slug,
+        title=source.title,
+        page_type="concept",
+        content=source.content,
+        summary=source.summary,
+        aliases=[],
+        source_refs=source.source_refs,
+        chunk_refs=source.chunk_refs,
+        contributor_op_ids=[completed.id],
+    )
+    failed_page = ReducedPage(
+        slug="concept/failed-exclusive",
+        title="Failed Exclusive",
+        page_type="concept",
+        content="Failed",
+        summary="Failed",
+        contributor_op_ids=[failed.id],
+    )
+    superseded_page = ReducedPage(
+        slug="concept/superseded-exclusive",
+        title="Superseded Exclusive",
+        page_type="concept",
+        content="Superseded",
+        summary="Superseded",
+        contributor_op_ids=[superseded.id],
+    )
+    request = BatchApplyRequest.model_construct(
+        claim_token=token,
+        pages=(source_reduced, failed_page, superseded_page),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=completed.id,
+                action="add",
+                slug=source_reduced.slug,
+                knowledge_id=completed.knowledge_id,
+                previous=None,
+                current=_current_for_reduced(completed, source_reduced),
+            ),
+            ContributionDelta(
+                pending_op_id=superseded.id,
+                action="add",
+                slug=superseded_page.slug,
+                knowledge_id=superseded.knowledge_id,
+                previous=None,
+                current=_current_for_reduced(superseded, superseded_page),
+            ),
+        ),
+        completed_op_ids=(completed.id,),
+        superseded_op_ids=(superseded.id,),
+        failures=(
+            OperationFailure(
+                pending_op_id=failed.id,
+                error_code="MODEL_FAILED",
+                error_summary="failed",
+            ),
+        ),
+        expected_pages=(
+            PageExpectation(
+                slug=source.slug, page_id=source.id, version=source.version
+            ),
+            PageExpectation(slug=failed_page.slug),
+            PageExpectation(slug=superseded_page.slug),
+        ),
+        operation_id=uuid4(),
+        folder_assignments=(),
+        index_intro_plan=None,
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[completed, failed, superseded]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[source]),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(rowcount=2),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(scalar=0),
+        ],
+        statement_results={
+            "SELECT wiki_links.source_page_id, wiki_links.target_slug": [
+                _ScriptedResult()
+            ]
+        },
+    )
+    replaced: list[tuple[str, str, list[str]]] = []
+
+    async def record_replace(_store, _scope, row, targets):
+        replaced.append((row.slug, row.content, targets))
+
+    monkeypatch.setattr(
+        "app.wiki.ingest.store.SqlAlchemyPageStore.replace_page_links",
+        record_replace,
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), _RecordingFinalization(session.events)
+    )  # type: ignore[arg-type]
+
+    outcome = await store._apply_batch_results(
+        SCOPE, request, require_taxonomy=False
+    )
+
+    assert outcome.completed_op_ids == (completed.id,)
+    assert outcome.superseded_op_ids == (superseded.id,)
+    assert source.content == "Failed Exclusive and Superseded Exclusive"
+    assert replaced == [(source.slug, source.content, [])]
+    assert not any(
+        isinstance(item, WikiPage)
+        and item.slug in {failed_page.slug, superseded_page.slug}
+        for item in session.added
+    )
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
+async def test_modern_apply_keeps_ambiguous_fresh_and_historical_display_unlinked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = uuid4()
+    pending = _pending(claimed=True)
+    pending.claim_token = token
+    source = _page(slug="concept/source", page_type="concept")
+    source.title = "Source"
+    source.content = "Redis"
+    source.summary = "Source"
+    source.aliases = []
+    source.source_refs = [pending.knowledge_id]
+    source.chunk_refs = ["chunk:source"]
+    source_reduced = ReducedPage(
+        slug=source.slug,
+        title=source.title,
+        page_type="concept",
+        content=source.content,
+        summary=source.summary,
+        source_refs=source.source_refs,
+        chunk_refs=source.chunk_refs,
+        contributor_op_ids=[pending.id],
+    )
+    fresh = ReducedPage(
+        slug="concept/redis-client",
+        title="Redis",
+        page_type="concept",
+        content="Client",
+        summary="Client",
+        contributor_op_ids=[pending.id],
+    )
+    request = _batch_request(
+        claim_token=token,
+        pages=(source_reduced, fresh),
+        contribution_deltas=tuple(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="add",
+                slug=page.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=None,
+                current=_current_for_reduced(pending, page),
+            )
+            for page in (source_reduced, fresh)
+        ),
+        completed_op_ids=(pending.id,),
+        expected_pages=(
+            PageExpectation(
+                slug=source.slug, page_id=source.id, version=source.version
+            ),
+            PageExpectation(slug=fresh.slug),
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[source]),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(scalar=0),
+        ],
+        statement_results={
+            "SELECT wiki_links.source_page_id, wiki_links.target_slug": [
+                _ScriptedResult(rows=[(source.id, "concept/redis")])
+            ],
+            "SELECT wiki_pages.slug, wiki_pages.title, wiki_pages.aliases, wiki_pages.page_type": [
+                _ScriptedResult(rows=[("concept/redis", "Redis", [], "concept")])
+            ],
+        },
+    )
+    replaced: list[tuple[str, str, list[str]]] = []
+
+    async def record_replace(_store, _scope, row, targets):
+        replaced.append((row.slug, row.content, targets))
+
+    monkeypatch.setattr(
+        "app.wiki.ingest.store.SqlAlchemyPageStore.replace_page_links",
+        record_replace,
+    )
+
+    class RootStore(SqlAlchemyIngestStore):
+        async def _resolve_folder_assignment(
+            self,
+            _session: AsyncSession,
+            _scope: WikiScope,
+            assignment: FolderAssignment,
+        ) -> tuple[UUID | None, list[str], str, int]:
+            return None, [], f"/{assignment.slug}", 0
+
+    store = RootStore(
+        _OneSessionFactory(session), _RecordingFinalization(session.events)
+    )  # type: ignore[arg-type]
+
+    assert await store.apply_results(SCOPE, request) is True
+
+    assert source.content == "Redis"
+    assert next(item for item in replaced if item[0] == source.slug) == (
+        source.slug,
+        "Redis",
+        [],
+    )
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("historical_rows", "message"),
+    [
+        ([ ("concept/redis", "Redis", ["bad]alias"], "concept") ], "alias"),
+        ([ ("concept/redis", " Redis ", [], "concept") ], "title"),
+        (
+            [
+                ("concept/redis", "Redis", [], "concept"),
+                ("concept/redis", "Redis", [], "concept"),
+            ],
+            "重复活跃",
+        ),
+    ],
+)
+async def test_modern_apply_rolls_back_on_dirty_historical_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    historical_rows: list[tuple[str, str, list[str], str]],
+    message: str,
+) -> None:
+    token = uuid4()
+    pending = _pending(claimed=True)
+    pending.claim_token = token
+    source = _page(slug="concept/source", page_type="concept")
+    source.title = "Source"
+    source.content = "Redis"
+    source.summary = "Source"
+    source.aliases = []
+    source.source_refs = [pending.knowledge_id]
+    source.chunk_refs = ["chunk:source"]
+    reduced = ReducedPage(
+        slug=source.slug,
+        title=source.title,
+        page_type="concept",
+        content=source.content,
+        summary=source.summary,
+        source_refs=source.source_refs,
+        chunk_refs=source.chunk_refs,
+        contributor_op_ids=[pending.id],
+    )
+    request = _batch_request(
+        claim_token=token,
+        pages=(reduced,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="add",
+                slug=reduced.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=None,
+                current=_current_for_reduced(pending, reduced),
+            ),
+        ),
+        completed_op_ids=(pending.id,),
+        expected_pages=(
+            PageExpectation(
+                slug=source.slug, page_id=source.id, version=source.version
+            ),
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[source]),
+        ],
+        statement_results={
+            "SELECT wiki_links.source_page_id, wiki_links.target_slug": [
+                _ScriptedResult(rows=[(source.id, "concept/redis")])
+            ],
+            "SELECT wiki_pages.slug, wiki_pages.title, wiki_pages.aliases, wiki_pages.page_type": [
+                _ScriptedResult(rows=historical_rows)
+            ],
+        },
+    )
+    replace_called = False
+
+    async def record_replace(*_args):
+        nonlocal replace_called
+        replace_called = True
+
+    monkeypatch.setattr(
+        "app.wiki.ingest.store.SqlAlchemyPageStore.replace_page_links",
+        record_replace,
+    )
+    finalization = _RecordingFinalization(session.events)
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), finalization
+    )  # type: ignore[arg-type]
+    before = (source.content, source.version)
+
+    with pytest.raises(InvariantError, match=message):
+        await store.apply_results(SCOPE, request)
+
+    assert session.rolled_back is True
+    assert session.added == []
+    assert finalization.requests == []
+    assert (source.content, source.version) == before
+    assert replace_called is False
+    assert not any(
+        _sql(statement).startswith(("DELETE FROM wiki_links", "UPDATE wiki_links"))
+        for statement in session.statements
+    )
+    session.assert_consumed()
 
 
 @pytest.mark.asyncio
@@ -3238,7 +3661,8 @@ async def test_modern_apply_results_atomically_replaces_contribution_and_page() 
             _ScriptedResult(rowcount=1),
             _ScriptedResult(),
             _ScriptedResult(scalar=0),
-        ]
+        ],
+        allow_empty_link_candidates=True,
     )
     finalization = _RecordingFinalization(session.events)
     store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
@@ -3841,7 +4265,8 @@ async def test_modern_contribution_conflict_rolls_back_before_page_writes() -> N
             _ScriptedResult(rows=[]),
             _ScriptedResult(rows=[page]),
             _ScriptedResult(rowcount=0),
-        ]
+        ],
+        allow_empty_link_candidates=True,
     )
     finalization = _RecordingFinalization(session.events)
     store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
@@ -3898,7 +4323,8 @@ async def test_modern_finalization_failure_rolls_back_and_stops_pending_delete()
             _ScriptedResult(rows=[page]),
             _ScriptedResult(),
             _ScriptedResult(),
-        ]
+        ],
+        allow_empty_link_candidates=True,
     )
     finalization = _RecordingFinalization(session.events, release_ok=False)
     store = SqlAlchemyIngestStore(_OneSessionFactory(session), finalization)  # type: ignore[arg-type]
