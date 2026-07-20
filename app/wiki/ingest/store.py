@@ -45,6 +45,9 @@ from app.wiki.ingest.schemas import (
     FinalizationRequest,
     FolderAssignment,
     FolderCatalogEntry,
+    IndexIntroContext,
+    IndexPageSnapshot,
+    IndexSummaryItem,
     OperationFailure,
     PageExpectation,
     ReducedPage,
@@ -217,6 +220,10 @@ class IngestStore(Protocol):
     async def load_taxonomy_context(
         self, scope: WikiScope, slugs: Iterable[str]
     ) -> TaxonomyContext: ...
+
+    async def load_index_intro_context(
+        self, scope: WikiScope
+    ) -> IndexIntroContext: ...
 
     async def list_source_contributions(
         self,
@@ -1212,6 +1219,47 @@ def _taxonomy_context(
         raise InvariantError("taxonomy context 查询返回脏数据") from exc
 
 
+def _index_page_snapshot(
+    identity_rows: Iterable[Sequence[object]],
+) -> IndexPageSnapshot | None:
+    identity = list(identity_rows)
+    if len(identity) > 1:
+        raise InvariantError("canonical Index 身份冲突")
+
+    try:
+        if not identity:
+            return None
+        page_id, slug, page_type, status, version, content, summary = identity[0]
+        if slug != "index" or page_type != "index" or status != "published":
+            raise InvariantError("canonical Index 身份冲突")
+        return IndexPageSnapshot(
+            id=page_id,
+            version=version,
+            content=content,
+            summary=summary,
+        )
+    except InvariantError:
+        raise
+    except (ValidationError, TypeError, ValueError) as exc:
+        raise InvariantError("Index intro 上下文包含无效数据库记录") from exc
+
+
+def _index_intro_context(
+    index: IndexPageSnapshot | None,
+    summary_rows: Iterable[Sequence[object]],
+) -> IndexIntroContext:
+    try:
+        recent_summaries = tuple(
+            IndexSummaryItem(slug=slug, title=title, summary=summary)
+            for slug, title, summary in summary_rows
+        )
+        return IndexIntroContext(index=index, recent_summaries=recent_summaries)
+    except InvariantError:
+        raise
+    except (ValidationError, TypeError, ValueError) as exc:
+        raise InvariantError("Index intro 上下文包含无效数据库记录") from exc
+
+
 class SqlAlchemyIngestStore:
     """每个公开操作使用独立短 session 的 PostgreSQL 摄取仓储。"""
 
@@ -1896,6 +1944,52 @@ class SqlAlchemyIngestStore:
         return _taxonomy_context(
             folder_rows, existing_page_slugs, requested_slugs
         )
+
+    async def load_index_intro_context(self, scope: WikiScope) -> IndexIntroContext:
+        async with self._session_factory() as session:
+            identity_rows = list(
+                (
+                    await session.execute(
+                        select(
+                            WikiPage.id,
+                            WikiPage.slug,
+                            WikiPage.page_type,
+                            WikiPage.status,
+                            WikiPage.version,
+                            WikiPage.content,
+                            WikiPage.summary,
+                        )
+                        .where(
+                            WikiPage.tenant_id == scope.tenant_id,
+                            WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                            WikiPage.deleted_at.is_(None),
+                            or_(
+                                WikiPage.slug == "index",
+                                WikiPage.page_type == "index",
+                            ),
+                        )
+                        .limit(2)
+                    )
+                ).all()
+            )
+            index = _index_page_snapshot(identity_rows)
+            summary_rows = list(
+                (
+                    await session.execute(
+                        select(WikiPage.slug, WikiPage.title, WikiPage.summary)
+                        .where(
+                            WikiPage.tenant_id == scope.tenant_id,
+                            WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                            WikiPage.deleted_at.is_(None),
+                            WikiPage.status == "published",
+                            WikiPage.page_type == "summary",
+                        )
+                        .order_by(WikiPage.updated_at.desc(), WikiPage.id.desc())
+                        .limit(200)
+                    )
+                ).all()
+            )
+        return _index_intro_context(index, summary_rows)
 
     async def list_source_contributions(
         self,

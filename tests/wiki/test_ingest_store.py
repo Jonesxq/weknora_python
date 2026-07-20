@@ -18,6 +18,7 @@ from app.wiki.ingest.schemas import (
     ContributionDelta,
     FinalizationRequest,
     FolderAssignment,
+    IndexIntroContext,
     OperationFailure,
     PageExpectation,
     ReducedPage,
@@ -28,6 +29,7 @@ from app.wiki.ingest.store import (
     ClaimLost,
     EnqueueRecord,
     ExistingPageRecord,
+    IngestStore,
     InvariantError,
     PageConflict,
     SqlAlchemyIngestStore,
@@ -1170,6 +1172,195 @@ async def test_load_taxonomy_context_wraps_dirty_dto_rows_only() -> None:
 
     with pytest.raises(InvariantError, match="taxonomy context 查询返回脏数据"):
         await store.load_taxonomy_context(SCOPE, ["entity/new"])
+
+
+@pytest.mark.asyncio
+async def test_load_index_intro_context_uses_scoped_narrow_queries_and_snapshots() -> None:
+    index_row = [uuid4(), "index", "index", "published", 3, " Index body ", " Index summary "]
+    summary_row = ["summary/recent", " Recent ", " Summary "]
+    session = _ScriptedSession(
+        [_ScriptedResult(rows=[index_row]), _ScriptedResult(rows=[summary_row])]
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
+
+    context = await store.load_index_intro_context(SCOPE)
+
+    assert isinstance(store, IngestStore)
+    assert isinstance(context, IndexIntroContext)
+    assert context.index is not None
+    assert context.index.id == index_row[0]
+    assert context.index.content == "Index body"
+    assert [(item.slug, item.title, item.summary) for item in context.recent_summaries] == [
+        ("summary/recent", "Recent", "Summary")
+    ]
+    index_row[5] = "mutated"
+    summary_row[2] = "mutated"
+    assert context.index.content == "Index body"
+    assert context.recent_summaries[0].summary == "Summary"
+    with pytest.raises(ValidationError):
+        context.index.content = "mutated"  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        context.recent_summaries[0].summary = "mutated"  # type: ignore[misc]
+
+    identity_sql, summary_sql = map(_sql, session.statements)
+    assert "wiki_pages.id" in identity_sql
+    assert "wiki_pages.slug" in identity_sql
+    assert "wiki_pages.page_type" in identity_sql
+    assert "wiki_pages.status" in identity_sql
+    assert "wiki_pages.version" in identity_sql
+    assert "wiki_pages.content" in identity_sql
+    assert "wiki_pages.summary" in identity_sql
+    assert "wiki_pages.tenant_id" in identity_sql
+    assert "wiki_pages.knowledge_base_id" in identity_sql
+    assert "wiki_pages.deleted_at IS NULL" in identity_sql
+    assert "wiki_pages.slug =" in identity_sql
+    assert " OR wiki_pages.page_type =" in identity_sql
+    assert 2 in session.statements[0].compile(dialect=postgresql.dialect()).params.values()
+    assert "wiki_pages.slug" in summary_sql
+    assert "wiki_pages.title" in summary_sql
+    assert "wiki_pages.summary" in summary_sql
+    assert "wiki_pages.content" not in summary_sql
+    assert "wiki_pages.aliases" not in summary_sql
+    assert "wiki_pages.tenant_id" in summary_sql
+    assert "wiki_pages.knowledge_base_id" in summary_sql
+    assert "wiki_pages.deleted_at IS NULL" in summary_sql
+    assert "wiki_pages.status =" in summary_sql
+    assert "wiki_pages.page_type =" in summary_sql
+    assert "ORDER BY wiki_pages.updated_at DESC, wiki_pages.id DESC" in summary_sql
+    assert 200 in session.statements[1].compile(dialect=postgresql.dialect()).params.values()
+
+
+@pytest.mark.asyncio
+async def test_load_index_intro_context_returns_empty_index_and_summaries() -> None:
+    session = _ScriptedSession([_ScriptedResult(rows=[]), _ScriptedResult(rows=[])])
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
+
+    context = await store.load_index_intro_context(SCOPE)
+
+    assert context.index is None
+    assert context.recent_summaries == ()
+    assert len(session.statements) == 2
+
+
+@pytest.mark.asyncio
+async def test_load_index_intro_context_rejects_identity_conflict_without_summary_query() -> None:
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(
+                rows=[
+                    (uuid4(), "index", "index", "published", 1, "", ""),
+                    (uuid4(), "summary/index", "index", "published", 1, "", ""),
+                ]
+            )
+        ]
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(InvariantError, match="canonical Index 身份冲突"):
+        await store.load_index_intro_context(SCOPE)
+
+    assert len(session.statements) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identity_row",
+    [
+        (uuid4(), "index", "summary", "published", 1, "", ""),
+        (uuid4(), "summary/index", "index", "published", 1, "", ""),
+        (uuid4(), "index", "index", "archived", 1, "", ""),
+    ],
+)
+async def test_load_index_intro_context_rejects_noncanonical_identity_row(
+    identity_row: tuple[object, ...],
+) -> None:
+    session = _ScriptedSession([_ScriptedResult(rows=[identity_row])])
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(InvariantError, match="canonical Index 身份冲突"):
+        await store.load_index_intro_context(SCOPE)
+
+    assert len(session.statements) == 1
+
+
+@pytest.mark.asyncio
+async def test_load_index_intro_context_preserves_recent_summary_sql_order() -> None:
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(
+                rows=[
+                    ("summary/newest", "Newest", "First"),
+                    ("summary/older", "Older", "Second"),
+                ]
+            ),
+        ]
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
+
+    context = await store.load_index_intro_context(SCOPE)
+
+    assert [item.slug for item in context.recent_summaries] == [
+        "summary/newest",
+        "summary/older",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("identity_rows", "summary_rows"),
+    [
+        ([(uuid4(), "index", "index", "published", 0, "", "")], []),
+        (
+            [(uuid4(), "index", "index", "published", 1, "", "")],
+            [("summary/not valid", "Title", "Summary")],
+        ),
+        (
+            [(uuid4(), "index", "index", "published", 1, "", "")],
+            [
+                ("summary/duplicate", "First", "One"),
+                ("summary/duplicate", "Second", "Two"),
+            ],
+        ),
+    ],
+)
+async def test_load_index_intro_context_wraps_dirty_database_rows(
+    identity_rows: list[tuple[object, ...]],
+    summary_rows: list[tuple[object, ...]],
+) -> None:
+    session = _ScriptedSession(
+        [_ScriptedResult(rows=identity_rows), _ScriptedResult(rows=summary_rows)]
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(InvariantError, match="Index intro 上下文包含无效数据库记录"):
+        await store.load_index_intro_context(SCOPE)
+
+
+@pytest.mark.asyncio
+async def test_load_index_intro_context_propagates_database_execution_error() -> None:
+    error = RuntimeError("database unavailable")
+    session = _ScriptedSession([error])
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError) as raised:
+        await store.load_index_intro_context(SCOPE)
+
+    assert raised.value is error
 
 
 def test_claim_pending_sql_is_scoped_ordered_and_skip_locked() -> None:
