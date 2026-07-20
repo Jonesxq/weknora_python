@@ -97,6 +97,46 @@ def test_existing_wiki_link_suppresses_all_candidates_for_its_slug() -> None:
     assert result.added_slugs == ()
 
 
+def test_extract_safe_wiki_links_returns_tuple_in_safe_body_order() -> None:
+    content = (
+        "`[[concept/code]]` [[concept/real|真实]]\n"
+        "```md\n"
+        "[[entity/fenced]]\n"
+        "```\n"
+        "[[concept/real]] [[entity/acme]]"
+    )
+
+    links = _api().extract_safe_wiki_links(content)
+
+    assert isinstance(links, tuple)
+    assert links == ("concept/real", "entity/acme")
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "[label [[concept/hidden]]](https://example.test) [[concept/real]]",
+        "![label [[concept/hidden]]](image.png) [[concept/real]]",
+        "[label [[concept/hidden]]][ref]\n[ref]: https://example.test\n[[concept/real]]",
+        "[ref]: https://example.test/[[concept/hidden]]\n[[concept/real]]",
+        "<https://example.test/[[concept/hidden]]> [[concept/real]]",
+    ],
+)
+def test_extract_safe_wiki_links_skips_markdown_protected_markup(content: str) -> None:
+    assert _api().extract_safe_wiki_links(content) == ("concept/real",)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "`[[concept/hidden]] [[concept/real]]",
+        "```md\n[[concept/hidden]]\n[[concept/real]]",
+    ],
+)
+def test_extract_safe_wiki_links_skips_unclosed_code_markup(content: str) -> None:
+    assert _api().extract_safe_wiki_links(content) == ()
+
+
 def test_wiki_link_inside_code_does_not_suppress_safe_text() -> None:
     content = "`[[concept/ai|AI]]`\n```\nignored\n```\nAI"
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 
-_WIKI_LINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]*)?\]\]")
 _WHITESPACE_RE = re.compile(r"\s+")
 _HYPHEN_RE = re.compile(r"-+")
 
@@ -32,17 +31,9 @@ def normalize_slug(value: str) -> str:
 def extract_wiki_links(content: str) -> list[str]:
     """按正文出现顺序解析并去重合法 Wiki 链接目标。"""
 
-    links: list[str] = []
-    seen: set[str] = set()
-    for match in _WIKI_LINK_RE.finditer(content):
-        try:
-            slug = normalize_slug(match.group(1))
-        except WikiSlugError:
-            continue
-        if slug not in seen:
-            seen.add(slug)
-            links.append(slug)
-    return links
+    from app.wiki.linkify import extract_safe_wiki_links
+
+    return list(extract_safe_wiki_links(content))
 
 
 def normalize_category_path(values: list[str], *, max_depth: int = 3) -> list[str]:

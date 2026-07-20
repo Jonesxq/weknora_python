@@ -38,6 +38,32 @@ def protected_spans(content: str) -> tuple[tuple[int, int], ...]:
     return tuple(_merge_spans(spans))
 
 
+def extract_safe_wiki_links(content: str) -> tuple[str, ...]:
+    """Return distinct normalized Wiki targets found in safe body text."""
+
+    return _extract_safe_wiki_links(content, _unsafe_body_spans(content))
+
+
+def _extract_safe_wiki_links(
+    content: str,
+    unsafe_body_spans: list[tuple[int, int]],
+) -> tuple[str, ...]:
+    links: list[str] = []
+    seen: set[str] = set()
+    for match in _WIKI_LINK_RE.finditer(content):
+        if _overlaps_protected(unsafe_body_spans, match.start(), match.end()):
+            continue
+        try:
+            slug = normalize_slug(match.group(1))
+        except WikiSlugError:
+            continue
+        if "/" not in slug or slug in seen:
+            continue
+        seen.add(slug)
+        links.append(slug)
+    return tuple(links)
+
+
 def linkify_markdown(
     content: str,
     *,
@@ -50,9 +76,11 @@ def linkify_markdown(
     code_spans = _fenced_code_spans(content)
     code_spans.extend(_inline_code_spans(content, code_spans))
     code_spans = _merge_spans(code_spans)
-    spans = list(protected_spans(content))
-    unsafe_body_spans = _merge_spans(code_spans + _non_wiki_markdown_spans(content))
-    existing_slugs = _existing_wiki_slugs(content, unsafe_body_spans)
+    non_wiki_markdown_spans = _non_wiki_markdown_spans(content)
+    wiki_markup_spans = [(match.start(), match.end()) for match in _WIKI_MARKUP_RE.finditer(content)]
+    spans = _merge_spans(code_spans + wiki_markup_spans + non_wiki_markdown_spans)
+    unsafe_body_spans = _merge_spans(code_spans + non_wiki_markdown_spans)
+    existing_slugs = set(_extract_safe_wiki_links(content, unsafe_body_spans))
     prepared = _prepare_candidates(candidates, normalized_current_slug, existing_slugs)
     added_slugs: list[str] = []
     added_slug_set: set[str] = set()
@@ -153,16 +181,10 @@ def _is_escaped(content: str, index: int) -> bool:
     return slash_count % 2 == 1
 
 
-def _existing_wiki_slugs(content: str, unsafe_body_spans: list[tuple[int, int]]) -> set[str]:
-    existing: set[str] = set()
-    for match in _WIKI_LINK_RE.finditer(content):
-        if _overlaps_protected(unsafe_body_spans, match.start(), match.end()):
-            continue
-        try:
-            existing.add(normalize_slug(match.group(1)))
-        except WikiSlugError:
-            continue
-    return existing
+def _unsafe_body_spans(content: str) -> list[tuple[int, int]]:
+    code_spans = _fenced_code_spans(content)
+    code_spans.extend(_inline_code_spans(content, code_spans))
+    return _merge_spans(code_spans + _non_wiki_markdown_spans(content))
 
 
 def _fenced_code_spans(content: str) -> list[tuple[int, int]]:

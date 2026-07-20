@@ -38,6 +38,28 @@ def test_extract_wiki_links_ignores_malformed_targets() -> None:
     ]
 
 
+def test_extract_wiki_links_uses_safe_body_markup_and_returns_a_list() -> None:
+    content = (
+        "`[[concept/code]]` [[concept/real|真实]]\n"
+        "```md\n"
+        "[[entity/fenced]]\n"
+        "```\n"
+        "[[concept/real]] [[entity/acme]]"
+    )
+
+    links = extract_wiki_links(content)
+
+    assert isinstance(links, list)
+    assert links == ["concept/real", "entity/acme"]
+
+
+def test_extract_wiki_links_skips_invalid_targets_without_losing_later_safe_links() -> None:
+    assert extract_wiki_links("[[not valid]] [[concept/python]] [[../escape]] [[entity/acme]]") == [
+        "concept/python",
+        "entity/acme",
+    ]
+
+
 def test_normalize_category_path_removes_empty_duplicate_and_extra_levels() -> None:
     assert normalize_category_path([" 技术 ", "", "技术", " AI ", "模型", "多余"]) == [
         "技术",
