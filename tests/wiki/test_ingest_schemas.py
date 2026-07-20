@@ -1122,7 +1122,10 @@ def test_apply_request_rejects_cross_group_operation_id_overlap(
     completed: list[str], superseded: list[str], failures: list[str]
 ) -> None:
     op_id = uuid4()
-    make_ids = lambda values: [op_id for _ in values]
+
+    def make_ids(values: list[str]) -> list[UUID]:
+        return [op_id for _ in values]
+
     with pytest.raises(ValidationError):
         BatchApplyRequest(claim_token=uuid4(), pages=[], contribution_deltas=[], completed_op_ids=make_ids(completed), superseded_op_ids=make_ids(superseded), failures=[OperationFailure(pending_op_id=op_id, error_code="code", error_summary="failed") for _ in failures], expected_pages=[], operation_id=uuid4())
 
