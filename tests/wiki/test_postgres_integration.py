@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from random import Random
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
@@ -25,7 +25,14 @@ from sqlalchemy.ext.asyncio import (
 from app.infrastructure.database.base import Base
 from app.schemas.wiki.pages import WikiPageCreateRequest, WikiPageUpdateRequest
 from app.wiki.errors import WikiNotFoundError, WikiVersionConflictError
+from app.wiki.ingest.enqueue import WikiEnqueueService
+from app.wiki.ingest.fakes import (
+    FakeChatModel,
+    FakeEmbeddingModel,
+    load_fake_runtime_adapters,
+)
 from app.wiki.ingest.schemas import (
+    BatchApplyOutcome,
     BatchApplyRequest,
     ContributionDelta,
     FolderAssignment,
@@ -90,7 +97,7 @@ def test_postgres_worker_constructions_supply_embedding_model() -> None:
         and node.func.id == "WikiIngestWorker"
     ]
 
-    assert len(worker_calls) == 3
+    assert len(worker_calls) == 4
     assert [
         node.lineno
         for node in worker_calls
@@ -239,6 +246,134 @@ async def postgres_factory() -> async_sessionmaker[AsyncSession]:
         await _cleanup_postgres_engine(
             engine, schema, schema_created=schema_created
         )
+
+
+class RecordingSqlAlchemyIngestStore(SqlAlchemyIngestStore):
+    def __init__(
+        self,
+        factory: async_sessionmaker[AsyncSession],
+        finalization: SqlFinalizationPort,
+    ) -> None:
+        super().__init__(factory, finalization)
+        self.last_request: BatchApplyRequest | None = None
+
+    async def apply_results_with_outcome(
+        self,
+        scope: WikiScope,
+        request: BatchApplyRequest,
+    ) -> BatchApplyOutcome:
+        snapshot = BatchApplyRequest.model_validate(request.model_dump(mode="python"))
+        self.last_request = snapshot
+        return await super().apply_results_with_outcome(scope, snapshot)
+
+
+async def _real_taxonomy_worker(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> tuple[
+    WikiScope,
+    RecordingSqlAlchemyIngestStore,
+    WikiIngestWorker,
+    FakeChatModel,
+    FakeEmbeddingModel,
+    UUID,
+]:
+    source, model, embedding = load_fake_runtime_adapters(
+        Path("examples/wiki_fake_data.json")
+    )
+    scope = WikiScope(
+        tenant_id=1,
+        knowledge_base_id=UUID("11111111-1111-1111-1111-111111111111"),
+        actor_id="task11",
+    )
+    store = RecordingSqlAlchemyIngestStore(
+        postgres_factory, SqlFinalizationPort()
+    )
+    enqueued = await WikiEnqueueService(source, store).enqueue(scope, "knowledge-1")
+    assert enqueued.pending_op_id is not None
+
+    async def retry_wait(_seconds: int) -> None:
+        return None
+
+    worker = WikiIngestWorker(
+        store=store,
+        locks=MemoryWikiLockManager(),
+        source=source,
+        model=model,
+        embedding_model=embedding,
+        options=WikiWorkerOptions(),
+        retry_wait=retry_wait,
+    )
+    return scope, store, worker, model, embedding, enqueued.pending_op_id
+
+
+@pytest.mark.asyncio
+async def test_real_worker_applies_taxonomy_once_and_replay_is_idempotent(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope, store, worker, model, embedding, op_id = await _real_taxonomy_worker(
+        postgres_factory
+    )
+
+    result = await worker.run_batch(scope)
+
+    assert result.completed_op_ids == (op_id,)
+    assert result.failed_op_ids == result.superseded_op_ids == ()
+    assert len(model.taxonomy_requests) == 1
+    assert embedding.calls == []
+    request = store.last_request
+    assert request is not None
+
+    async with postgres_factory() as session:
+        pages = {
+            page.slug: page
+            for page in (
+                await session.execute(
+                    select(WikiPage).where(
+                        WikiPage.tenant_id == scope.tenant_id,
+                        WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                    )
+                )
+            ).scalars()
+        }
+        versions = {slug: page.version for slug, page in pages.items()}
+        folder_count = await session.scalar(
+            select(func.count(WikiFolder.id)).where(
+                WikiFolder.tenant_id == scope.tenant_id,
+                WikiFolder.knowledge_base_id == scope.knowledge_base_id,
+            )
+        )
+
+    assert pages["entity/acme"].category_path == ["Organizations", "Products"]
+    assert pages["entity/acme"].wiki_path == "/Organizations/Products/entity/acme"
+    assert pages["entity/acme"].depth == 2
+    assert pages["concept/retrieval"].folder_id is None
+    assert pages["concept/retrieval"].category_path == []
+    assert pages["concept/retrieval"].wiki_path == "/concept/retrieval"
+    assert pages["concept/retrieval"].depth == 0
+    assert folder_count == 2
+
+    replay = await store.apply_results_with_outcome(scope, request)
+
+    assert replay.applied is False
+    async with postgres_factory() as session:
+        replayed_versions = dict(
+            (
+                await session.execute(
+                    select(WikiPage.slug, WikiPage.version).where(
+                        WikiPage.tenant_id == scope.tenant_id,
+                        WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                    )
+                )
+            ).all()
+        )
+        replayed_folder_count = await session.scalar(
+            select(func.count(WikiFolder.id)).where(
+                WikiFolder.tenant_id == scope.tenant_id,
+                WikiFolder.knowledge_base_id == scope.knowledge_base_id,
+            )
+        )
+    assert replayed_versions == versions
+    assert replayed_folder_count == folder_count
 
 
 async def _claim_taxonomy_ingest(
@@ -507,6 +642,103 @@ async def test_concurrent_crossed_folder_assignments_are_serialized_per_scope(
             assert pages[slug].category_path == category_path
             assert pages[slug].wiki_path == wiki_path
             assert pages[slug].depth == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_new_topics_share_one_new_taxonomy_chain(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scope = WikiScope(
+        tenant_id=51, knowledge_base_id=uuid4(), actor_id="task11-concurrent"
+    )
+    first_store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    second_store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    first_pending = await _claim_taxonomy_ingest(
+        first_store, scope, knowledge_id="same-chain-first"
+    )
+    second_pending = await _claim_taxonomy_ingest(
+        second_store, scope, knowledge_id="same-chain-second"
+    )
+    first_page = ReducedPage(
+        slug="entity/same-chain-first",
+        title="Same chain first",
+        page_type="entity",
+        content="First",
+        summary="First",
+        contributor_op_ids=[first_pending.id],
+    )
+    second_page = ReducedPage(
+        slug="entity/same-chain-second",
+        title="Same chain second",
+        page_type="entity",
+        content="Second",
+        summary="Second",
+        contributor_op_ids=[second_pending.id],
+    )
+    first_request = _taxonomy_apply_request(
+        first_pending,
+        first_page,
+        folder_assignments=(
+            FolderAssignment(
+                slug=first_page.slug,
+                contributor_op_ids=(first_pending.id,),
+                new_segments=("Organizations", "Products"),
+            ),
+        ),
+    )
+    second_request = _taxonomy_apply_request(
+        second_pending,
+        second_page,
+        folder_assignments=(
+            FolderAssignment(
+                slug=second_page.slug,
+                contributor_op_ids=(second_pending.id,),
+                new_segments=("Organizations", "Products"),
+            ),
+        ),
+    )
+
+    outcomes = await asyncio.wait_for(
+        asyncio.gather(
+            first_store.apply_results_with_outcome(scope, first_request),
+            second_store.apply_results_with_outcome(scope, second_request),
+        ),
+        timeout=10,
+    )
+
+    assert [outcome.applied for outcome in outcomes] == [True, True]
+    async with postgres_factory() as session:
+        folders = list(
+            (
+                await session.execute(
+                    select(WikiFolder)
+                    .where(
+                        WikiFolder.tenant_id == scope.tenant_id,
+                        WikiFolder.knowledge_base_id == scope.knowledge_base_id,
+                    )
+                    .order_by(WikiFolder.path)
+                )
+            ).scalars()
+        )
+        pages = {
+            page.slug: page
+            for page in (
+                await session.execute(
+                    select(WikiPage).where(
+                        WikiPage.tenant_id == scope.tenant_id,
+                        WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                    )
+                )
+            ).scalars()
+        }
+
+    assert [folder.path for folder in folders] == [
+        "/Organizations",
+        "/Organizations/Products",
+    ]
+    assert folders[1].parent_id == folders[0].id
+    assert pages[first_page.slug].category_path == ["Organizations", "Products"]
+    assert pages[second_page.slug].category_path == ["Organizations", "Products"]
 
 
 @pytest.mark.asyncio
@@ -846,14 +1078,13 @@ async def test_invalid_taxonomy_base_rolls_back_without_residual_folder(
     scope = WikiScope(tenant_id=44, knowledge_base_id=uuid4(), actor_id="task8")
     folder_tenant = scope.tenant_id + 1 if conflict == "tenant" else scope.tenant_id
     folder_kb = uuid4() if conflict == "knowledge_base" else scope.knowledge_base_id
-    actual_path = "/Moved" if conflict == "moved" else "/Base"
     async with postgres_factory() as session, session.begin():
         base = WikiFolder(
             tenant_id=folder_tenant,
             knowledge_base_id=folder_kb,
             parent_id=None,
-            name=actual_path.removeprefix("/"),
-            path=actual_path,
+            name="Base",
+            path="/Base",
             depth=1,
             deleted_at=datetime.now(UTC) if conflict == "deleted" else None,
         )
@@ -877,25 +1108,29 @@ async def test_invalid_taxonomy_base_rolls_back_without_residual_folder(
         slug=page.slug,
         contributor_op_ids=(pending.id,),
         base_folder_id=base_id,
-        base_path="/Original" if conflict == "moved" else "/Base",
+        base_path="/Base",
         base_depth=1,
-        new_segments=("Residual",),
+        new_segments=("Products",),
     )
+    request = _taxonomy_apply_request(
+        pending,
+        page,
+        folder_assignments=(assignment,),
+    )
+    if conflict == "moved":
+        async with postgres_factory() as session, session.begin():
+            moved_base = await session.get(WikiFolder, base_id)
+            assert moved_base is not None
+            moved_base.name = "Moved"
+            moved_base.path = "/Moved"
 
     with pytest.raises(PageConflict, match="taxonomy base 目录已移动或失效"):
-        await store.apply_results_with_outcome(
-            scope,
-            _taxonomy_apply_request(
-                pending,
-                page,
-                folder_assignments=(assignment,),
-            ),
-        )
+        await store.apply_results_with_outcome(scope, request)
 
     async with postgres_factory() as session:
         assert (
             await session.scalar(
-                select(func.count(WikiFolder.id)).where(WikiFolder.name == "Residual")
+                select(func.count(WikiFolder.id)).where(WikiFolder.name == "Products")
             )
             == 0
         )
