@@ -97,6 +97,16 @@ def test_existing_wiki_link_suppresses_all_candidates_for_its_slug() -> None:
     assert result.added_slugs == ()
 
 
+def test_existing_single_segment_wiki_link_suppresses_same_candidate() -> None:
+    result = _linkify(
+        "[[topic|Topic]] and Topic",
+        current_slug="concept/overview",
+        candidates=(_candidate("topic", "Topic"),),
+    )
+
+    assert result == _api().LinkifyResult("[[topic|Topic]] and Topic", False, ())
+
+
 def test_extract_safe_wiki_links_returns_tuple_in_safe_body_order() -> None:
     content = (
         "`[[concept/code]]` [[concept/real|真实]]\n"
@@ -124,6 +134,25 @@ def test_extract_safe_wiki_links_returns_tuple_in_safe_body_order() -> None:
 )
 def test_extract_safe_wiki_links_skips_markdown_protected_markup(content: str) -> None:
     assert _api().extract_safe_wiki_links(content) == ("concept/real",)
+
+
+def test_extract_safe_wiki_links_skips_custom_uri_autolinks() -> None:
+    assert _api().extract_safe_wiki_links("<foo:[[concept/ai]]> [[concept/real]]") == (
+        "concept/real",
+    )
+
+
+def test_custom_uri_autolink_does_not_suppress_later_safe_candidate() -> None:
+    content = "<foo:[[concept/ai|AI]]> AI"
+
+    result = _linkify(
+        content,
+        current_slug="concept/overview",
+        candidates=(_candidate("concept/ai", "AI"),),
+    )
+
+    assert result.content == content[:-2] + "[[concept/ai|AI]]"
+    assert result.added_slugs == ("concept/ai",)
 
 
 @pytest.mark.parametrize(

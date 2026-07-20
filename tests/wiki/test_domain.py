@@ -54,10 +54,14 @@ def test_extract_wiki_links_uses_safe_body_markup_and_returns_a_list() -> None:
 
 
 def test_extract_wiki_links_skips_invalid_targets_without_losing_later_safe_links() -> None:
-    assert extract_wiki_links("[[not valid]] [[concept/python]] [[../escape]] [[entity/acme]]") == [
+    assert extract_wiki_links("[[../escape]] [[concept/python]] [[entity/acme]]") == [
         "concept/python",
         "entity/acme",
     ]
+
+
+def test_extract_wiki_links_normalizes_single_segment_targets() -> None:
+    assert extract_wiki_links("[[Topic Name]] [[topic-name]]") == ["topic-name"]
 
 
 def test_normalize_category_path_removes_empty_duplicate_and_extra_levels() -> None:
