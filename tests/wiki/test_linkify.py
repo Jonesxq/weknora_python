@@ -307,3 +307,69 @@ def test_existing_wiki_link_outside_safe_body_does_not_suppress_candidate(conten
 
     assert result.content == content[:-2] + "[[concept/ai|AI]]"
     assert result.added_slugs == ("concept/ai",)
+
+
+@pytest.mark.parametrize("display", ["A]B", "A\rB", "A\nB"])
+def test_unrepresentable_display_is_skipped_idempotently(display: str) -> None:
+    candidates = (_candidate("concept/token", display),)
+
+    first = _linkify(display, current_slug="concept/overview", candidates=candidates)
+    second = _linkify(first.content, current_slug="concept/overview", candidates=candidates)
+
+    assert first == _api().LinkifyResult(display, False, ())
+    assert second == first
+
+
+def test_display_may_contain_open_bracket_and_pipe() -> None:
+    display = "A[B|C"
+    candidates = (_candidate("concept/token", display),)
+
+    first = _linkify(display, current_slug="concept/overview", candidates=candidates)
+    second = _linkify(first.content, current_slug="concept/overview", candidates=candidates)
+
+    assert first.content == "[[concept/token|A[B|C]]"
+    assert second == _api().LinkifyResult(first.content, False, ())
+
+
+class _CountingText(str):
+    def __new__(cls, value: str):
+        instance = super().__new__(cls, value)
+        instance.index_reads = 0
+        return instance
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            self.index_reads += 1
+        return super().__getitem__(key)
+
+
+def test_markdown_bracket_scan_is_near_linear_with_many_unclosed_brackets() -> None:
+    content = _CountingText("[" * 4000 + "[AI](url)")
+
+    spans = _api()._markdown_link_spans(content)
+
+    assert spans == [(4000, len(content))]
+    assert content.index_reads < 100_000
+
+
+def test_main_scan_uses_cursor_for_many_protected_spans(monkeypatch) -> None:
+    module = _api()
+    comparisons = 0
+
+    def counted_protected_end(spans, index):
+        nonlocal comparisons
+        for start, end in spans:
+            comparisons += 1
+            if index < start:
+                return None
+            if start <= index < end:
+                return end
+        return None
+
+    monkeypatch.setattr(module, "_protected_end", counted_protected_end)
+    content = " ".join("[AI](x)" for _ in range(4000))
+
+    result = module.linkify_markdown(content, current_slug="concept/overview", candidates=())
+
+    assert result == module.LinkifyResult(content, False, ())
+    assert comparisons < 100_000

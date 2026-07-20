@@ -55,15 +55,19 @@ def linkify_markdown(
     existing_slugs = _existing_wiki_slugs(content, unsafe_body_spans)
     prepared = _prepare_candidates(candidates, normalized_current_slug, existing_slugs)
     added_slugs: list[str] = []
+    added_slug_set: set[str] = set()
     index = 0
+    protected_cursor = 0
 
     while index < len(content):
-        protected_end = _protected_end(spans, index)
-        if protected_end is not None:
-            index = protected_end
+        while protected_cursor < len(spans) and spans[protected_cursor][1] <= index:
+            protected_cursor += 1
+        if protected_cursor < len(spans) and spans[protected_cursor][0] <= index:
+            index = spans[protected_cursor][1]
+            protected_cursor += 1
             continue
 
-        candidate = _candidate_at(content, index, prepared, set(added_slugs), spans)
+        candidate = _candidate_at(content, index, prepared, added_slug_set, spans)
         if candidate is None:
             index += 1
             continue
@@ -72,7 +76,9 @@ def linkify_markdown(
         content = content[:index] + replacement + content[index + len(candidate.display) :]
         spans = _shift_spans_for_insert(spans, index, len(candidate.display), len(replacement))
         added_slugs.append(candidate.slug)
+        added_slug_set.add(candidate.slug)
         index += len(replacement)
+        protected_cursor = _first_span_ending_after(spans, index)
 
     return LinkifyResult(content, bool(added_slugs), tuple(added_slugs))
 
@@ -91,7 +97,7 @@ def _prepare_candidates(
             display = candidate.display.strip()
         except (TypeError, AttributeError, ValueError):
             continue
-        if not display:
+        if not display or any(character in display for character in "]\r\n"):
             continue
         pairs.add((slug, display))
         by_display.setdefault(display, set()).add(slug)
@@ -265,12 +271,13 @@ def _non_wiki_markdown_spans(content: str) -> list[tuple[int, int]]:
 
 def _markdown_link_spans(content: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
+    bracket_pairs = _bracket_pairs(content)
     index = 0
     while index < len(content):
         opening = content.find("[", index)
         if opening == -1:
             break
-        closing = _closing_bracket(content, opening)
+        closing = bracket_pairs.get(opening)
         if closing is None:
             index = opening + 1
             continue
@@ -283,7 +290,7 @@ def _markdown_link_spans(content: str) -> list[tuple[int, int]]:
                 index = end + 1
                 continue
         if next_index < len(content) and content[next_index] == "[":
-            end = _closing_bracket(content, next_index)
+            end = bracket_pairs.get(next_index)
             if end is not None:
                 spans.append((start, end + 1))
                 index = end + 1
@@ -292,19 +299,15 @@ def _markdown_link_spans(content: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _closing_bracket(content: str, opening: int) -> int | None:
-    depth = 0
-    index = opening
-    while index < len(content):
-        character = content[index]
+def _bracket_pairs(content: str) -> dict[int, int]:
+    openings: list[int] = []
+    pairs: dict[int, int] = {}
+    for index, character in enumerate(content):
         if character == "[" and not _is_escaped(content, index):
-            depth += 1
-        elif character == "]" and not _is_escaped(content, index):
-            depth -= 1
-            if depth == 0:
-                return index
-        index += 1
-    return None
+            openings.append(index)
+        elif character == "]" and openings and not _is_escaped(content, index):
+            pairs[openings.pop()] = index
+    return pairs
 
 
 def _closing_parenthesis(content: str, opening: int) -> int | None:
@@ -348,12 +351,20 @@ def _protected_end(spans: list[tuple[int, int]], index: int) -> int | None:
 
 
 def _overlaps_protected(spans: list[tuple[int, int]], start: int, end: int) -> bool:
-    for span_start, span_end in spans:
-        if span_start >= end:
-            return False
-        if span_end > start:
-            return True
-    return False
+    cursor = _first_span_ending_after(spans, start)
+    return cursor < len(spans) and spans[cursor][0] < end
+
+
+def _first_span_ending_after(spans: list[tuple[int, int]], index: int) -> int:
+    low = 0
+    high = len(spans)
+    while low < high:
+        middle = (low + high) // 2
+        if spans[middle][1] <= index:
+            low = middle + 1
+        else:
+            high = middle
+    return low
 
 
 def _shift_spans_for_insert(
