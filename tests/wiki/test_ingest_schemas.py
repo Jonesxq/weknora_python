@@ -784,6 +784,104 @@ def test_batch_apply_request_index_plan_requires_completed_operation_and_validat
         )
 
 
+def test_batch_apply_request_copy_updates_preserve_deep_copy_semantics() -> None:
+    completed_op_id = uuid4()
+    expected = PageExpectation(slug="summary/knowledge-1", page_id=uuid4(), version=1)
+    plan = _index_plan()
+    request = _index_batch(
+        completed_op_ids=(completed_op_id,),
+        expected_pages=(expected,),
+        index_intro_plan=plan,
+    )
+
+    shallow = request.model_copy(update={"operation_id": uuid4()})
+    deep = request.model_copy(update={"operation_id": uuid4()}, deep=True)
+
+    assert shallow.expected_pages[0] is request.expected_pages[0]
+    assert shallow.index_intro_plan is request.index_intro_plan
+    assert deep.expected_pages[0] is not request.expected_pages[0]
+    assert deep.index_intro_plan is not request.index_intro_plan
+    with pytest.raises(ValidationError):
+        shallow.model_copy(update={"completed_op_ids": ()})
+    with pytest.raises(ValidationError):
+        deep.model_copy(update={"completed_op_ids": ()})
+
+
+def test_index_intro_models_snapshot_raw_nested_inputs_and_accept_models() -> None:
+    raw_summary = {
+        "slug": " summary/knowledge-1 ",
+        "title": " Document One ",
+        "summary": " Summary ",
+    }
+    raw_summaries = [raw_summary]
+    request = IndexIntroRequest(mode="create", summaries=raw_summaries)
+    item = IndexSummaryItem(
+        slug="summary/knowledge-2", title="Document Two", summary="Summary"
+    )
+    change = IndexIntroChange(
+        action="ingest", knowledge_id="knowledge-2", pages=(item,)
+    )
+    update = IndexIntroRequest(
+        mode="update", existing_intro="Existing", changes=(change,)
+    )
+
+    raw_summary["title"] = "Polluted"
+    raw_summaries.append(
+        {"slug": "summary/knowledge-3", "title": "Added", "summary": "Added"}
+    )
+
+    assert request.summaries == (
+        IndexSummaryItem(
+            slug="summary/knowledge-1", title="Document One", summary="Summary"
+        ),
+    )
+    assert update.changes == (change,)
+
+
+def test_index_intro_models_accept_exact_boundaries_and_reject_request_duplicates() -> None:
+    summaries = tuple(
+        IndexSummaryItem(slug=f"summary/knowledge-{index}", title="T", summary="")
+        for index in range(200)
+    )
+    boundary = IndexSummaryItem(
+        slug="summary/boundary", title="t" * 512, summary="s" * 4000
+    )
+    snapshot = IndexPageSnapshot(
+        id=uuid4(), version=1, content="c" * 4000, summary="s" * 4000
+    )
+    change = IndexIntroChange(action="ingest", knowledge_id="knowledge-1", pages=())
+    maximum_change = IndexIntroChange(action="retract", knowledge_id="k" * 512)
+    plan = IndexIntroPlan(
+        mode="create",
+        intro="i" * 4000,
+        model_status="defaulted",
+        error_code="e" * 128,
+    )
+
+    assert IndexIntroContext(recent_summaries=summaries).recent_summaries == summaries
+    assert IndexIntroRequest(mode="create", summaries=summaries).summaries == summaries
+    assert boundary.title == "t" * 512
+    assert snapshot.content == "c" * 4000
+    assert snapshot.summary == "s" * 4000
+    assert maximum_change.knowledge_id == "k" * 512
+    assert (
+        IndexIntroRequest(
+            mode="update", existing_intro="i" * 4000, changes=(change,)
+        ).existing_intro
+        == "i" * 4000
+    )
+    assert IndexIntroOutput(intro="i" * 4000).intro == "i" * 4000
+    assert plan.error_code == "e" * 128
+    with pytest.raises(ValidationError):
+        IndexIntroRequest(mode="create", summaries=(boundary, boundary))
+    with pytest.raises(ValidationError):
+        IndexIntroRequest(
+            mode="update",
+            existing_intro="Existing",
+            changes=(change, change),
+        )
+
+
 def test_worker_options_read_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GRAPH_WIKI_INGEST_BATCH_SIZE", "7")
     monkeypatch.setenv("GRAPH_WIKI_INGEST_MAP_PARALLEL", "3")

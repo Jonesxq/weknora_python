@@ -47,14 +47,14 @@ class _FrozenValueModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-class _TaxonomyValueModel(_FrozenValueModel):
-    """对 taxonomy DTO 的 model_copy update 重新执行完整验证。"""
+class _ValidatedFrozenModel(_FrozenValueModel):
+    """对冻结 DTO 的 model_copy update 重新执行完整验证。"""
 
     def model_copy(
         self, *, update: Mapping[str, Any] | None = None, deep: bool = False
     ) -> Self:
         if not update:
-            return super().model_copy(deep=deep)
+            return super().model_copy(update=update, deep=deep)
 
         source = super().model_copy(deep=deep)
         payload = {
@@ -72,6 +72,10 @@ class _TaxonomyValueModel(_FrozenValueModel):
         if private_state is not None:
             object.__setattr__(validated, "__pydantic_private__", private_state)
         return validated
+
+
+class _TaxonomyValueModel(_ValidatedFrozenModel):
+    """Taxonomy DTO 的语义化冻结验证基类。"""
 
 
 class _FrozenMapping(Mapping[str, tuple[str, ...]]):
@@ -1331,7 +1335,7 @@ class PageExpectation(_FrozenValueModel):
         return self
 
 
-class IndexSummaryItem(_TaxonomyValueModel):
+class IndexSummaryItem(_ValidatedFrozenModel):
     slug: str
     title: str
     summary: str
@@ -1358,7 +1362,7 @@ class IndexSummaryItem(_TaxonomyValueModel):
         return value
 
 
-class IndexPageSnapshot(_TaxonomyValueModel):
+class IndexPageSnapshot(_ValidatedFrozenModel):
     id: UUID
     version: int = Field(ge=1)
     content: str
@@ -1373,7 +1377,7 @@ class IndexPageSnapshot(_TaxonomyValueModel):
         return value
 
 
-class IndexIntroContext(_TaxonomyValueModel):
+class IndexIntroContext(_ValidatedFrozenModel):
     index: IndexPageSnapshot | None = None
     recent_summaries: tuple[IndexSummaryItem, ...] = Field(default=(), max_length=200)
 
@@ -1385,7 +1389,7 @@ class IndexIntroContext(_TaxonomyValueModel):
         return self
 
 
-class IndexIntroChange(_TaxonomyValueModel):
+class IndexIntroChange(_ValidatedFrozenModel):
     action: Literal["ingest", "retract"]
     knowledge_id: str
     pages: tuple[IndexSummaryItem, ...] = ()
@@ -1406,7 +1410,7 @@ class IndexIntroChange(_TaxonomyValueModel):
         return self
 
 
-class IndexIntroRequest(_TaxonomyValueModel):
+class IndexIntroRequest(_ValidatedFrozenModel):
     mode: IndexIntroMode
     existing_intro: str = ""
     summaries: tuple[IndexSummaryItem, ...] = Field(default=(), max_length=200)
@@ -1436,7 +1440,7 @@ class IndexIntroRequest(_TaxonomyValueModel):
         return self
 
 
-class IndexIntroOutput(_TaxonomyValueModel):
+class IndexIntroOutput(_ValidatedFrozenModel):
     intro: str
 
     @field_validator("intro")
@@ -1448,7 +1452,7 @@ class IndexIntroOutput(_TaxonomyValueModel):
         return value
 
 
-class IndexIntroPlan(_TaxonomyValueModel):
+class IndexIntroPlan(_ValidatedFrozenModel):
     mode: IndexIntroMode
     expected_page_id: UUID | None = None
     expected_version: int | None = Field(default=None, ge=1)
@@ -1499,7 +1503,7 @@ class IndexIntroPlan(_TaxonomyValueModel):
         return self
 
 
-class BatchApplyRequest(_FrozenValueModel):
+class BatchApplyRequest(_ValidatedFrozenModel):
     claim_token: UUID
     pages: tuple[_FrozenReducedPage, ...]
     contribution_deltas: tuple[ContributionDelta, ...]
@@ -1510,24 +1514,6 @@ class BatchApplyRequest(_FrozenValueModel):
     operation_id: UUID
     folder_assignments: tuple[FolderAssignment, ...] = ()
     index_intro_plan: IndexIntroPlan | None = None
-
-    def model_copy(
-        self, *, update: Mapping[str, Any] | None = None, deep: bool = False
-    ) -> Self:
-        if not update:
-            return super().model_copy(update=update, deep=deep)
-        payload = self.model_dump(mode="python")
-        payload.update(update)
-        validated = type(self).model_validate(payload)
-        object.__setattr__(
-            validated,
-            "__pydantic_fields_set__",
-            self.model_fields_set | set(update),
-        )
-        private_state = getattr(self, "__pydantic_private__", None)
-        if private_state is not None:
-            object.__setattr__(validated, "__pydantic_private__", private_state)
-        return validated
 
     @field_validator("pages", mode="before")
     @classmethod
