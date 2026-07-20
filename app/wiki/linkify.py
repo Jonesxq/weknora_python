@@ -14,7 +14,7 @@ _REFERENCE_DEFINITION_RE = re.compile(r"(?m)^[ \t]{0,3}\[[^\]\r\n]+\]:[^\r\n]*(?
 _WIKI_TARGET_RE = r"[^\]|\r\n]+"
 _WIKI_DISPLAY_RE = r"[^\]\r\n]*"
 _WIKI_LINK_RE = re.compile(rf"\[\[({_WIKI_TARGET_RE})(?:\|{_WIKI_DISPLAY_RE})?\]\]")
-_WIKI_MARKUP_RE = re.compile(rf"\[\[{_WIKI_TARGET_RE}(?:\|{_WIKI_DISPLAY_RE})?\]\]")
+_WIKI_PROTECTED_MARKUP_RE = re.compile(r"\[\[[^\]\r\n]*\]\]")
 _MULTILINE_WIKI_MARKUP_RE = re.compile(r"\[\[[^\]]*[\r\n][^\]]*\]\]")
 _ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_]")
 
@@ -82,7 +82,9 @@ def linkify_markdown(
     non_wiki_markdown_spans = _non_wiki_markdown_spans(content)
     wiki_markup_spans = _wiki_markup_spans(content)
     spans = _merge_spans(code_spans + wiki_markup_spans + non_wiki_markdown_spans)
-    unsafe_body_spans = _merge_spans(code_spans + non_wiki_markdown_spans)
+    unsafe_body_spans = _merge_spans(
+        code_spans + non_wiki_markdown_spans + _multiline_wiki_markup_spans(content)
+    )
     existing_slugs = set(_extract_safe_wiki_links(content, unsafe_body_spans))
     prepared = _prepare_candidates(candidates, normalized_current_slug, existing_slugs)
     added_slugs: list[str] = []
@@ -187,7 +189,9 @@ def _is_escaped(content: str, index: int) -> bool:
 def _unsafe_body_spans(content: str) -> list[tuple[int, int]]:
     code_spans = _fenced_code_spans(content)
     code_spans.extend(_inline_code_spans(content, code_spans))
-    return _merge_spans(code_spans + _non_wiki_markdown_spans(content))
+    return _merge_spans(
+        code_spans + _non_wiki_markdown_spans(content) + _multiline_wiki_markup_spans(content)
+    )
 
 
 def _fenced_code_spans(content: str) -> list[tuple[int, int]]:
@@ -300,9 +304,13 @@ def _markdown_spans(content: str) -> list[tuple[int, int]]:
 
 
 def _wiki_markup_spans(content: str) -> list[tuple[int, int]]:
-    spans = [(match.start(), match.end()) for match in _WIKI_MARKUP_RE.finditer(content)]
-    spans.extend((match.start(), match.end()) for match in _MULTILINE_WIKI_MARKUP_RE.finditer(content))
+    spans = [(match.start(), match.end()) for match in _WIKI_PROTECTED_MARKUP_RE.finditer(content)]
+    spans.extend(_multiline_wiki_markup_spans(content))
     return spans
+
+
+def _multiline_wiki_markup_spans(content: str) -> list[tuple[int, int]]:
+    return [(match.start(), match.end()) for match in _MULTILINE_WIKI_MARKUP_RE.finditer(content)]
 
 
 def _non_wiki_markdown_spans(content: str) -> list[tuple[int, int]]:

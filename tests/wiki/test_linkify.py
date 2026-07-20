@@ -219,6 +219,38 @@ def test_linkify_does_not_insert_into_cross_line_wiki_markup(content: str) -> No
     assert result.added_slugs == ("concept/ai",)
 
 
+def test_cross_line_wiki_like_markup_hides_nested_wiki_links_from_extraction() -> None:
+    content = "[[broken\ntext [[concept/real]] tail]] Real"
+
+    assert _api().extract_safe_wiki_links(content) == ()
+    assert extract_wiki_links(content) == []
+
+    result = _linkify(
+        content,
+        current_slug="concept/overview",
+        candidates=(_candidate("concept/real", "Real"),),
+    )
+
+    assert result.content == content[:-4] + "[[concept/real|Real]]"
+    assert result.added_slugs == ("concept/real",)
+
+
+def test_malformed_single_line_wiki_markup_is_protected_without_suppressing_safe_text() -> None:
+    content = "[[|AI]] [[]] AI"
+
+    assert _api().extract_safe_wiki_links(content) == ()
+    assert extract_wiki_links(content) == []
+
+    result = _linkify(
+        content,
+        current_slug="concept/overview",
+        candidates=(_candidate("concept/ai", "AI"),),
+    )
+
+    assert result.content == "[[|AI]] [[]] [[concept/ai|AI]]"
+    assert result.added_slugs == ("concept/ai",)
+
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -524,22 +556,13 @@ def test_markdown_link_destination_supports_escaped_parentheses() -> None:
 
 def test_inline_code_scan_uses_cursor_for_many_fenced_blocks(monkeypatch) -> None:
     module = _api()
-    comparisons = 0
 
-    def counted_protected_end(spans, index):
-        nonlocal comparisons
-        for start, end in spans:
-            comparisons += 1
-            if index < start:
-                return None
-            if start <= index < end:
-                return end
-        return None
+    def fail_on_legacy_lookup(*_args, **_kwargs):
+        pytest.fail("inline code 扫描不应线性查询所有 fenced spans")
 
-    monkeypatch.setattr(module, "_protected_end", counted_protected_end)
+    monkeypatch.setattr(module, "_protected_end", fail_on_legacy_lookup)
     content = "```\nx\n```\na\n" * 4000
     fenced_spans = module._fenced_code_spans(content)
 
     assert len(fenced_spans) == 4000
     assert module._inline_code_spans(content, fenced_spans) == []
-    assert comparisons < 100_000
