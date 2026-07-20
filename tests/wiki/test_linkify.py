@@ -513,6 +513,34 @@ def test_shorter_candidate_wins_when_longer_slug_was_already_added() -> None:
     assert result.added_slugs == ("concept/machine-learning", "concept/machine")
 
 
+def test_ascii_left_boundary_uses_prior_inserted_markup_context() -> None:
+    result = _linkify(
+        "机器AIAPI",
+        current_slug="concept/overview",
+        candidates=(
+            _candidate("concept/prefix", "机器AI"),
+            _candidate("concept/api", "API"),
+        ),
+    )
+
+    assert result.content == "[[concept/prefix|机器AI]][[concept/api|API]]"
+    assert result.added_slugs == ("concept/prefix", "concept/api")
+
+
+def test_escape_check_uses_prior_inserted_markup_context() -> None:
+    result = _linkify(
+        "甲\\AI",
+        current_slug="concept/overview",
+        candidates=(
+            _candidate("concept/prefix", "甲\\"),
+            _candidate("concept/ai", "AI"),
+        ),
+    )
+
+    assert result.content == "[[concept/prefix|甲\\]][[concept/ai|AI]]"
+    assert result.added_slugs == ("concept/prefix", "concept/ai")
+
+
 @pytest.mark.parametrize(
     "content",
     [

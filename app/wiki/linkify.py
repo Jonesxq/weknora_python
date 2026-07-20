@@ -126,17 +126,42 @@ def linkify_markdown(
     copy_cursor = 0
     index = 0
     protected_cursor = 0
+    previous_character: str | None = None
+    trailing_backslashes = 0
 
     while index < len(content):
         while protected_cursor < len(spans) and spans[protected_cursor][1] <= index:
             protected_cursor += 1
         if protected_cursor < len(spans) and spans[protected_cursor][0] <= index:
-            index = spans[protected_cursor][1]
+            protected_end = spans[protected_cursor][1]
+            previous_character, trailing_backslashes = _advance_output_context(
+                content,
+                index,
+                protected_end,
+                previous_character,
+                trailing_backslashes,
+            )
+            index = protected_end
             protected_cursor += 1
             continue
 
-        match = _candidate_at(content, index, candidate_trie, added_slug_set, spans)
+        match = _candidate_at(
+            content,
+            index,
+            candidate_trie,
+            added_slug_set,
+            spans,
+            previous_character,
+            trailing_backslashes,
+        )
         if match is None:
+            previous_character, trailing_backslashes = _advance_output_context(
+                content,
+                index,
+                index + 1,
+                previous_character,
+                trailing_backslashes,
+            )
             index += 1
             continue
 
@@ -147,6 +172,13 @@ def linkify_markdown(
         copy_cursor = end
         added_slugs.append(candidate.slug)
         added_slug_set.add(candidate.slug)
+        previous_character, trailing_backslashes = _advance_output_context(
+            replacement,
+            0,
+            len(replacement),
+            previous_character,
+            trailing_backslashes,
+        )
         index = end
 
     if not added_slugs:
@@ -206,6 +238,8 @@ def _candidate_at(
     trie: _CandidateTrieNode,
     added_slugs: set[str],
     protected: list[tuple[int, int]],
+    previous_character: str | None,
+    trailing_backslashes: int,
 ) -> tuple[LinkCandidate, int] | None:
     node = trie
     matches: list[tuple[LinkCandidate, int]] = []
@@ -219,27 +253,59 @@ def _candidate_at(
         if node.candidate is not None:
             matches.append((node.candidate, cursor))
 
-    if not matches or _is_escaped(content, index):
+    if not matches or trailing_backslashes % 2 == 1:
         return None
     for candidate, end in reversed(matches):
         if candidate.slug in added_slugs:
             continue
         if (
             _overlaps_protected(protected, index, end)
-            or not _has_valid_boundary(content, index, end, candidate.display)
+            or not _has_valid_boundary(
+                content, end, candidate.display, previous_character
+            )
         ):
             continue
         return candidate, end
     return None
 
 
-def _has_valid_boundary(content: str, start: int, end: int, display: str) -> bool:
+def _has_valid_boundary(
+    content: str,
+    end: int,
+    display: str,
+    previous_character: str | None,
+) -> bool:
     if not display.isascii():
         return True
     return (
-        (start == 0 or _ASCII_WORD_RE.fullmatch(content[start - 1]) is None)
+        (
+            previous_character is None
+            or _ASCII_WORD_RE.fullmatch(previous_character) is None
+        )
         and (end == len(content) or _ASCII_WORD_RE.fullmatch(content[end]) is None)
     )
+
+
+def _advance_output_context(
+    text: str,
+    start: int,
+    end: int,
+    previous_character: str | None,
+    trailing_backslashes: int,
+) -> tuple[str | None, int]:
+    if start >= end:
+        return previous_character, trailing_backslashes
+    last_character = text[end - 1]
+    if last_character != "\\":
+        return last_character, 0
+
+    cursor = end - 1
+    while cursor > start and text[cursor - 1] == "\\":
+        cursor -= 1
+    slash_count = end - cursor
+    if cursor == start:
+        slash_count += trailing_backslashes
+    return last_character, slash_count
 
 
 def _is_escaped(content: str, index: int) -> bool:
