@@ -162,3 +162,107 @@ def test_unclosed_inline_code_preserves_crlf_and_is_idempotent() -> None:
 def test_invalid_current_slug_is_not_silenced() -> None:
     with pytest.raises(WikiSlugError):
         _linkify("AI", current_slug="../bad", candidates=())
+
+
+def test_trims_display_before_matching_and_ignores_whitespace_only_display() -> None:
+    result = _linkify(
+        "AI Empty",
+        current_slug="concept/overview",
+        candidates=(
+            _candidate("concept/ai", " AI "),
+            _candidate("concept/empty", "   "),
+        ),
+    )
+
+    assert result.content == "[[concept/ai|AI]] Empty"
+    assert result.added_slugs == ("concept/ai",)
+
+
+def test_trimmed_displays_are_ambiguous_across_distinct_slugs() -> None:
+    result = _linkify(
+        "Acme",
+        current_slug="concept/overview",
+        candidates=(
+            _candidate("entity/acme", " Acme "),
+            _candidate("company/acme", "Acme"),
+        ),
+    )
+
+    assert result == _api().LinkifyResult("Acme", False, ())
+
+
+@pytest.mark.parametrize(
+    ("content", "current_slug", "candidates"),
+    [
+        (
+            "Acme",
+            "entity/acme",
+            (
+                ("entity/acme", "Acme"),
+                ("company/acme", "Acme"),
+            ),
+        ),
+        (
+            "[[entity/acme|Acme]] Acme",
+            "concept/overview",
+            (
+                ("entity/acme", "Acme"),
+                ("company/acme", "Acme"),
+            ),
+        ),
+    ],
+)
+def test_self_or_existing_slug_still_participates_in_display_ambiguity(
+    content: str,
+    current_slug: str,
+    candidates: tuple[tuple[str, str], ...],
+) -> None:
+    result = _linkify(
+        content,
+        current_slug=current_slug,
+        candidates=tuple(_candidate(slug, display) for slug, display in candidates),
+    )
+
+    assert result == _api().LinkifyResult(content, False, ())
+
+
+def test_invalid_candidate_slug_type_is_ignored() -> None:
+    result = _linkify(
+        "AI",
+        current_slug="concept/overview",
+        candidates=(
+            _api().LinkCandidate(slug=None, display="Broken"),
+            _candidate("concept/ai", "AI"),
+        ),
+    )
+
+    assert result.content == "[[concept/ai|AI]]"
+    assert result.added_slugs == ("concept/ai",)
+
+
+def test_unclosed_bracket_does_not_hide_later_markdown_links() -> None:
+    content = (
+        "[unterminated [AI](https://example.test) ![AI](image.png) [AI][ref]\n"
+        "[ref]: https://example.test/AI\n"
+        "AI"
+    )
+
+    result = _linkify(
+        content,
+        current_slug="concept/overview",
+        candidates=(_candidate("concept/ai", "AI"),),
+    )
+
+    assert result.content == content[:-2] + "[[concept/ai|AI]]"
+    assert result.added_slugs == ("concept/ai",)
+
+
+def test_autolink_with_whitespace_is_not_overprotected() -> None:
+    result = _linkify(
+        "<https://example.test AI> AI",
+        current_slug="concept/overview",
+        candidates=(_candidate("concept/ai", "AI"),),
+    )
+
+    assert result.content == "<https://example.test [[concept/ai|AI]]> AI"
+    assert result.added_slugs == ("concept/ai",)

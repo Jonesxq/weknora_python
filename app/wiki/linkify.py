@@ -9,7 +9,7 @@ import re
 from app.wiki.domain import WikiSlugError, normalize_slug
 
 
-_AUTOLINK_RE = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]*://[^>\r\n]+>")
+_AUTOLINK_RE = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]*://[^<>\s]+>")
 _REFERENCE_DEFINITION_RE = re.compile(r"(?m)^[ \t]{0,3}\[[^\]\r\n]+\]:[^\r\n]*(?:\r\n|\r|\n|$)")
 _WIKI_LINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]*)?\]\]")
 _WIKI_MARKUP_RE = re.compile(r"\[\[[^\]\r\n]*\]\]")
@@ -85,21 +85,24 @@ def _prepare_candidates(
     pairs: set[tuple[str, str]] = set()
 
     for candidate in candidates:
-        if not candidate.display:
-            continue
         try:
             slug = normalize_slug(candidate.slug)
-        except (TypeError, WikiSlugError):
+            display = candidate.display.strip()
+        except (TypeError, AttributeError, ValueError):
             continue
-        if slug == current_slug or slug in existing_slugs:
+        if not display:
             continue
-        pairs.add((slug, candidate.display))
-        by_display.setdefault(candidate.display, set()).add(slug)
+        pairs.add((slug, display))
+        by_display.setdefault(display, set()).add(slug)
 
     filtered = [
         LinkCandidate(slug=slug, display=display)
         for slug, display in pairs
-        if len(by_display[display]) == 1
+        if (
+            len(by_display[display]) == 1
+            and slug != current_slug
+            and slug not in existing_slugs
+        )
     ]
     return tuple(sorted(filtered, key=lambda item: (-len(item.display), item.display, item.slug)))
 
@@ -257,7 +260,8 @@ def _markdown_link_spans(content: str) -> list[tuple[int, int]]:
             break
         closing = _closing_bracket(content, opening)
         if closing is None:
-            break
+            index = opening + 1
+            continue
         start = opening - 1 if opening > 0 and content[opening - 1] == "!" else opening
         next_index = closing + 1
         if next_index < len(content) and content[next_index] == "(":
