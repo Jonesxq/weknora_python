@@ -306,6 +306,17 @@ def test_example_fixture_has_strict_incremental_model_responses() -> None:
     dataset = FakeDataset.model_validate(raw)
     source, chat_model, embedding_model = load_fake_runtime_adapters(fixture_path)
 
+    expected_index_intros = {
+        "index_intro:create:summary/knowledge-1": {"intro": "知识库首次简介。"},
+        "index_intro:update:ingest:knowledge-1,retract:knowledge-2": {
+            "intro": "知识库增量简介。"
+        },
+    }
+    assert raw["model_responses"]["index_intros"] == expected_index_intros
+    assert set(chat_model.responses["index_intros"]) == set(
+        raw["model_responses"]["index_intros"]
+    )
+
     assert source is not chat_model
     assert chat_model is not embedding_model
     assert embedding_model is not source

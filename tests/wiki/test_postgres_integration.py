@@ -29,6 +29,7 @@ from app.wiki.ingest.enqueue import WikiEnqueueService
 from app.wiki.ingest.fakes import (
     FakeChatModel,
     FakeEmbeddingModel,
+    FakeKnowledgeSource,
     load_fake_runtime_adapters,
 )
 from app.wiki.ingest.schemas import (
@@ -256,6 +257,7 @@ class RecordingSqlAlchemyIngestStore(SqlAlchemyIngestStore):
     ) -> None:
         super().__init__(factory, finalization)
         self.last_request: BatchApplyRequest | None = None
+        self.before_apply: Any | None = None
 
     async def apply_results_with_outcome(
         self,
@@ -264,22 +266,26 @@ class RecordingSqlAlchemyIngestStore(SqlAlchemyIngestStore):
     ) -> BatchApplyOutcome:
         snapshot = BatchApplyRequest.model_validate(request.model_dump(mode="python"))
         self.last_request = snapshot
+        callback = self.before_apply
+        self.before_apply = None
+        if callback is not None:
+            await callback(snapshot)
         return await super().apply_results_with_outcome(scope, snapshot)
 
 
 async def _real_taxonomy_worker(
     postgres_factory: async_sessionmaker[AsyncSession],
+    fixture_path: Path = Path("examples/wiki_fake_data.json"),
 ) -> tuple[
     WikiScope,
     RecordingSqlAlchemyIngestStore,
     WikiIngestWorker,
+    FakeKnowledgeSource,
     FakeChatModel,
     FakeEmbeddingModel,
     UUID,
 ]:
-    source, model, embedding = load_fake_runtime_adapters(
-        Path("examples/wiki_fake_data.json")
-    )
+    source, model, embedding = load_fake_runtime_adapters(fixture_path)
     scope = WikiScope(
         tenant_id=1,
         knowledge_base_id=UUID("11111111-1111-1111-1111-111111111111"),
@@ -303,15 +309,77 @@ async def _real_taxonomy_worker(
         options=WikiWorkerOptions(),
         retry_wait=retry_wait,
     )
-    return scope, store, worker, model, embedding, enqueued.pending_op_id
+    return scope, store, worker, source, model, embedding, enqueued.pending_op_id
+
+
+async def _enqueue_incremental_fixture_batch(
+    postgres_factory: async_sessionmaker[AsyncSession],
+    scope: WikiScope,
+    store: SqlAlchemyIngestStore,
+    source: FakeKnowledgeSource,
+) -> tuple[UUID, UUID]:
+    async with postgres_factory() as session, session.begin():
+        page = WikiPage(
+            tenant_id=scope.tenant_id,
+            knowledge_base_id=scope.knowledge_base_id,
+            slug="summary/knowledge-2",
+            title="Knowledge 2",
+            page_type="summary",
+            status="published",
+            content="Knowledge 2 summary.",
+            summary="Knowledge 2 summary.",
+            source_refs=["knowledge-2"],
+            chunk_refs=["chunk-knowledge-2"],
+            wiki_path="/summary/knowledge-2",
+        )
+        session.add_all(
+            [
+                page,
+                WikiPageContribution(
+                    tenant_id=scope.tenant_id,
+                    knowledge_base_id=scope.knowledge_base_id,
+                    slug=page.slug,
+                    knowledge_id="knowledge-2",
+                    op_version="version-1",
+                    page_type="summary",
+                    state="active",
+                    title=page.title,
+                    content=page.content,
+                    summary=page.summary,
+                    aliases=[],
+                    chunk_refs=list(page.chunk_refs),
+                ),
+            ]
+        )
+
+    source_key = (scope.tenant_id, scope.knowledge_base_id, "knowledge-1")
+    knowledge = source.knowledge[source_key].model_copy(
+        update={"op_version": "version-2"}
+    )
+    source.knowledge[source_key] = knowledge
+    ingest = await store.enqueue_ingest(
+        scope,
+        knowledge,
+        {"knowledge_id": knowledge.id},
+        delay_seconds=0,
+    )
+    retract = await store.enqueue_retract(
+        scope,
+        "knowledge-2",
+        "fixture-delete-v1",
+        {"knowledge_id": "knowledge-2"},
+        delay_seconds=0,
+    )
+    assert ingest.id is not None and retract.id is not None
+    return ingest.id, retract.id
 
 
 @pytest.mark.asyncio
 async def test_real_worker_applies_taxonomy_once_and_replay_is_idempotent(
     postgres_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    scope, store, worker, model, embedding, op_id = await _real_taxonomy_worker(
-        postgres_factory
+    scope, store, worker, _source, model, embedding, op_id = (
+        await _real_taxonomy_worker(postgres_factory)
     )
 
     result = await worker.run_batch(scope)
@@ -387,6 +455,413 @@ async def test_real_worker_applies_taxonomy_once_and_replay_is_idempotent(
         )
     assert replayed_versions == versions
     assert replayed_folder_count == folder_count
+
+
+@pytest.mark.asyncio
+async def test_real_fake_worker_creates_index_links_and_one_terminal_log(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    (
+        scope,
+        store,
+        worker,
+        _source,
+        model,
+        _embedding,
+        op_id,
+    ) = await _real_taxonomy_worker(postgres_factory)
+
+    result = await worker.run_batch(scope)
+
+    create_key = "index_intro:create:summary/knowledge-1"
+    assert result.completed_op_ids == (op_id,)
+    assert result.failed_op_ids == result.superseded_op_ids == ()
+    assert model.calls.count(create_key) == 1
+    assert len(model.index_intro_requests) == 1
+    assert model.index_intro_requests[0].mode == "create"
+    async with postgres_factory() as session:
+        pages = list(
+            (
+                await session.execute(
+                    select(WikiPage).where(
+                        WikiPage.tenant_id == scope.tenant_id,
+                        WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                    )
+                )
+            ).scalars()
+        )
+        index = next(page for page in pages if page.slug == "index")
+        summary_page = next(
+            page for page in pages if page.slug == "summary/knowledge-1"
+        )
+        links = list(
+            (
+                await session.execute(
+                    select(WikiLink).where(
+                        WikiLink.tenant_id == scope.tenant_id,
+                        WikiLink.knowledge_base_id == scope.knowledge_base_id,
+                    )
+                )
+            ).scalars()
+        )
+        logs = list(
+            (
+                await session.execute(
+                    select(WikiLogEntry).where(
+                        WikiLogEntry.tenant_id == scope.tenant_id,
+                        WikiLogEntry.knowledge_base_id == scope.knowledge_base_id,
+                    )
+                )
+            ).scalars()
+        )
+
+    assert index.page_type == "index"
+    assert index.status == "published"
+    assert index.content == index.summary == "知识库首次简介。"
+    assert index.version == 1
+    assert "[[" in summary_page.content
+    assert links
+    assert len(logs) == 1
+    assert "Index=created" in logs[0].message
+    assert logs[0].result_outcome == {
+        "completed_op_ids": [str(op_id)],
+        "failed_op_ids": [],
+        "superseded_op_ids": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_real_fake_worker_updates_index_for_incremental_ingest_and_retract(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    (
+        scope,
+        store,
+        worker,
+        source,
+        model,
+        _embedding,
+        first_op_id,
+    ) = await _real_taxonomy_worker(postgres_factory)
+    first = await worker.run_batch(scope)
+    assert first.completed_op_ids == (first_op_id,)
+    ingest_id, retract_id = await _enqueue_incremental_fixture_batch(
+        postgres_factory, scope, store, source
+    )
+
+    incremental = await worker.run_batch(scope)
+
+    update_key = "index_intro:update:ingest:knowledge-1,retract:knowledge-2"
+    assert set(incremental.completed_op_ids) == {ingest_id, retract_id}
+    assert incremental.failed_op_ids == incremental.superseded_op_ids == ()
+    assert model.calls.count(update_key) == 1
+    assert len(model.index_intro_requests) == 2
+    request = model.index_intro_requests[-1]
+    assert request.mode == "update"
+    assert [(change.action, change.knowledge_id) for change in request.changes] == [
+        ("ingest", "knowledge-1"),
+        ("retract", "knowledge-2"),
+    ]
+    applied_request = store.last_request
+    assert applied_request is not None
+    replay = await store.apply_results_with_outcome(scope, applied_request)
+    assert replay.applied is False
+    assert set(replay.completed_op_ids) == {ingest_id, retract_id}
+    assert replay.failed_op_ids == replay.superseded_op_ids == ()
+
+    async with postgres_factory() as session:
+        index = (
+            await session.execute(
+                select(WikiPage).where(
+                    WikiPage.tenant_id == scope.tenant_id,
+                    WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                    WikiPage.slug == "index",
+                )
+            )
+        ).scalar_one()
+        logs = list(
+            (
+                await session.execute(
+                    select(WikiLogEntry)
+                    .where(
+                        WikiLogEntry.tenant_id == scope.tenant_id,
+                        WikiLogEntry.knowledge_base_id == scope.knowledge_base_id,
+                    )
+                    .order_by(WikiLogEntry.id)
+                )
+            ).scalars()
+        )
+        pending_count = int(
+            await session.scalar(
+                select(func.count(WikiPendingOp.id)).where(
+                    WikiPendingOp.tenant_id == scope.tenant_id,
+                    WikiPendingOp.knowledge_base_id == scope.knowledge_base_id,
+                )
+            )
+            or 0
+        )
+
+    assert index.content == index.summary == "知识库增量简介。"
+    assert index.version == 2
+    assert len(logs) == 2
+    assert "Index=created" in logs[0].message
+    assert "Index=updated" in logs[1].message
+    assert set(logs[1].result_outcome["completed_op_ids"]) == {
+        str(ingest_id),
+        str(retract_id),
+    }
+    assert pending_count == 0
+    assert await store.list_dead_letters(scope) == []
+
+
+@pytest.mark.asyncio
+async def test_real_fake_worker_preserves_manual_index_edit_after_model_planning(
+    postgres_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    (
+        scope,
+        store,
+        worker,
+        source,
+        model,
+        _embedding,
+        first_op_id,
+    ) = await _real_taxonomy_worker(postgres_factory)
+    assert (await worker.run_batch(scope)).completed_op_ids == (first_op_id,)
+    original_summary = model._responses.summaries["knowledge-1"]
+    model._responses.summaries["knowledge-1"] = original_summary.model_copy(
+        update={"markdown": "Acme now uses retrieval for newly grounded answers."}
+    )
+    ingest_id, retract_id = await _enqueue_incremental_fixture_batch(
+        postgres_factory, scope, store, source
+    )
+    manual_intro = "人工维护的知识库简介。"
+
+    async def edit_index_after_planning(request: BatchApplyRequest) -> None:
+        plan = request.index_intro_plan
+        assert plan is not None
+        assert plan.expected_version == 1
+        assert plan.intro == "知识库增量简介。"
+        async with postgres_factory() as session, session.begin():
+            index = (
+                await session.execute(
+                    select(WikiPage)
+                    .where(
+                        WikiPage.tenant_id == scope.tenant_id,
+                        WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                        WikiPage.slug == "index",
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one()
+            index.content = manual_intro
+            index.summary = manual_intro
+            index.version += 1
+
+    store.before_apply = edit_index_after_planning
+
+    result = await worker.run_batch(scope)
+
+    update_key = "index_intro:update:ingest:knowledge-1,retract:knowledge-2"
+    assert set(result.completed_op_ids) == {ingest_id, retract_id}
+    assert result.failed_op_ids == result.superseded_op_ids == ()
+    assert model.calls.count(update_key) == 1
+    async with postgres_factory() as session:
+        index = (
+            await session.execute(
+                select(WikiPage).where(
+                    WikiPage.tenant_id == scope.tenant_id,
+                    WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                    WikiPage.slug == "index",
+                )
+            )
+        ).scalar_one()
+        summary_page = (
+            await session.execute(
+                select(WikiPage).where(
+                    WikiPage.tenant_id == scope.tenant_id,
+                    WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                    WikiPage.slug == "summary/knowledge-1",
+                )
+            )
+        ).scalar_one()
+        link_count = int(
+            await session.scalar(
+                select(func.count(WikiLink.id)).where(
+                    WikiLink.tenant_id == scope.tenant_id,
+                    WikiLink.knowledge_base_id == scope.knowledge_base_id,
+                    WikiLink.source_page_id == summary_page.id,
+                )
+            )
+            or 0
+        )
+        active_versions = list(
+            (
+                await session.execute(
+                    select(WikiPageContribution.op_version).where(
+                        WikiPageContribution.tenant_id == scope.tenant_id,
+                        WikiPageContribution.knowledge_base_id
+                        == scope.knowledge_base_id,
+                        WikiPageContribution.knowledge_id == "knowledge-1",
+                        WikiPageContribution.state == "active",
+                    )
+                )
+            ).scalars()
+        )
+        logs = list(
+            (
+                await session.execute(
+                    select(WikiLogEntry)
+                    .where(
+                        WikiLogEntry.tenant_id == scope.tenant_id,
+                        WikiLogEntry.knowledge_base_id == scope.knowledge_base_id,
+                    )
+                    .order_by(WikiLogEntry.id)
+                )
+            ).scalars()
+        )
+
+    assert index.content == index.summary == manual_intro
+    assert index.version == 2
+    assert summary_page.version == 2
+    assert "newly grounded answers" in summary_page.content
+    assert "[[" in summary_page.content
+    assert link_count >= 1
+    assert active_versions and set(active_versions) == {"version-2"}
+    assert len(logs) == 2
+    assert "Index=stale_skipped" in logs[-1].message
+    assert await store.pending_count(scope) == 0
+    assert await store.list_dead_letters(scope) == []
+
+
+@pytest.mark.asyncio
+async def test_real_fake_index_permanent_failures_do_not_fail_operations(
+    postgres_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    raw = json.loads(Path("examples/wiki_fake_data.json").read_text(encoding="utf-8"))
+    raw["model_responses"]["index_intros"] = {}
+    fixture_path = tmp_path / "wiki-missing-index-intros.json"
+    fixture_path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    (
+        scope,
+        store,
+        worker,
+        source,
+        model,
+        _embedding,
+        first_op_id,
+    ) = await _real_taxonomy_worker(postgres_factory, fixture_path)
+
+    async def assert_create_pending_has_not_failed(
+        request: BatchApplyRequest,
+    ) -> None:
+        assert request.failures == ()
+        assert request.index_intro_plan is not None
+        assert request.index_intro_plan.model_status == "defaulted"
+        async with postgres_factory() as session:
+            pending = await session.get(WikiPendingOp, first_op_id)
+            assert pending is not None and pending.fail_count == 0
+
+    store.before_apply = assert_create_pending_has_not_failed
+    created = await worker.run_batch(scope)
+
+    create_key = "index_intro:create:summary/knowledge-1"
+    default_intro = "本知识库汇总了当前已发布的文档摘要、实体与概念。"
+    assert created.completed_op_ids == (first_op_id,)
+    assert created.failed_op_ids == created.superseded_op_ids == ()
+    assert model.calls.count(create_key) == 1
+    async with postgres_factory() as session, session.begin():
+        index = (
+            await session.execute(
+                select(WikiPage)
+                .where(
+                    WikiPage.tenant_id == scope.tenant_id,
+                    WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                    WikiPage.slug == "index",
+                )
+                .with_for_update()
+            )
+        ).scalar_one()
+        assert index.content == index.summary == default_intro
+        assert index.version == 1
+        index.content = "模型失败前的旧简介。"
+        index.summary = "模型失败前的旧简介。"
+        index.version += 1
+    assert await store.pending_count(scope) == 0
+    assert await store.list_dead_letters(scope) == []
+
+    ingest_id, retract_id = await _enqueue_incremental_fixture_batch(
+        postgres_factory, scope, store, source
+    )
+
+    async def assert_update_pending_has_not_failed(
+        request: BatchApplyRequest,
+    ) -> None:
+        assert request.failures == ()
+        assert request.index_intro_plan is not None
+        assert request.index_intro_plan.model_status == "kept_after_error"
+        async with postgres_factory() as session:
+            pending = list(
+                (
+                    await session.execute(
+                        select(WikiPendingOp).where(
+                            WikiPendingOp.tenant_id == scope.tenant_id,
+                            WikiPendingOp.knowledge_base_id == scope.knowledge_base_id,
+                        )
+                    )
+                ).scalars()
+            )
+            assert {row.id for row in pending} == {ingest_id, retract_id}
+            assert {row.fail_count for row in pending} == {0}
+
+    store.before_apply = assert_update_pending_has_not_failed
+    updated = await worker.run_batch(scope)
+
+    update_key = "index_intro:update:ingest:knowledge-1,retract:knowledge-2"
+    assert set(updated.completed_op_ids) == {ingest_id, retract_id}
+    assert updated.failed_op_ids == updated.superseded_op_ids == ()
+    assert model.calls.count(update_key) == 1
+    assert len(model.index_intro_requests) == 2
+    async with postgres_factory() as session:
+        index = (
+            await session.execute(
+                select(WikiPage).where(
+                    WikiPage.tenant_id == scope.tenant_id,
+                    WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                    WikiPage.slug == "index",
+                )
+            )
+        ).scalar_one()
+        logs = list(
+            (
+                await session.execute(
+                    select(WikiLogEntry)
+                    .where(
+                        WikiLogEntry.tenant_id == scope.tenant_id,
+                        WikiLogEntry.knowledge_base_id == scope.knowledge_base_id,
+                    )
+                    .order_by(WikiLogEntry.id)
+                )
+            ).scalars()
+        )
+        pending_count = int(
+            await session.scalar(
+                select(func.count(WikiPendingOp.id)).where(
+                    WikiPendingOp.tenant_id == scope.tenant_id,
+                    WikiPendingOp.knowledge_base_id == scope.knowledge_base_id,
+                )
+            )
+            or 0
+        )
+
+    assert index.content == index.summary == "模型失败前的旧简介。"
+    assert index.version == 2
+    assert len(logs) == 2
+    assert "Index=defaulted" in logs[0].message
+    assert "Index=kept_after_error" in logs[1].message
+    assert pending_count == 0
+    assert await store.list_dead_letters(scope) == []
 
 
 async def _claim_taxonomy_ingest(
@@ -3503,6 +3978,9 @@ async def test_retract_worker_minimally_cleans_unique_and_shared_source_pages(
                 markdown="Shared B only body",
             )
 
+        async def generate_index_intro(self, _request):
+            raise PermanentModelError("index intro 未配置")
+
     worker = WikiIngestWorker(
         store=store,
         locks=MemoryWikiLockManager(),
@@ -3610,6 +4088,9 @@ async def test_multiple_retract_versions_for_one_source_complete_in_one_batch(
     class NoMergeModel:
         async def merge_page(self, _request):
             raise AssertionError("纯 retract 不应调用模型")
+
+        async def generate_index_intro(self, _request):
+            raise PermanentModelError("index intro 未配置")
 
     worker = WikiIngestWorker(
         store=store,

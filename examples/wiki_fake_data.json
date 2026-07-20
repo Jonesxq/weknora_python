@@ -146,6 +146,14 @@
           }
         ]
       }
+    },
+    "index_intros": {
+      "index_intro:create:summary/knowledge-1": {
+        "intro": "知识库首次简介。"
+      },
+      "index_intro:update:ingest:knowledge-1,retract:knowledge-2": {
+        "intro": "知识库增量简介。"
+      }
     }
   },
   "transient_failures": {}
