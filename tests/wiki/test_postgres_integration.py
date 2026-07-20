@@ -1717,7 +1717,8 @@ async def test_graph_excludes_inactive_unresolved_edges_and_sorts_visible_edges(
     )
     assert stale_source_ids == {archived_source.id, deleted_source.id}
 
-    graph = await WikiQueryService(postgres_session).get_graph(
+    queries = WikiQueryService(postgres_session)
+    graph = await queries.get_graph(
         scope,
         mode="overview",
         center=None,
@@ -1726,16 +1727,31 @@ async def test_graph_excludes_inactive_unresolved_edges_and_sorts_visible_edges(
         types={"entity"},
     )
 
-    assert [(node.slug, node.link_count) for node in graph.nodes] == [
+    expected_nodes = [
         (active_a.slug, 2),
         (active_z.slug, 2),
         (source.slug, 2),
     ]
-    assert [(edge.source, edge.target) for edge in graph.edges] == [
+    expected_edges = [
         (active_z.slug, active_a.slug),
         (source.slug, active_a.slug),
         (source.slug, active_z.slug),
     ]
+    assert [(node.slug, node.link_count) for node in graph.nodes] == expected_nodes
+    assert [(edge.source, edge.target) for edge in graph.edges] == expected_edges
+
+    ego = await queries.get_graph(
+        scope,
+        mode="ego",
+        center=active_z.slug,
+        hops=2,
+        limit=10,
+        types={"entity"},
+    )
+
+    assert ego.center == active_z.slug
+    assert [(node.slug, node.link_count) for node in ego.nodes] == expected_nodes
+    assert [(edge.source, edge.target) for edge in ego.edges] == expected_edges
 
 
 @pytest.mark.asyncio
