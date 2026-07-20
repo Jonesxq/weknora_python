@@ -34,6 +34,14 @@ class LinkifyResult:
     added_slugs: tuple[str, ...]
 
 
+class _CandidateTrieNode:
+    __slots__ = ("children", "candidate")
+
+    def __init__(self) -> None:
+        self.children: dict[str, _CandidateTrieNode] = {}
+        self.candidate: LinkCandidate | None = None
+
+
 def protected_spans(content: str) -> tuple[tuple[int, int], ...]:
     """Return merged source ranges that must remain unchanged."""
 
@@ -111,8 +119,11 @@ def linkify_markdown(
     )
     existing_slugs = set(_extract_safe_wiki_links(content, unsafe_body_spans))
     prepared = _prepare_candidates(candidates, normalized_current_slug, existing_slugs)
+    candidate_trie = _build_candidate_trie(prepared)
     added_slugs: list[str] = []
     added_slug_set: set[str] = set()
+    pieces: list[str] = []
+    copy_cursor = 0
     index = 0
     protected_cursor = 0
 
@@ -124,20 +135,24 @@ def linkify_markdown(
             protected_cursor += 1
             continue
 
-        candidate = _candidate_at(content, index, prepared, added_slug_set, spans)
-        if candidate is None:
+        match = _candidate_at(content, index, candidate_trie, added_slug_set, spans)
+        if match is None:
             index += 1
             continue
 
+        candidate, end = match
         replacement = f"[[{candidate.slug}|{candidate.display}]]"
-        content = content[:index] + replacement + content[index + len(candidate.display) :]
-        spans = _shift_spans_for_insert(spans, index, len(candidate.display), len(replacement))
+        pieces.append(content[copy_cursor:index])
+        pieces.append(replacement)
+        copy_cursor = end
         added_slugs.append(candidate.slug)
         added_slug_set.add(candidate.slug)
-        index += len(replacement)
-        protected_cursor = _first_span_ending_after(spans, index)
+        index = end
 
-    return LinkifyResult(content, bool(added_slugs), tuple(added_slugs))
+    if not added_slugs:
+        return LinkifyResult(content, False, ())
+    pieces.append(content[copy_cursor:])
+    return LinkifyResult("".join(pieces), True, tuple(added_slugs))
 
 
 def _prepare_candidates(
@@ -171,24 +186,50 @@ def _prepare_candidates(
     return tuple(sorted(filtered, key=lambda item: (-len(item.display), item.display, item.slug)))
 
 
+def _build_candidate_trie(candidates: tuple[LinkCandidate, ...]) -> _CandidateTrieNode:
+    root = _CandidateTrieNode()
+    for candidate in candidates:
+        node = root
+        for character in candidate.display:
+            child = node.children.get(character)
+            if child is None:
+                child = _CandidateTrieNode()
+                node.children[character] = child
+            node = child
+        node.candidate = candidate
+    return root
+
+
 def _candidate_at(
     content: str,
     index: int,
-    candidates: tuple[LinkCandidate, ...],
+    trie: _CandidateTrieNode,
     added_slugs: set[str],
     protected: list[tuple[int, int]],
-) -> LinkCandidate | None:
-    for candidate in candidates:
-        if candidate.slug in added_slugs or not content.startswith(candidate.display, index):
+) -> tuple[LinkCandidate, int] | None:
+    node = trie
+    matches: list[tuple[LinkCandidate, int]] = []
+    cursor = index
+    while cursor < len(content):
+        child = node.children.get(content[cursor])
+        if child is None:
+            break
+        node = child
+        cursor += 1
+        if node.candidate is not None:
+            matches.append((node.candidate, cursor))
+
+    if not matches or _is_escaped(content, index):
+        return None
+    for candidate, end in reversed(matches):
+        if candidate.slug in added_slugs:
             continue
-        end = index + len(candidate.display)
         if (
-            _is_escaped(content, index)
-            or _overlaps_protected(protected, index, end)
+            _overlaps_protected(protected, index, end)
             or not _has_valid_boundary(content, index, end, candidate.display)
         ):
             continue
-        return candidate
+        return candidate, end
     return None
 
 
@@ -427,21 +468,6 @@ def _first_span_ending_after(spans: list[tuple[int, int]], index: int) -> int:
         else:
             high = middle
     return low
-
-
-def _shift_spans_for_insert(
-    spans: list[tuple[int, int]],
-    start: int,
-    replaced_length: int,
-    replacement_length: int,
-) -> list[tuple[int, int]]:
-    delta = replacement_length - replaced_length
-    shifted = [
-        (span_start + delta, span_end + delta) if span_start >= start else (span_start, span_end)
-        for span_start, span_end in spans
-    ]
-    shifted.append((start, start + replacement_length))
-    return _merge_spans(shifted)
 
 
 def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:

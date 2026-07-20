@@ -481,6 +481,38 @@ def test_long_candidate_does_not_overlap_protected_markup(content: str) -> None:
     assert result == _api().LinkifyResult(content, False, ())
 
 
+def test_shorter_candidate_wins_when_longer_match_crosses_protected_markup() -> None:
+    content = "Alpha [AI](https://example.test)"
+
+    result = _linkify(
+        content,
+        current_slug="concept/overview",
+        candidates=(
+            _candidate("concept/composite", content),
+            _candidate("concept/alpha", "Alpha"),
+        ),
+    )
+
+    assert result.content == "[[concept/alpha|Alpha]] [AI](https://example.test)"
+    assert result.added_slugs == ("concept/alpha",)
+
+
+def test_shorter_candidate_wins_when_longer_slug_was_already_added() -> None:
+    result = _linkify(
+        "机器学习，机器学习",
+        current_slug="concept/overview",
+        candidates=(
+            _candidate("concept/machine-learning", "机器学习"),
+            _candidate("concept/machine", "机器"),
+        ),
+    )
+
+    assert result.content == (
+        "[[concept/machine-learning|机器学习]]，[[concept/machine|机器]]学习"
+    )
+    assert result.added_slugs == ("concept/machine-learning", "concept/machine")
+
+
 @pytest.mark.parametrize(
     "content",
     [
@@ -530,12 +562,37 @@ class _CountingText(str):
     def __new__(cls, value: str):
         instance = super().__new__(cls, value)
         instance.index_reads = 0
+        instance.startswith_calls = 0
         return instance
 
     def __getitem__(self, key):
         if isinstance(key, int):
             self.index_reads += 1
         return super().__getitem__(key)
+
+    def startswith(self, prefix, start=0, end=None):
+        self.startswith_calls += 1
+        if end is None:
+            return super().startswith(prefix, start)
+        return super().startswith(prefix, start, end)
+
+
+def test_main_scan_candidate_probes_do_not_scale_with_total_candidates() -> None:
+    content = _CountingText("c" * 2000)
+    candidates = tuple(
+        _candidate(f"concept/candidate-{index}", f"candidate-{index}")
+        for index in range(1000)
+    )
+
+    result = _linkify(
+        content,
+        current_slug="concept/overview",
+        candidates=candidates,
+    )
+
+    assert result == _api().LinkifyResult(content, False, ())
+    candidate_probes = content.startswith_calls + content.index_reads
+    assert candidate_probes <= len(content) * 10
 
 
 def test_markdown_bracket_scan_is_near_linear_with_many_unclosed_brackets() -> None:
