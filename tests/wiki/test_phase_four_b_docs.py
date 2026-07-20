@@ -5,16 +5,18 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-_TERMINAL_LANGUAGES = frozenset({"powershell", "pwsh", "bash", "sh", "shell"})
+_POWERSHELL_LANGUAGES = frozenset({"powershell", "pwsh"})
+_SHELL_LANGUAGES = frozenset({"bash", "sh", "shell"})
+_TERMINAL_LANGUAGES = _POWERSHELL_LANGUAGES | _SHELL_LANGUAGES
 
 
 def _read_project_text(relative_path: str) -> str:
     return (PROJECT_ROOT / relative_path).read_text(encoding="utf-8")
 
 
-def _terminal_fence_blocks(text: str) -> list[str]:
+def _terminal_fence_blocks(text: str) -> list[tuple[str, str]]:
     lines = text.splitlines(keepends=True)
-    blocks: list[str] = []
+    blocks: list[tuple[str, str]] = []
     index = 0
     while index < len(lines):
         opener = _fence_opener(lines[index])
@@ -30,7 +32,7 @@ def _terminal_fence_blocks(text: str) -> list[str]:
         ):
             index += 1
         if language in _TERMINAL_LANGUAGES:
-            blocks.append("".join(lines[body_start:index]))
+            blocks.append((language, "".join(lines[body_start:index])))
         if index < len(lines):
             index += 1
     return blocks
@@ -69,15 +71,19 @@ def _is_fence_closer(line: str, marker: str, minimum_length: int) -> bool:
     )
 
 
-def _continues_terminal_command(line: str) -> bool:
+def _continues_terminal_command(line: str, language: str) -> bool:
     stripped = line.rstrip()
-    return stripped.endswith(("`", "\\", "|", "&&", "||"))
+    if language in _POWERSHELL_LANGUAGES:
+        return stripped.endswith("`")
+    if language in _SHELL_LANGUAGES:
+        return stripped.endswith("\\")
+    raise AssertionError(f"不支持的 terminal fence language: {language}")
 
 
 def _assert_terminal_commands_have_chinese_comments(text: str) -> None:
     blocks = _terminal_fence_blocks(text)
     assert blocks
-    for block in blocks:
+    for language, block in blocks:
         previous = ""
         continuing = False
         for raw_line in block.splitlines():
@@ -90,14 +96,14 @@ def _assert_terminal_commands_have_chinese_comments(text: str) -> None:
                 previous = line
                 continue
             if continuing:
-                continuing = _continues_terminal_command(line)
+                continuing = _continues_terminal_command(line, language)
                 continue
             has_chinese_comment = previous.startswith("#") and re.search(
                 r"[\u4e00-\u9fff]", previous
             )
             assert has_chinese_comment, f"命令缺少中文用途注释: {line}"
             previous = ""
-            continuing = _continues_terminal_command(line)
+            continuing = _continues_terminal_command(line, language)
 
 
 @pytest.mark.parametrize(
@@ -116,7 +122,7 @@ def test_terminal_fence_scanner_recognizes_markers_indentation_and_aliases(
     body = f"{indent}# 运行示例命令\n{indent}echo ok\n"
     markdown = f"{indent}{marker}{language}\n{body}{indent}{marker}\n"
 
-    assert _terminal_fence_blocks(markdown) == [body]
+    assert _terminal_fence_blocks(markdown) == [(language.casefold(), body)]
 
 
 def test_terminal_comment_contract_checks_every_recognized_block():
@@ -149,15 +155,38 @@ def test_terminal_fence_scanner_ignores_non_terminal_output_blocks():
     assert _terminal_fence_blocks(markdown) == []
 
 
-def test_terminal_comment_contract_allows_shell_and_powershell_continuations():
+@pytest.mark.parametrize("language", ["powershell", "pwsh"])
+def test_powershell_trailing_backslash_does_not_continue_command(language: str):
     markdown = (
-        "```pwsh\n"
+        f"```{language}\n"
+        "# 输出 Windows 根路径\n"
+        "Write-Output C:\\\n"
+        "Write-Output missing-comment\n"
+        "```\n"
+    )
+
+    with pytest.raises(AssertionError, match="命令缺少中文用途注释"):
+        _assert_terminal_commands_have_chinese_comments(markdown)
+
+
+@pytest.mark.parametrize("language", ["powershell", "pwsh"])
+def test_powershell_backtick_continuation_is_allowed(language: str):
+    markdown = (
+        f"```{language}\n"
         "# 运行多行 PowerShell 命令\n"
         "uv run pytest `\n"
         "  tests/wiki/test_linkify.py `\n"
         "  -q\n"
         "```\n"
-        "~~~bash\n"
+    )
+
+    _assert_terminal_commands_have_chinese_comments(markdown)
+
+
+@pytest.mark.parametrize("language", ["bash", "sh", "shell"])
+def test_shell_backslash_continuation_is_allowed(language: str):
+    markdown = (
+        f"~~~{language}\n"
         "# 运行多行 shell 命令\n"
         "printf '%s' \\\n"
         "  value\n"
