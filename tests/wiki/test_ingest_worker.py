@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import get_type_hints
@@ -27,6 +28,10 @@ from app.wiki.ingest.schemas import (
     EmbeddingOutput,
     EmbeddingRequest,
     FolderCatalogEntry,
+    IndexIntroContext,
+    IndexIntroOutput,
+    IndexIntroRequest,
+    IndexPageSnapshot,
     ReducedPage,
     StoredContributionRecord,
     TaxonomyContext,
@@ -313,6 +318,8 @@ class WorkerStore:
         apply_outcome: BatchApplyOutcome | None = None,
         folders: tuple[FolderCatalogEntry, ...] = (),
         classifiable_slugs: tuple[str, ...] = (),
+        index_intro_context: IndexIntroContext | None = None,
+        index_context_error: BaseException | None = None,
         events: list[str] | None = None,
     ) -> None:
         self.records = list(records)
@@ -324,10 +331,13 @@ class WorkerStore:
         self.apply_outcome = apply_outcome
         self.folders = folders
         self.classifiable_slugs = classifiable_slugs
+        self.index_intro_context = index_intro_context or IndexIntroContext()
+        self.index_context_error = index_context_error
         self.events = events
         self.claim_calls: list[tuple[WikiScope, int, int]] = []
         self.find_calls: list[tuple[str, ...]] = []
         self.taxonomy_context_calls: list[tuple[str, ...]] = []
+        self.index_context_calls: list[WikiScope] = []
         self.contribution_calls: list[tuple[str, str]] = []
         self.apply_calls: list[BatchApplyRequest] = []
         self.bool_apply_calls = 0
@@ -387,6 +397,17 @@ class WorkerStore:
             if item.knowledge_id == knowledge_id and item.state == state
         ]
 
+    async def load_index_intro_context(self, scope: WikiScope) -> IndexIntroContext:
+        assert scope == SCOPE
+        self.index_context_calls.append(scope)
+        if self.events is not None:
+            self.events.append("index-context")
+        if self.index_context_error is not None:
+            raise self.index_context_error
+        return IndexIntroContext.model_validate(
+            self.index_intro_context.model_dump(mode="python", warnings="error")
+        )
+
     async def find_dedup_candidates(
         self, scope: WikiScope, candidate: object, limit: int = 20
     ) -> list[object]:
@@ -399,6 +420,8 @@ class WorkerStore:
         request: BatchApplyRequest,
     ) -> BatchApplyOutcome:
         assert scope == SCOPE
+        if self.events is not None:
+            self.events.append("apply")
         call = BatchApplyRequest.model_validate(request.model_dump(mode="python"))
         self.apply_calls.append(call)
         if self.conflict:
@@ -541,6 +564,41 @@ class OrderedTaxonomyModel(FakeChatModel):
             self.taxonomy_active -= 1
 
 
+class OrderedIndexModel(OrderedTaxonomyModel):
+    def __init__(
+        self,
+        dataset: FakeDataset,
+        *,
+        intro: object = None,
+        transient_failures: int = 0,
+        error: BaseException | None = None,
+        events: list[str] | None = None,
+    ) -> None:
+        super().__init__(dataset, events=events)
+        self.index_result = (
+            IndexIntroOutput(intro="Generated index intro") if intro is None else intro
+        )
+        self.index_transient_failures = transient_failures
+        self.index_error = error
+
+    async def generate_index_intro(
+        self, request: IndexIntroRequest
+    ) -> IndexIntroOutput:
+        snapshot = IndexIntroRequest.model_validate(
+            request.model_dump(mode="python", warnings="error")
+        )
+        self.index_intro_requests.append(snapshot)
+        self.calls.append("index-intro")
+        if self.events is not None:
+            self.events.append("index-model")
+        if self.index_transient_failures > 0:
+            self.index_transient_failures -= 1
+            raise TransientModelError("index intro transient")
+        if self.index_error is not None:
+            raise self.index_error
+        return deepcopy(self.index_result)  # type: ignore[return-value]
+
+
 def contribution(
     knowledge_id: str,
     slug: str,
@@ -588,6 +646,312 @@ def worker(
         options=options,
         retry_wait=retry_wait if waits is not None else None,
     )
+
+
+def update_index_context(intro: str = "Old index intro") -> IndexIntroContext:
+    return IndexIntroContext(
+        index=IndexPageSnapshot(
+            id=UUID("12345678-1234-5678-1234-567812345678"),
+            version=7,
+            content=intro,
+            summary="Index summary",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_index_intro_create_runs_once_after_fixed_point_and_before_apply() -> (
+    None
+):
+    events: list[str] = []
+    dataset = fake_dataset(("doc-a",))
+    model = OrderedIndexModel(
+        dataset,
+        intro=IndexIntroOutput(intro="Generated intro\n## Directory\n- ignored"),
+        events=events,
+    )
+    store = WorkerStore([pending_op(OP_A, "doc-a")], events=events)
+
+    result = await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
+
+    assert result.completed_op_ids == (OP_A,)
+    assert len(store.index_context_calls) == 1
+    assert len(model.index_intro_requests) == 1
+    assert len(store.apply_calls) == 1
+    plan = store.apply_calls[0].index_intro_plan
+    assert plan is not None
+    assert plan.mode == "create"
+    assert plan.intro == "Generated intro"
+    assert plan.model_status == "generated"
+    assert model.index_intro_requests[0].mode == "create"
+    assert [item.slug for item in model.index_intro_requests[0].summaries] == [
+        "summary/doc-a"
+    ]
+    assert max(
+        index for index, event in enumerate(events) if event == "reduce"
+    ) < events.index("index-context")
+    assert events.index("index-context") < events.index("index-model")
+    assert events.index("index-model") < events.index("apply")
+    with pytest.raises(ValidationError):
+        plan.intro = "mutated"  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+async def test_index_intro_update_contains_only_old_intro_and_completed_changes() -> (
+    None
+):
+    dataset = fake_dataset(("doc-a",))
+    old = contribution("doc-z", "entity/old", state="retract_pending")
+    existing = ExistingPageRecord(
+        page_id=uuid4(),
+        version=3,
+        page=ReducedPage(
+            slug="entity/old",
+            title="Old",
+            page_type="entity",
+            content="Old body",
+            summary="Old summary",
+            source_refs=["doc-z"],
+        ),
+    )
+    model = OrderedIndexModel(dataset)
+    store = WorkerStore(
+        [pending_op(OP_A, "doc-a"), pending_op(OP_B, "doc-z", op="retract")],
+        existing={"entity/old": existing},
+        contributions=[old],
+        index_intro_context=update_index_context(),
+    )
+
+    await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
+
+    assert len(model.index_intro_requests) == 1
+    request = model.index_intro_requests[0]
+    assert request.mode == "update"
+    assert request.existing_intro == "Old index intro"
+    assert request.summaries == ()
+    assert [(change.action, change.knowledge_id) for change in request.changes] == [
+        ("ingest", "doc-a"),
+        ("retract", "doc-z"),
+    ]
+    plan = store.apply_calls[0].index_intro_plan
+    assert plan is not None
+    assert plan.expected_page_id == update_index_context().index.id  # type: ignore[union-attr]
+    assert plan.expected_version == 7
+
+
+@pytest.mark.asyncio
+async def test_index_intro_skips_context_and_model_when_completed_operation_has_no_delta() -> (
+    None
+):
+    dataset = fake_dataset(("doc-a",), short_knowledge={"doc-a"})
+    model = OrderedIndexModel(dataset)
+    store = WorkerStore([pending_op(OP_A, "doc-a")])
+
+    result = await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
+
+    assert result.completed_op_ids == (OP_A,)
+    assert store.index_context_calls == []
+    assert model.index_intro_requests == []
+    assert store.apply_calls[0].index_intro_plan is None
+
+
+@pytest.mark.asyncio
+async def test_index_intro_filters_failed_and_superseded_deltas_after_fixed_point() -> (
+    None
+):
+    events: list[str] = []
+    dataset = fake_dataset(
+        ("doc-a", "doc-b", "doc-c"),
+        concepts_by_knowledge={"doc-c": ("concept/fail",)},
+        include_shared=False,
+        omitted_merges={"concept/fail"},
+    )
+
+    class ExpiringSource(FakeKnowledgeSource):
+        def __init__(self) -> None:
+            super().__init__(dataset)
+            self.active_calls: defaultdict[str, int] = defaultdict(int)
+
+        async def is_active(
+            self, scope: WikiScope, knowledge_id: str, op_version: str
+        ) -> bool:
+            self.active_calls[knowledge_id] += 1
+            active = await super().is_active(scope, knowledge_id, op_version)
+            return active and not (
+                knowledge_id == "doc-a" and self.active_calls[knowledge_id] >= 2
+            )
+
+    model = OrderedIndexModel(dataset, events=events)
+    store = WorkerStore(
+        [
+            pending_op(OP_A, "doc-a"),
+            pending_op(OP_B, "doc-b"),
+            pending_op(OP_C, "doc-c"),
+        ],
+        index_intro_context=update_index_context(),
+        events=events,
+    )
+
+    result = await worker(store, ExpiringSource(), model).run_batch(SCOPE)
+
+    assert result.completed_op_ids == (OP_B,)
+    assert result.superseded_op_ids == (OP_A,)
+    assert result.failed_op_ids == (OP_C,)
+    assert len(store.index_context_calls) == 1
+    assert len(model.index_intro_requests) == 1
+    assert [
+        (change.action, change.knowledge_id)
+        for change in model.index_intro_requests[0].changes
+    ] == [("ingest", "doc-b")]
+    assert {
+        delta.pending_op_id for delta in store.apply_calls[0].contribution_deltas
+    } == {OP_B}
+    assert max(
+        index for index, event in enumerate(events) if event == "reduce"
+    ) < events.index("index-context")
+
+
+@pytest.mark.asyncio
+async def test_index_intro_transient_exhaustion_defaults_without_failing_operation() -> (
+    None
+):
+    dataset = fake_dataset(("doc-a",), include_shared=False)
+    waits: list[int] = []
+    model = OrderedIndexModel(dataset, transient_failures=3)
+    store = WorkerStore([pending_op(OP_A, "doc-a")])
+
+    result = await worker(
+        store, FakeKnowledgeSource(dataset), model, waits=waits
+    ).run_batch(SCOPE)
+
+    assert waits == [2, 4]
+    assert len(model.index_intro_requests) == 3
+    assert result.completed_op_ids == (OP_A,)
+    assert result.failed_op_ids == ()
+    request = store.apply_calls[0]
+    assert request.completed_op_ids == (OP_A,)
+    assert request.failures == ()
+    assert request.index_intro_plan is not None
+    assert request.index_intro_plan.model_status == "defaulted"
+    assert request.index_intro_plan.error_code == "INDEX_INTRO_TRANSIENT_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_index_intro_permanent_error_keeps_existing_intro_after_one_attempt() -> (
+    None
+):
+    dataset = fake_dataset(("doc-a",), include_shared=False)
+    model = OrderedIndexModel(dataset, error=PermanentModelError("no index intro"))
+    store = WorkerStore(
+        [pending_op(OP_A, "doc-a")], index_intro_context=update_index_context()
+    )
+
+    result = await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
+
+    assert len(model.index_intro_requests) == 1
+    assert result.completed_op_ids == (OP_A,)
+    plan = store.apply_calls[0].index_intro_plan
+    assert plan is not None
+    assert plan.intro == "Old index intro"
+    assert plan.model_status == "kept_after_error"
+    assert plan.error_code == "INDEX_INTRO_PERMANENT_ERROR"
+    assert store.apply_calls[0].failures == ()
+
+
+@pytest.mark.parametrize(
+    "invalid_output",
+    [
+        {"intro": ""},
+        IndexIntroOutput(intro="## Directory only"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_index_intro_invalid_or_clean_empty_output_uses_invalid_fallback(
+    invalid_output: object,
+) -> None:
+    dataset = fake_dataset(("doc-a",), include_shared=False)
+    model = OrderedIndexModel(dataset, intro=invalid_output)
+    store = WorkerStore([pending_op(OP_A, "doc-a")])
+
+    result = await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
+
+    assert result.completed_op_ids == (OP_A,)
+    assert len(model.index_intro_requests) == 1
+    plan = store.apply_calls[0].index_intro_plan
+    assert plan is not None
+    assert plan.model_status == "defaulted"
+    assert plan.error_code == "INDEX_INTRO_INVALID_OUTPUT"
+    assert store.apply_calls[0].failures == ()
+
+
+@pytest.mark.asyncio
+async def test_index_intro_context_error_propagates_and_releases_claim() -> None:
+    dataset = fake_dataset(("doc-a",), include_shared=False)
+    model = OrderedIndexModel(dataset)
+    store = WorkerStore(
+        [pending_op(OP_A, "doc-a")], index_context_error=RuntimeError("db down")
+    )
+
+    with pytest.raises(RuntimeError, match="db down"):
+        await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
+
+    assert len(store.index_context_calls) == 1
+    assert model.index_intro_requests == []
+    assert store.apply_calls == []
+    assert store.release_calls == [(SCOPE, [OP_A], CLAIM_TOKEN)]
+
+
+@pytest.mark.asyncio
+async def test_index_intro_cancelled_error_propagates_without_apply() -> None:
+    dataset = fake_dataset(("doc-a",), include_shared=False)
+    model = OrderedIndexModel(dataset, error=asyncio.CancelledError())
+    store = WorkerStore([pending_op(OP_A, "doc-a")])
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
+
+    assert len(model.index_intro_requests) == 1
+    assert store.apply_calls == []
+    assert store.release_calls == [(SCOPE, [OP_A], CLAIM_TOKEN)]
+
+
+@pytest.mark.asyncio
+async def test_index_intro_control_error_propagates_through_lock_lost_path() -> None:
+    dataset = fake_dataset(("doc-a",), include_shared=False)
+    model = OrderedIndexModel(dataset, error=LockOwnershipLost("model lost lock"))
+    store = WorkerStore([pending_op(OP_A, "doc-a")])
+
+    with pytest.raises(WikiLockLost) as error:
+        await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
+
+    assert isinstance(error.value.__cause__, LockOwnershipLost)
+    assert len(model.index_intro_requests) == 1
+    assert store.apply_calls == []
+    assert store.release_calls == [(SCOPE, [OP_A], CLAIM_TOKEN)]
+
+
+@pytest.mark.asyncio
+async def test_index_intro_plans_before_lease_check_and_lock_loss_blocks_apply() -> (
+    None
+):
+    dataset = fake_dataset(("doc-a",), include_shared=False)
+    model = OrderedIndexModel(dataset)
+    store = WorkerStore([pending_op(OP_A, "doc-a")])
+    lease = FakeLease(lose_on_assert=True)
+
+    with pytest.raises(WikiLockLost):
+        await worker(
+            store,
+            FakeKnowledgeSource(dataset),
+            model,
+            lease=lease,
+        ).run_batch(SCOPE)
+
+    assert len(store.index_context_calls) == 1
+    assert len(model.index_intro_requests) == 1
+    assert lease.assert_calls == 1
+    assert store.apply_calls == []
+    assert store.release_calls == [(SCOPE, [OP_A], CLAIM_TOKEN)]
 
 
 @pytest.mark.asyncio

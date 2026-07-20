@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import TypeVar
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from pydantic import ValidationError
 from tenacity import (
     AsyncRetrying,
     retry_if_exception_type,
@@ -17,6 +18,11 @@ from tenacity import (
 
 from app.wiki.errors import WikiValidationError
 from app.wiki.ingest.errors import WikiBatchBusy
+from app.wiki.ingest.index_intro import (
+    build_index_intro_planning,
+    build_success_index_intro_plan,
+    fallback_index_intro_plan,
+)
 from app.wiki.ingest.map_document import map_document
 from app.wiki.ingest.ports import (
     EmbeddingModelPort,
@@ -33,6 +39,8 @@ from app.wiki.ingest.schemas import (
     BatchResult,
     ContributionDelta,
     FolderAssignment,
+    IndexIntroOutput,
+    IndexIntroPlan,
     MapDocumentResult,
     OperationFailure,
     PageExpectation,
@@ -256,6 +264,13 @@ class WikiIngestWorker:
             self._page_expectation(page.slug, existing_pages.get(page.slug))
             for page in pages
         )
+        index_intro_plan = await self._plan_index_intro(
+            scope,
+            records,
+            completed_ids,
+            pages,
+            contribution_deltas,
+        )
         request = BatchApplyRequest(
             claim_token=claim_token,
             pages=tuple(pages),
@@ -269,6 +284,7 @@ class WikiIngestWorker:
                 f"wiki:{scope.knowledge_base_id}:{claim_token}",
             ),
             folder_assignments=tuple(folder_assignments),
+            index_intro_plan=index_intro_plan,
         )
         await lease.assert_owned()
         outcome = await self._store.apply_results_with_outcome(scope, request)
@@ -571,6 +587,65 @@ class WikiIngestWorker:
         return PageExpectation(
             slug=slug, page_id=existing.page_id, version=existing.version
         )
+
+    async def _plan_index_intro(
+        self,
+        scope: WikiScope,
+        records: Sequence[PendingOpRecord],
+        completed_op_ids: Sequence[UUID],
+        pages: Sequence[ReducedPage],
+        contribution_deltas: Sequence[ContributionDelta],
+    ) -> IndexIntroPlan | None:
+        completed = set(completed_op_ids)
+        changed = {
+            delta.pending_op_id
+            for delta in contribution_deltas
+            if delta.pending_op_id in completed
+        }
+        operation_actions = tuple(
+            (record.op, record.knowledge_id)
+            for record in records
+            if record.id in changed and record.op in ("ingest", "retract")
+        )
+        if not operation_actions:
+            return None
+
+        context = await self._store.load_index_intro_context(scope)
+        planning = build_index_intro_planning(
+            context,
+            completed_op_ids=completed_op_ids,
+            pages=pages,
+            contribution_deltas=contribution_deltas,
+            operation_actions=operation_actions,
+        )
+        if planning is None:
+            return None
+
+        try:
+            raw_output = await self._retry_model(
+                lambda: self._model.generate_index_intro(planning.request)
+            )
+        except TransientModelError:
+            return fallback_index_intro_plan(
+                planning, error_code="INDEX_INTRO_TRANSIENT_ERROR"
+            )
+        except PermanentModelError:
+            return fallback_index_intro_plan(
+                planning, error_code="INDEX_INTRO_PERMANENT_ERROR"
+            )
+
+        try:
+            output_payload = (
+                raw_output.model_dump(mode="python", warnings="error")
+                if isinstance(raw_output, IndexIntroOutput)
+                else raw_output
+            )
+            output = IndexIntroOutput.model_validate(output_payload)
+            return build_success_index_intro_plan(planning, output)
+        except (ValidationError, TypeError, AttributeError, ValueError):
+            return fallback_index_intro_plan(
+                planning, error_code="INDEX_INTRO_INVALID_OUTPUT"
+            )
 
     @staticmethod
     def _is_control_error(error: Exception) -> bool:
