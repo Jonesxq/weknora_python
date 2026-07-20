@@ -31,6 +31,13 @@ from app.wiki.ingest.schemas import (
     FinalizationRequest,
     FolderAssignment,
     FolderCatalogEntry,
+    IndexIntroChange,
+    IndexIntroContext,
+    IndexIntroOutput,
+    IndexIntroPlan,
+    IndexIntroRequest,
+    IndexPageSnapshot,
+    IndexSummaryItem,
     MapDocumentResult,
     PageContribution,
     PageMergeOutput,
@@ -612,6 +619,163 @@ def test_batch_apply_request_validates_folder_assignment_copy_updates() -> None:
         )
     with pytest.raises(ValidationError):
         request.model_copy(update={"folder_assignments": [assignment, duplicate]})
+
+
+def _index_summary(slug: str = "summary/knowledge-1") -> IndexSummaryItem:
+    return IndexSummaryItem(slug=slug, title=" Document One ", summary=" Summary ")
+
+
+def _index_plan(
+    *,
+    mode: str = "create",
+    model_status: str = "generated",
+    error_code: str | None = None,
+) -> IndexIntroPlan:
+    return IndexIntroPlan(
+        mode=mode,
+        expected_page_id=uuid4() if mode == "update" else None,
+        expected_version=1 if mode == "update" else None,
+        intro=" Index introduction ",
+        model_status=model_status,
+        error_code=error_code,
+    )
+
+
+def _index_batch(**updates: object) -> BatchApplyRequest:
+    payload: dict[str, object] = {
+        "claim_token": uuid4(),
+        "pages": (),
+        "contribution_deltas": (),
+        "completed_op_ids": (),
+        "superseded_op_ids": (),
+        "failures": (),
+        "expected_pages": (),
+        "operation_id": uuid4(),
+    }
+    payload.update(updates)
+    return BatchApplyRequest(**payload)
+
+
+def test_index_intro_value_models_normalize_and_remain_deeply_immutable() -> None:
+    request = IndexIntroRequest(mode="create", summaries=[_index_summary()])
+    context = IndexIntroContext(
+        index=IndexPageSnapshot(id=uuid4(), version=1, content=" Body ", summary=" Old "),
+        recent_summaries=[_index_summary("summary/knowledge-2")],
+    )
+
+    assert request.summaries == (
+        IndexSummaryItem(
+            slug="summary/knowledge-1", title="Document One", summary="Summary"
+        ),
+    )
+    assert context.index is not None
+    assert context.index.content == "Body"
+    assert isinstance(request.model_dump()["summaries"], tuple)
+    assert IndexIntroRequest.model_validate(request.model_dump()) == request
+    copied = request.model_copy(
+        update={
+            "summaries": [
+                {"slug": "summary/copied", "title": "Copied", "summary": "Copied"}
+            ]
+        }
+    )
+    assert copied.summaries[0].slug == "summary/copied"
+    with pytest.raises((AttributeError, TypeError, ValidationError)):
+        request.summaries[0].title = "Changed"
+    with pytest.raises((AttributeError, TypeError, ValidationError)):
+        context.index.summary = "Changed"  # type: ignore[union-attr]
+
+
+def test_index_intro_request_requires_disjoint_create_and_update_payloads() -> None:
+    change = IndexIntroChange(action="ingest", knowledge_id=" knowledge-1 ", pages=[_index_summary()])
+    update = IndexIntroRequest(
+        mode="update", existing_intro=" Existing ", changes=[change]
+    )
+
+    assert update.existing_intro == "Existing"
+    assert update.changes[0].knowledge_id == "knowledge-1"
+    invalid_payloads = (
+        {"mode": "create", "existing_intro": "Existing"},
+        {"mode": "create", "changes": [change]},
+        {"mode": "update", "existing_intro": " ", "changes": [change]},
+        {"mode": "update", "existing_intro": "Existing", "summaries": [_index_summary()], "changes": [change]},
+        {"mode": "update", "existing_intro": "Existing", "changes": ()},
+        {"mode": "other"},
+    )
+    for payload in invalid_payloads:
+        with pytest.raises(ValidationError):
+            IndexIntroRequest(**payload)
+
+
+def test_index_intro_context_and_changes_reject_duplicate_or_oversized_values() -> None:
+    summary = _index_summary()
+    with pytest.raises(ValidationError):
+        IndexIntroContext(recent_summaries=[summary] * 201)
+    with pytest.raises(ValidationError):
+        IndexIntroContext(recent_summaries=[summary, summary])
+    with pytest.raises(ValidationError):
+        IndexIntroChange(action="ingest", knowledge_id="knowledge-1", pages=[summary, summary])
+    with pytest.raises(ValidationError):
+        IndexIntroChange(action="retract", knowledge_id=" " * 2, pages=())
+    with pytest.raises(ValidationError):
+        IndexSummaryItem(slug="entity/acme", title="Title", summary="Summary")
+    with pytest.raises(ValidationError):
+        IndexSummaryItem(slug="summary/acme", title=" " * 513, summary="Summary")
+    with pytest.raises(ValidationError):
+        IndexSummaryItem(slug="summary/acme", title="Title", summary="x" * 4001)
+
+
+def test_index_intro_output_and_plan_validate_cross_field_contracts() -> None:
+    assert IndexIntroOutput(intro=" Intro ").intro == "Intro"
+    assert _index_plan().intro == "Index introduction"
+    assert _index_plan(model_status="defaulted", error_code=" MODEL_FAILED ").error_code == "MODEL_FAILED"
+    assert _index_plan(mode="update", model_status="kept_after_error", error_code="MODEL_FAILED").expected_version == 1
+
+    with pytest.raises(ValidationError):
+        IndexIntroOutput(intro=" ")
+    with pytest.raises(ValidationError):
+        IndexIntroOutput(intro="x" * 4001)
+    with pytest.raises(ValidationError):
+        IndexPageSnapshot(id=uuid4(), version=0, content="Body", summary="Summary")
+    with pytest.raises(ValidationError):
+        IndexPageSnapshot(id=uuid4(), version=1, content="x" * 4001, summary="Summary")
+
+    invalid_plans = (
+        {"mode": "create", "expected_page_id": uuid4(), "expected_version": None, "intro": "Intro", "model_status": "generated"},
+        {"mode": "create", "expected_page_id": None, "expected_version": 1, "intro": "Intro", "model_status": "generated"},
+        {"mode": "update", "intro": "Intro", "model_status": "generated"},
+        {"mode": "create", "intro": "Intro", "model_status": "generated", "error_code": "FAILED"},
+        {"mode": "update", "expected_page_id": uuid4(), "expected_version": 1, "intro": "Intro", "model_status": "defaulted", "error_code": "FAILED"},
+        {"mode": "create", "intro": "Intro", "model_status": "kept_after_error", "error_code": "FAILED"},
+        {"mode": "create", "intro": "Intro", "model_status": "defaulted", "error_code": " "},
+    )
+    for payload in invalid_plans:
+        with pytest.raises(ValidationError):
+            IndexIntroPlan(**payload)
+
+
+def test_batch_apply_request_index_plan_requires_completed_operation_and_validated_copy() -> None:
+    plan = _index_plan()
+    with pytest.raises(ValidationError):
+        _index_batch(index_intro_plan=plan)
+
+    old_request = _index_batch()
+    assert old_request.index_intro_plan is None
+    request = _index_batch(completed_op_ids=(uuid4(),))
+    updated = request.model_copy(update={"index_intro_plan": plan})
+    assert updated.index_intro_plan == plan
+    with pytest.raises(ValidationError):
+        old_request.model_copy(update={"index_intro_plan": plan})
+    with pytest.raises(ValidationError):
+        request.model_copy(
+            update={
+                "index_intro_plan": {
+                    "mode": "create",
+                    "intro": "Intro",
+                    "model_status": "defaulted",
+                }
+            }
+        )
 
 
 def test_worker_options_read_environment(monkeypatch: pytest.MonkeyPatch) -> None:

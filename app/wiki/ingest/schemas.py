@@ -27,6 +27,8 @@ from app.wiki.scope import WikiScope
 ExtractionGranularity = Literal["focused", "standard", "exhaustive"]
 TopicPageType = Literal["entity", "concept"]
 IngestPageType = Literal["summary", "entity", "concept"]
+IndexIntroMode = Literal["create", "update"]
+IndexModelStatus = Literal["generated", "defaulted", "kept_after_error"]
 
 _SLUG_PATTERN = re.compile(
     r"^(summary|entity|concept)/[a-z0-9][a-z0-9_-]*(?:/[a-z0-9][a-z0-9_-]*)*$"
@@ -124,8 +126,7 @@ class _FrozenVectorMapping(Mapping[str, tuple[float, ...]]):
     def __init__(
         self,
         values: (
-            Mapping[str, tuple[float, ...]]
-            | Iterable[tuple[str, tuple[float, ...]]]
+            Mapping[str, tuple[float, ...]] | Iterable[tuple[str, tuple[float, ...]]]
         ),
     ) -> None:
         source = values.items() if isinstance(values, Mapping) else values
@@ -1102,7 +1103,9 @@ class FolderAssignment(_TaxonomyValueModel):
 
     @property
     def wiki_path(self) -> str:
-        return f"{self.folder_path}/{self.slug}" if self.folder_path else f"/{self.slug}"
+        return (
+            f"{self.folder_path}/{self.slug}" if self.folder_path else f"/{self.slug}"
+        )
 
 
 class _FolderAssignmentsPayload(_TaxonomyValueModel):
@@ -1328,6 +1331,174 @@ class PageExpectation(_FrozenValueModel):
         return self
 
 
+class IndexSummaryItem(_TaxonomyValueModel):
+    slug: str
+    title: str
+    summary: str
+
+    @field_validator("slug")
+    @classmethod
+    def normalize_slug(cls, value: str) -> str:
+        return _normalize_slug(value, ("summary",))
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        value = value.strip()
+        if not 1 <= len(value) <= 512:
+            raise ValueError("索引摘要标题长度必须在 1 到 512 之间")
+        return value
+
+    @field_validator("summary")
+    @classmethod
+    def normalize_summary(cls, value: str) -> str:
+        value = value.strip()
+        if len(value) > 4000:
+            raise ValueError("索引摘要长度不能超过 4000")
+        return value
+
+
+class IndexPageSnapshot(_TaxonomyValueModel):
+    id: UUID
+    version: int = Field(ge=1)
+    content: str
+    summary: str
+
+    @field_validator("content", "summary")
+    @classmethod
+    def normalize_text(cls, value: str) -> str:
+        value = value.strip()
+        if len(value) > 4000:
+            raise ValueError("索引页面文本长度不能超过 4000")
+        return value
+
+
+class IndexIntroContext(_TaxonomyValueModel):
+    index: IndexPageSnapshot | None = None
+    recent_summaries: tuple[IndexSummaryItem, ...] = Field(default=(), max_length=200)
+
+    @model_validator(mode="after")
+    def validate_recent_summary_slugs(self) -> Self:
+        slugs = [item.slug for item in self.recent_summaries]
+        if len(slugs) != len(set(slugs)):
+            raise ValueError("recent_summaries slug 不能重复")
+        return self
+
+
+class IndexIntroChange(_TaxonomyValueModel):
+    action: Literal["ingest", "retract"]
+    knowledge_id: str
+    pages: tuple[IndexSummaryItem, ...] = ()
+
+    @field_validator("knowledge_id")
+    @classmethod
+    def normalize_knowledge_id(cls, value: str) -> str:
+        value = value.strip()
+        if not 1 <= len(value) <= 512:
+            raise ValueError("知识标识长度必须在 1 到 512 之间")
+        return value
+
+    @model_validator(mode="after")
+    def validate_page_slugs(self) -> Self:
+        slugs = [page.slug for page in self.pages]
+        if len(slugs) != len(set(slugs)):
+            raise ValueError("index intro change pages slug 不能重复")
+        return self
+
+
+class IndexIntroRequest(_TaxonomyValueModel):
+    mode: IndexIntroMode
+    existing_intro: str = ""
+    summaries: tuple[IndexSummaryItem, ...] = Field(default=(), max_length=200)
+    changes: tuple[IndexIntroChange, ...] = ()
+
+    @field_validator("existing_intro")
+    @classmethod
+    def normalize_existing_intro(cls, value: str) -> str:
+        value = value.strip()
+        if len(value) > 4000:
+            raise ValueError("existing_intro 长度不能超过 4000")
+        return value
+
+    @model_validator(mode="after")
+    def validate_payload_contract(self) -> Self:
+        summary_slugs = [summary.slug for summary in self.summaries]
+        changes = [(change.action, change.knowledge_id) for change in self.changes]
+        if len(summary_slugs) != len(set(summary_slugs)):
+            raise ValueError("summaries slug 不能重复")
+        if len(changes) != len(set(changes)):
+            raise ValueError("changes action 和 knowledge_id 不能重复")
+        if self.mode == "create":
+            if self.existing_intro or self.changes:
+                raise ValueError("create index intro 只能包含 summaries")
+        elif not self.existing_intro or self.summaries or not self.changes:
+            raise ValueError("update index intro 必须包含 existing_intro 和 changes")
+        return self
+
+
+class IndexIntroOutput(_TaxonomyValueModel):
+    intro: str
+
+    @field_validator("intro")
+    @classmethod
+    def normalize_intro(cls, value: str) -> str:
+        value = value.strip()
+        if not 1 <= len(value) <= 4000:
+            raise ValueError("index intro 长度必须在 1 到 4000 之间")
+        return value
+
+
+class IndexIntroPlan(_TaxonomyValueModel):
+    mode: IndexIntroMode
+    expected_page_id: UUID | None = None
+    expected_version: int | None = Field(default=None, ge=1)
+    intro: str
+    model_status: IndexModelStatus
+    error_code: str | None = None
+
+    @field_validator("intro")
+    @classmethod
+    def normalize_intro(cls, value: str) -> str:
+        value = value.strip()
+        if not 1 <= len(value) <= 4000:
+            raise ValueError("index intro 长度必须在 1 到 4000 之间")
+        return value
+
+    @field_validator("error_code")
+    @classmethod
+    def normalize_error_code(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not 1 <= len(value) <= 128:
+            raise ValueError("error_code 长度必须在 1 到 128 之间")
+        return value
+
+    @model_validator(mode="after")
+    def validate_plan_contract(self) -> Self:
+        has_page = self.expected_page_id is not None
+        if has_page != (self.expected_version is not None):
+            raise ValueError(
+                "expected_page_id 与 expected_version 必须同时存在或同时为空"
+            )
+        if self.mode == "create" and has_page:
+            raise ValueError("create index intro 不能提供 expected page")
+        if self.mode == "update" and not has_page:
+            raise ValueError("update index intro 必须提供 expected page")
+        if self.model_status == "generated" and self.error_code is not None:
+            raise ValueError("generated index intro 不能提供 error_code")
+        if (
+            self.model_status in {"defaulted", "kept_after_error"}
+            and self.error_code is None
+        ):
+            raise ValueError("回退 index intro 必须提供 error_code")
+        if self.model_status == "defaulted" and self.mode != "create":
+            raise ValueError("defaulted index intro 只允许 create")
+        if self.model_status == "kept_after_error" and self.mode != "update":
+            raise ValueError("kept_after_error index intro 只允许 update")
+        return self
+
+
 class BatchApplyRequest(_FrozenValueModel):
     claim_token: UUID
     pages: tuple[_FrozenReducedPage, ...]
@@ -1338,17 +1509,31 @@ class BatchApplyRequest(_FrozenValueModel):
     expected_pages: tuple[PageExpectation, ...]
     operation_id: UUID
     folder_assignments: tuple[FolderAssignment, ...] = ()
+    index_intro_plan: IndexIntroPlan | None = None
 
     def model_copy(
         self, *, update: Mapping[str, Any] | None = None, deep: bool = False
     ) -> Self:
-        if not update or "folder_assignments" not in update:
+        if not update or not {"folder_assignments", "index_intro_plan"}.intersection(
+            update
+        ):
             return super().model_copy(update=update, deep=deep)
-        validated_update = dict(update)
-        validated_update["folder_assignments"] = _FolderAssignmentsPayload(
-            items=validated_update["folder_assignments"]
-        ).items
-        return super().model_copy(update=validated_update, deep=deep)
+        source = super().model_copy(deep=deep)
+        payload = {
+            field_name: getattr(source, field_name)
+            for field_name in type(self).model_fields
+        }
+        payload.update(update)
+        validated = type(self).model_validate(payload)
+        object.__setattr__(
+            validated,
+            "__pydantic_fields_set__",
+            source.model_fields_set | set(update),
+        )
+        private_state = getattr(source, "__pydantic_private__", None)
+        if private_state is not None:
+            object.__setattr__(validated, "__pydantic_private__", private_state)
+        return validated
 
     @field_validator("pages", mode="before")
     @classmethod
@@ -1379,6 +1564,8 @@ class BatchApplyRequest(_FrozenValueModel):
         if len(expected_slugs) != len(set(expected_slugs)):
             raise ValueError("expected_pages slug 不能重复")
         _FolderAssignmentsPayload(items=self.folder_assignments)
+        if self.index_intro_plan is not None and not self.completed_op_ids:
+            raise ValueError("index intro plan 至少需要一个 completed operation")
         return self
 
 
