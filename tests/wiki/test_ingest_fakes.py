@@ -38,6 +38,10 @@ from app.wiki.ingest.schemas import (
     DedupRequest,
     EmbeddingItem,
     EmbeddingRequest,
+    IndexIntroChange,
+    IndexIntroOutput,
+    IndexIntroRequest,
+    IndexSummaryItem,
     PageContribution,
     PageMergeRequest,
     TopicCandidate,
@@ -160,6 +164,31 @@ def taxonomy_request(*slugs: str) -> TaxonomyRequest:
     )
 
 
+def index_intro_create_request(*knowledge_ids: str) -> IndexIntroRequest:
+    return IndexIntroRequest(
+        mode="create",
+        summaries=tuple(
+            IndexSummaryItem(
+                slug=f"summary/{knowledge_id}",
+                title=f"Document {knowledge_id}",
+                summary=f"Summary {knowledge_id}",
+            )
+            for knowledge_id in knowledge_ids
+        ),
+    )
+
+
+def index_intro_update_request(*changes: tuple[str, str]) -> IndexIntroRequest:
+    return IndexIntroRequest(
+        mode="update",
+        existing_intro="Existing intro",
+        changes=tuple(
+            IndexIntroChange(action=action, knowledge_id=knowledge_id)
+            for action, knowledge_id in changes
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_fake_embedding_returns_exact_requested_vectors() -> None:
     payload = deepcopy(FIXTURE)
@@ -184,6 +213,121 @@ async def test_fake_taxonomy_requires_explicit_batch_response() -> None:
 
     with pytest.raises(PermanentModelError, match="taxonomy:entity/acme"):
         await model.plan_folders(request)
+
+
+@pytest.mark.asyncio
+async def test_fake_index_intro_uses_request_order_and_isolates_snapshots() -> None:
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["index_intros"] = {
+        "index_intro:create:summary/knowledge-1": {"intro": "Created intro"},
+        "index_intro:update:ingest:knowledge-1,retract:knowledge-2": {
+            "intro": "Updated intro"
+        },
+    }
+    dataset = FakeDataset.model_validate(payload)
+    first = FakeChatModel(dataset)
+    second = FakeChatModel(dataset)
+    create = index_intro_create_request("knowledge-1")
+    update = index_intro_update_request(("ingest", "knowledge-1"), ("retract", "knowledge-2"))
+
+    created = await first.generate_index_intro(create)
+    updated = await first.generate_index_intro(update)
+    repeated = await second.generate_index_intro(create)
+
+    assert created.intro == "Created intro"
+    assert updated.intro == "Updated intro"
+    assert first.calls == [
+        "index_intro:create:summary/knowledge-1",
+        "index_intro:update:ingest:knowledge-1,retract:knowledge-2",
+    ]
+    assert [snapshot.model_dump() for snapshot in first.index_intro_requests] == [
+        create.model_dump(),
+        update.model_dump(),
+    ]
+    assert first.index_intro_requests[0] is not create
+    assert created is not repeated
+    assert first.responses["index_intros"] is not first._responses.index_intros
+    first.responses["index_intros"]["index_intro:create:summary/knowledge-1"] = IndexIntroOutput(
+        intro="Mutated public snapshot"
+    )
+    assert (await first.generate_index_intro(create)).intro == "Created intro"
+
+
+@pytest.mark.asyncio
+async def test_fake_index_intro_records_transient_attempts_and_missing_responses() -> None:
+    payload = deepcopy(FIXTURE)
+    key = "index_intro:create:summary/knowledge-1"
+    payload["model_responses"]["index_intros"] = {key: {"intro": "Created intro"}}
+    payload["transient_failures"] = {key: 1}
+    model = FakeChatModel(FakeDataset.model_validate(payload))
+    request = index_intro_create_request("knowledge-1")
+
+    with pytest.raises(TransientModelError, match=key):
+        await model.generate_index_intro(request)
+    assert (await model.generate_index_intro(request)).intro == "Created intro"
+    assert model.calls == [key, key]
+    assert len(model.index_intro_requests) == 2
+    assert all(snapshot.model_dump() == request.model_dump() for snapshot in model.index_intro_requests)
+    assert model.index_intro_requests[0] is not request
+    assert model.index_intro_requests[0] is not model.index_intro_requests[1]
+
+    missing = index_intro_create_request("knowledge-2")
+    with pytest.raises(
+        PermanentModelError, match="index_intro:create:summary/knowledge-2"
+    ):
+        await model.generate_index_intro(missing)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "index_intro:create:",
+        "index_intro:create:summary/knowledge-1,summary/knowledge-1",
+        "index_intro:create:summary/Knowledge-1",
+        "index_intro:create:entity/knowledge-1",
+        "index_intro:update:",
+        "index_intro:update:retract:knowledge-2,ingest:knowledge-1",
+        "index_intro:update:ingest:knowledge-1,ingest:knowledge-1",
+        "index_intro:update:ingest:knowledge,1",
+        "index_intro:update:ingest:knowledge:1",
+        "index_intro:unknown:summary/knowledge-1",
+        "not_index_intro:create:summary/knowledge-1",
+    ],
+)
+def test_fixture_rejects_malformed_index_intro_response_keys(key: str) -> None:
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["index_intros"] = {key: {"intro": "Index intro"}}
+
+    with pytest.raises(ValidationError):
+        FakeDataset.model_validate(payload)
+
+
+def test_fixture_accepts_empty_and_canonical_index_intro_responses() -> None:
+    empty = deepcopy(FIXTURE)
+    empty["model_responses"]["index_intros"] = {}
+    assert FakeDataset.model_validate(empty).model_responses.index_intros == {}
+
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["index_intros"] = {
+        "index_intro:create:summary/knowledge-2,summary/knowledge-1": {"intro": "Created"},
+        "index_intro:update:ingest:knowledge-1,retract:knowledge-2": {"intro": "Updated"},
+    }
+    assert set(FakeDataset.model_validate(payload).model_responses.index_intros) == set(
+        payload["model_responses"]["index_intros"]
+    )
+
+
+def test_fixture_rejects_unknown_index_intro_transient_response_key() -> None:
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["index_intros"] = {
+        "index_intro:create:summary/knowledge-1": {"intro": "Created"}
+    }
+    payload["transient_failures"] = {
+        "index_intro:create:summary/knowledge-missing": 1
+    }
+
+    with pytest.raises(ValidationError, match="未知"):
+        FakeDataset.model_validate(payload)
 
 
 @pytest.mark.asyncio

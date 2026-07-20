@@ -21,6 +21,9 @@ from app.wiki.ingest.schemas import (
     DocumentSummary,
     EmbeddingOutput,
     EmbeddingRequest,
+    IndexIntroChange,
+    IndexIntroOutput,
+    IndexIntroRequest,
     PageMergeOutput,
     PageMergeRequest,
     SourceChunk,
@@ -53,6 +56,7 @@ class _ModelResponses(_StrictModel):
     deduplications: dict[str, DedupDecision] = Field(default_factory=dict)
     embeddings: dict[str, tuple[float, ...]] = Field(default_factory=dict)
     taxonomies: dict[str, TaxonomyOutput] = Field(default_factory=dict)
+    index_intros: dict[str, IndexIntroOutput] = Field(default_factory=dict)
 
     @field_validator("embeddings", mode="before")
     @classmethod
@@ -65,6 +69,45 @@ class _ModelResponses(_StrictModel):
             if not isinstance(raw_key, str) or _normalize_embedding_key(raw_key) != raw_key:
                 raise ValueError("embeddings 响应键必须是非空规范 key")
         return dict(EmbeddingOutput(vectors=value).vectors)
+
+    @field_validator("index_intros")
+    @classmethod
+    def validate_index_intro_responses(
+        cls, value: dict[str, IndexIntroOutput]
+    ) -> dict[str, IndexIntroOutput]:
+        for key in value:
+            if key.startswith("index_intro:create:"):
+                slugs = key.removeprefix("index_intro:create:").split(",")
+                try:
+                    if (
+                        any(_normalize_slug(slug, ("summary",)) != slug for slug in slugs)
+                        or len(slugs) != len(set(slugs))
+                    ):
+                        raise ValueError
+                except ValueError as exc:
+                    raise ValueError("index intro create 响应键必须是唯一的规范 summary slug") from exc
+                continue
+
+            if key.startswith("index_intro:update:"):
+                raw_changes = key.removeprefix("index_intro:update:").split(",")
+                changes: list[tuple[str, str]] = []
+                try:
+                    for raw_change in raw_changes:
+                        action, knowledge_id = raw_change.split(":")
+                        change = IndexIntroChange(action=action, knowledge_id=knowledge_id)
+                        if change.knowledge_id != knowledge_id:
+                            raise ValueError
+                        changes.append((change.action, change.knowledge_id))
+                    if len(changes) != len(set(changes)) or changes != sorted(changes):
+                        raise ValueError
+                except ValueError as exc:
+                    raise ValueError(
+                        "index intro update 响应键必须是有序且唯一的 action:knowledge_id"
+                    ) from exc
+                continue
+
+            raise ValueError("index intro 响应键必须使用 create 或 update 模式")
+        return value
 
 
 FailureCount = Annotated[int, Field(ge=0)]
@@ -151,6 +194,8 @@ class FakeDataset(_StrictModel):
                     raise ValueError("embedding 瞬时失败键必须引用有序且唯一的已声明 vector key")
             if prefix == "taxonomy" and suffix not in self.model_responses.taxonomies:
                 raise ValueError("taxonomy 瞬时失败键必须引用已声明 batch")
+            if prefix == "index_intro" and f"index_intro:{suffix}" not in self.model_responses.index_intros:
+                raise ValueError("index intro 瞬时失败键包含未知响应 key")
         return self
 
     @field_validator("transient_failures")
@@ -166,6 +211,7 @@ class FakeDataset(_StrictModel):
                 "dedup",
                 "embedding",
                 "taxonomy",
+                "index_intro",
             }:
                 raise ValueError(f"不支持的 transient failure key: {key}")
             if prefix == "merge" and not (
@@ -250,13 +296,15 @@ class FakeKnowledgeSource:
 class FakeChatModel:
     def __init__(self, dataset: FakeDataset) -> None:
         self._responses = dataset.model_responses.model_copy(deep=True)
+        response_snapshot = self._responses.model_copy(deep=True)
         self.responses = {
-            "extract_candidates": self._responses.extract_candidates,
-            "summaries": self._responses.summaries,
-            "merges": self._responses.merges,
-            "citations": self._responses.citations,
-            "deduplications": self._responses.deduplications,
-            "taxonomies": self._responses.taxonomies,
+            "extract_candidates": response_snapshot.extract_candidates,
+            "summaries": response_snapshot.summaries,
+            "merges": response_snapshot.merges,
+            "citations": response_snapshot.citations,
+            "deduplications": response_snapshot.deduplications,
+            "taxonomies": response_snapshot.taxonomies,
+            "index_intros": response_snapshot.index_intros,
         }
         self._remaining_failures = dict(dataset.transient_failures)
         self.calls: list[str] = []
@@ -264,6 +312,7 @@ class FakeChatModel:
         self.citation_requests: list[CitationBatchRequest] = []
         self.dedup_requests: list[DedupRequest] = []
         self.taxonomy_requests: list[TaxonomyRequest] = []
+        self.index_intro_requests: list[IndexIntroRequest] = []
 
     def _record_call(self, key: str) -> None:
         self.calls.append(key)
@@ -303,6 +352,22 @@ class FakeChatModel:
         self.merge_requests.append(request.model_copy(deep=True))
         self._record_call(key)
         response = self._responses.merges.get(request.slug)
+        if response is None:
+            raise PermanentModelError(f"缺少模型响应: {key}")
+        return response.model_copy(deep=True)
+
+    async def generate_index_intro(self, request: IndexIntroRequest) -> IndexIntroOutput:
+        snapshot = IndexIntroRequest.model_validate(request.model_dump())
+        self.index_intro_requests.append(snapshot)
+        if snapshot.mode == "create":
+            suffix = _batch_key(summary.slug for summary in snapshot.summaries)
+        else:
+            suffix = _batch_key(
+                f"{change.action}:{change.knowledge_id}" for change in snapshot.changes
+            )
+        key = f"index_intro:{snapshot.mode}:{suffix}"
+        self._record_call(key)
+        response = self._responses.index_intros.get(key)
         if response is None:
             raise PermanentModelError(f"缺少模型响应: {key}")
         return response.model_copy(deep=True)

@@ -16,6 +16,8 @@ from app.wiki.ingest.schemas import (
     EmbeddingOutput,
     EmbeddingRequest,
     FinalizationRequest,
+    IndexIntroOutput,
+    IndexIntroRequest,
     PageMergeOutput,
     PageMergeRequest,
     SourceChunk,
@@ -61,6 +63,8 @@ class ChatModelPort(Protocol):
     ) -> DocumentSummary: ...
 
     async def merge_page(self, request: PageMergeRequest) -> PageMergeOutput: ...
+
+    async def generate_index_intro(self, request: IndexIntroRequest) -> IndexIntroOutput: ...
 
 
 @runtime_checkable
