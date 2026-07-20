@@ -9,12 +9,14 @@
 - 反引号或波浪号 fenced code，包括未闭合 fence 到文件末尾的内容；
 - inline code，包括未闭合 inline code 到文件末尾的内容；
 - 已有 `[[slug]]`、`[[slug|display]]` Wiki markup；
-- inline Markdown 链接、图片和 reference-style 链接；
+- inline Markdown 链接、图片，以及 full `[text][label]` 和 collapsed `[text][]` reference link；
 - reference definition 行；
 - `<https://example.test/path>` 这类 autolink；
 - 被反斜杠转义的候选文本。
 
 扫描保留 CRLF 和原始 Markdown。重复执行 linkify 时，已经存在的 Wiki 目标不会再次插入，因此结果幂等。
+
+CommonMark shortcut `[text]` 当前不在保护范围，其中的候选文本仍可能被 linkify 改写；这是阶段四 B 的当前限制。
 
 ## 本批受影响页面与候选范围
 
