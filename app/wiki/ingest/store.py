@@ -2981,7 +2981,7 @@ class SqlAlchemyIngestStore:
                     else "wiki_incremental_batch"
                 )
                 pages_affected = [
-                    {"slug": page.slug, "title": page.title} for page in pages
+                    {"slug": row.slug, "title": row.title} for row, _ in persisted
                 ]
                 if index_outcome.changed_page is not None and not any(
                     page["slug"] == "index" for page in pages_affected

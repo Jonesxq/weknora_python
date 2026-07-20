@@ -4480,6 +4480,169 @@ async def test_later_retract_supersedes_ingest_without_writing_its_slug(
 
 
 @pytest.mark.asyncio
+async def test_missing_deleted_page_is_not_reported_as_affected() -> None:
+    token = uuid4()
+    pending = _pending(op="retract", version="delete-1", claimed=True)
+    pending.claim_token = token
+    missing_delete = ReducedPage(
+        slug="summary/missing",
+        title="Missing summary",
+        page_type="summary",
+        content="",
+        summary="",
+        contributor_op_ids=[pending.id],
+        deleted=True,
+    )
+    request = _batch_request(
+        claim_token=token,
+        pages=(missing_delete,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="retract",
+                slug=missing_delete.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=_stored_contribution().model_copy(
+                    update={
+                        "slug": missing_delete.slug,
+                        "page_type": missing_delete.page_type,
+                        "state": "retract_pending",
+                    }
+                ),
+                current=None,
+            ),
+        ),
+        completed_op_ids=(pending.id,),
+        expected_pages=(PageExpectation(slug=missing_delete.slug),),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=0),
+        ]
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), _RecordingFinalization(session.events)
+    )  # type: ignore[arg-type]
+
+    assert await store.apply_results(SCOPE, request) is True
+
+    assert not any(isinstance(item, WikiPage) for item in session.added)
+    log = next(item for item in session.added if isinstance(item, WikiLogEntry))
+    assert log.pages_affected == []
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
+async def test_pages_affected_excludes_noop_delete_from_mixed_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = uuid4()
+    pending = _pending(claimed=True)
+    pending.claim_token = token
+    actual = ReducedPage(
+        slug="summary/actual",
+        title="Actual summary",
+        page_type="summary",
+        content="Actual content",
+        summary="Actual summary",
+        contributor_op_ids=[pending.id],
+    )
+    missing_delete = ReducedPage(
+        slug="summary/missing",
+        title="Missing summary",
+        page_type="summary",
+        content="",
+        summary="",
+        contributor_op_ids=[pending.id],
+        deleted=True,
+    )
+    current = _stored_contribution(version=pending.op_version).model_copy(
+        update={
+            "slug": actual.slug,
+            "page_type": actual.page_type,
+            "title": actual.title,
+            "content": actual.content,
+            "summary": actual.summary,
+            "aliases": (),
+            "chunk_refs": (),
+        }
+    )
+    stale_previous = _stored_contribution().model_copy(
+        update={
+            "slug": missing_delete.slug,
+            "page_type": missing_delete.page_type,
+            "state": "active",
+        }
+    )
+    request = _batch_request(
+        claim_token=token,
+        pages=(actual, missing_delete),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="add",
+                slug=actual.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=None,
+                current=current,
+            ),
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="retract_stale",
+                slug=missing_delete.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=stale_previous,
+                current=None,
+            ),
+        ),
+        completed_op_ids=(pending.id,),
+        expected_pages=(
+            PageExpectation(slug=actual.slug),
+            PageExpectation(slug=missing_delete.slug),
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=0),
+        ]
+    )
+
+    async def no_replace(*_args) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "app.wiki.ingest.store.SqlAlchemyPageStore.replace_page_links", no_replace
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), _RecordingFinalization(session.events)
+    )  # type: ignore[arg-type]
+
+    assert await store.apply_results(SCOPE, request) is True
+
+    log = next(item for item in session.added if isinstance(item, WikiLogEntry))
+    assert log.pages_affected == [{"slug": actual.slug, "title": actual.title}]
+    assert not any(
+        isinstance(item, WikiPage) and item.slug == missing_delete.slug
+        for item in session.added
+    )
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
 async def test_modern_retract_soft_deletes_page_and_clears_visible_links() -> None:
     token = uuid4()
     pending = _pending(op="retract", version="delete-1", claimed=True)
@@ -4548,6 +4711,7 @@ async def test_modern_retract_soft_deletes_page_and_clears_visible_links() -> No
     assert link_sql[1].startswith("UPDATE wiki_links")
     log = next(item for item in session.added if isinstance(item, WikiLogEntry))
     assert log.action == "wiki_retract_batch"
+    assert log.pages_affected == [{"slug": page.slug, "title": page.title}]
     assert [(kind, item.subtask_name) for kind, item in finalization.requests] == [
         ("release", "wiki-retract")
     ]
