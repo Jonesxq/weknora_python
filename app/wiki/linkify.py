@@ -223,10 +223,13 @@ def _fence_closing_end(content: str, line_start: int, marker: str, minimum_lengt
 def _inline_code_spans(content: str, fenced_spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     index = 0
+    fenced_cursor = 0
     while index < len(content):
-        fenced_end = _protected_end(fenced_spans, index)
-        if fenced_end is not None:
-            index = fenced_end
+        while fenced_cursor < len(fenced_spans) and fenced_spans[fenced_cursor][1] <= index:
+            fenced_cursor += 1
+        if fenced_cursor < len(fenced_spans) and fenced_spans[fenced_cursor][0] <= index:
+            index = fenced_spans[fenced_cursor][1]
+            fenced_cursor += 1
             continue
         if content[index] != "`":
             index += 1
@@ -235,10 +238,19 @@ def _inline_code_spans(content: str, fenced_spans: list[tuple[int, int]]) -> lis
         opener_end = _run_end(content, index, "`")
         run_length = opener_end - index
         cursor = opener_end
+        closer_fenced_cursor = fenced_cursor
         while cursor < len(content):
-            fenced_end = _protected_end(fenced_spans, cursor)
-            if fenced_end is not None:
-                cursor = fenced_end
+            while (
+                closer_fenced_cursor < len(fenced_spans)
+                and fenced_spans[closer_fenced_cursor][1] <= cursor
+            ):
+                closer_fenced_cursor += 1
+            if (
+                closer_fenced_cursor < len(fenced_spans)
+                and fenced_spans[closer_fenced_cursor][0] <= cursor
+            ):
+                cursor = fenced_spans[closer_fenced_cursor][1]
+                closer_fenced_cursor += 1
                 continue
             if content[cursor] != "`":
                 cursor += 1
@@ -247,6 +259,7 @@ def _inline_code_spans(content: str, fenced_spans: list[tuple[int, int]]) -> lis
             if closer_end - cursor == run_length:
                 spans.append((index, closer_end))
                 index = closer_end
+                fenced_cursor = closer_fenced_cursor
                 break
             cursor = closer_end
         else:

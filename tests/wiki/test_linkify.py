@@ -396,3 +396,26 @@ def test_markdown_link_destination_supports_escaped_parentheses() -> None:
 
     assert result.content == content[:-2] + "[[concept/ai|AI]]"
     assert result.added_slugs == ("concept/ai",)
+
+
+def test_inline_code_scan_uses_cursor_for_many_fenced_blocks(monkeypatch) -> None:
+    module = _api()
+    comparisons = 0
+
+    def counted_protected_end(spans, index):
+        nonlocal comparisons
+        for start, end in spans:
+            comparisons += 1
+            if index < start:
+                return None
+            if start <= index < end:
+                return end
+        return None
+
+    monkeypatch.setattr(module, "_protected_end", counted_protected_end)
+    content = "```\nx\n```\na\n" * 4000
+    fenced_spans = module._fenced_code_spans(content)
+
+    assert len(fenced_spans) == 4000
+    assert module._inline_code_spans(content, fenced_spans) == []
+    assert comparisons < 100_000
