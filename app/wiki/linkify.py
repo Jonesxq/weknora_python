@@ -1,0 +1,356 @@
+"""Deterministic Wiki-link insertion for Markdown source text."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from dataclasses import dataclass
+import re
+
+from app.wiki.domain import WikiSlugError, normalize_slug
+
+
+_AUTOLINK_RE = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]*://[^>\r\n]+>")
+_REFERENCE_DEFINITION_RE = re.compile(r"(?m)^[ \t]{0,3}\[[^\]\r\n]+\]:[^\r\n]*(?:\r\n|\r|\n|$)")
+_WIKI_LINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]*)?\]\]")
+_WIKI_MARKUP_RE = re.compile(r"\[\[[^\]\r\n]*\]\]")
+_ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_]")
+
+
+@dataclass(frozen=True, slots=True)
+class LinkCandidate:
+    slug: str
+    display: str
+
+
+@dataclass(frozen=True, slots=True)
+class LinkifyResult:
+    content: str
+    changed: bool
+    added_slugs: tuple[str, ...]
+
+
+def protected_spans(content: str) -> tuple[tuple[int, int], ...]:
+    """Return merged source ranges that must remain unchanged."""
+
+    code_spans = _fenced_code_spans(content)
+    code_spans.extend(_inline_code_spans(content, code_spans))
+    spans = code_spans + _markdown_spans(content)
+    return tuple(_merge_spans(spans))
+
+
+def linkify_markdown(
+    content: str,
+    *,
+    current_slug: str,
+    candidates: Iterable[LinkCandidate],
+) -> LinkifyResult:
+    """Insert one deterministic Wiki link per eligible candidate slug."""
+
+    normalized_current_slug = normalize_slug(current_slug)
+    code_spans = _fenced_code_spans(content)
+    code_spans.extend(_inline_code_spans(content, code_spans))
+    code_spans = _merge_spans(code_spans)
+    spans = list(protected_spans(content))
+    existing_slugs = _existing_wiki_slugs(content, code_spans)
+    prepared = _prepare_candidates(candidates, normalized_current_slug, existing_slugs)
+    added_slugs: list[str] = []
+    index = 0
+
+    while index < len(content):
+        protected_end = _protected_end(spans, index)
+        if protected_end is not None:
+            index = protected_end
+            continue
+
+        candidate = _candidate_at(content, index, prepared, set(added_slugs))
+        if candidate is None:
+            index += 1
+            continue
+
+        replacement = f"[[{candidate.slug}|{candidate.display}]]"
+        content = content[:index] + replacement + content[index + len(candidate.display) :]
+        spans = _shift_spans_for_insert(spans, index, len(candidate.display), len(replacement))
+        added_slugs.append(candidate.slug)
+        index += len(replacement)
+
+    return LinkifyResult(content, bool(added_slugs), tuple(added_slugs))
+
+
+def _prepare_candidates(
+    candidates: Iterable[LinkCandidate],
+    current_slug: str,
+    existing_slugs: set[str],
+) -> tuple[LinkCandidate, ...]:
+    by_display: dict[str, set[str]] = {}
+    pairs: set[tuple[str, str]] = set()
+
+    for candidate in candidates:
+        if not candidate.display:
+            continue
+        try:
+            slug = normalize_slug(candidate.slug)
+        except (TypeError, WikiSlugError):
+            continue
+        if slug == current_slug or slug in existing_slugs:
+            continue
+        pairs.add((slug, candidate.display))
+        by_display.setdefault(candidate.display, set()).add(slug)
+
+    filtered = [
+        LinkCandidate(slug=slug, display=display)
+        for slug, display in pairs
+        if len(by_display[display]) == 1
+    ]
+    return tuple(sorted(filtered, key=lambda item: (-len(item.display), item.display, item.slug)))
+
+
+def _candidate_at(
+    content: str,
+    index: int,
+    candidates: tuple[LinkCandidate, ...],
+    added_slugs: set[str],
+) -> LinkCandidate | None:
+    for candidate in candidates:
+        if candidate.slug in added_slugs or not content.startswith(candidate.display, index):
+            continue
+        end = index + len(candidate.display)
+        if _is_escaped(content, index) or not _has_valid_boundary(content, index, end, candidate.display):
+            continue
+        return candidate
+    return None
+
+
+def _has_valid_boundary(content: str, start: int, end: int, display: str) -> bool:
+    if not display.isascii():
+        return True
+    return (
+        (start == 0 or _ASCII_WORD_RE.fullmatch(content[start - 1]) is None)
+        and (end == len(content) or _ASCII_WORD_RE.fullmatch(content[end]) is None)
+    )
+
+
+def _is_escaped(content: str, index: int) -> bool:
+    slash_count = 0
+    cursor = index - 1
+    while cursor >= 0 and content[cursor] == "\\":
+        slash_count += 1
+        cursor -= 1
+    return slash_count % 2 == 1
+
+
+def _existing_wiki_slugs(content: str, code_spans: list[tuple[int, int]]) -> set[str]:
+    existing: set[str] = set()
+    for match in _WIKI_LINK_RE.finditer(content):
+        if _protected_end(code_spans, match.start()) is not None:
+            continue
+        try:
+            existing.add(normalize_slug(match.group(1)))
+        except WikiSlugError:
+            continue
+    return existing
+
+
+def _fenced_code_spans(content: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    line_start = 0
+    while line_start < len(content):
+        line_end = _line_end(content, line_start)
+        opener = _fence_opener(content[line_start:line_end])
+        if opener is None:
+            line_start = line_end
+            continue
+
+        marker, run_length = opener
+        cursor = line_end
+        while cursor < len(content):
+            closing_end = _fence_closing_end(content, cursor, marker, run_length)
+            if closing_end is not None:
+                spans.append((line_start, closing_end))
+                line_start = closing_end
+                break
+            cursor = _line_end(content, cursor)
+        else:
+            spans.append((line_start, len(content)))
+            return spans
+    return spans
+
+
+def _fence_opener(line: str) -> tuple[str, int] | None:
+    stripped = line.rstrip("\r\n")
+    prefix_length = len(stripped) - len(stripped.lstrip(" "))
+    if prefix_length > 3 or prefix_length == len(stripped):
+        return None
+    marker = stripped[prefix_length]
+    if marker not in {"`", "~"}:
+        return None
+    run_length = 0
+    while prefix_length + run_length < len(stripped) and stripped[prefix_length + run_length] == marker:
+        run_length += 1
+    if run_length < 3:
+        return None
+    return marker, run_length
+
+
+def _fence_closing_end(content: str, line_start: int, marker: str, minimum_length: int) -> int | None:
+    line_end = _line_end(content, line_start)
+    line = content[line_start:line_end].rstrip("\r\n")
+    prefix_length = len(line) - len(line.lstrip(" "))
+    if prefix_length > 3:
+        return None
+    run_length = 0
+    while prefix_length + run_length < len(line) and line[prefix_length + run_length] == marker:
+        run_length += 1
+    if run_length < minimum_length or line[prefix_length + run_length :].strip(" \t"):
+        return None
+    return line_end
+
+
+def _inline_code_spans(content: str, fenced_spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(content):
+        fenced_end = _protected_end(fenced_spans, index)
+        if fenced_end is not None:
+            index = fenced_end
+            continue
+        if content[index] != "`":
+            index += 1
+            continue
+
+        opener_end = _run_end(content, index, "`")
+        run_length = opener_end - index
+        cursor = opener_end
+        while cursor < len(content):
+            fenced_end = _protected_end(fenced_spans, cursor)
+            if fenced_end is not None:
+                cursor = fenced_end
+                continue
+            if content[cursor] != "`":
+                cursor += 1
+                continue
+            closer_end = _run_end(content, cursor, "`")
+            if closer_end - cursor == run_length:
+                spans.append((index, closer_end))
+                index = closer_end
+                break
+            cursor = closer_end
+        else:
+            spans.append((index, len(content)))
+            return spans
+    return spans
+
+
+def _markdown_spans(content: str) -> list[tuple[int, int]]:
+    spans = [(match.start(), match.end()) for match in _WIKI_MARKUP_RE.finditer(content)]
+    spans.extend((match.start(), match.end()) for match in _REFERENCE_DEFINITION_RE.finditer(content))
+    spans.extend((match.start(), match.end()) for match in _AUTOLINK_RE.finditer(content))
+    spans.extend(_markdown_link_spans(content))
+    return spans
+
+
+def _markdown_link_spans(content: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(content):
+        opening = content.find("[", index)
+        if opening == -1:
+            break
+        closing = _closing_bracket(content, opening)
+        if closing is None:
+            break
+        start = opening - 1 if opening > 0 and content[opening - 1] == "!" else opening
+        next_index = closing + 1
+        if next_index < len(content) and content[next_index] == "(":
+            end = _closing_parenthesis(content, next_index)
+            if end is not None:
+                spans.append((start, end + 1))
+                index = end + 1
+                continue
+        if next_index < len(content) and content[next_index] == "[":
+            end = _closing_bracket(content, next_index)
+            if end is not None:
+                spans.append((start, end + 1))
+                index = end + 1
+                continue
+        index = closing + 1
+    return spans
+
+
+def _closing_bracket(content: str, opening: int) -> int | None:
+    depth = 0
+    index = opening
+    while index < len(content):
+        character = content[index]
+        if character == "[" and not _is_escaped(content, index):
+            depth += 1
+        elif character == "]" and not _is_escaped(content, index):
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def _closing_parenthesis(content: str, opening: int) -> int | None:
+    depth = 0
+    index = opening
+    while index < len(content):
+        character = content[index]
+        if character == "(" and not _is_escaped(content, index):
+            depth += 1
+        elif character == ")" and not _is_escaped(content, index):
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def _line_end(content: str, start: int) -> int:
+    index = start
+    while index < len(content) and content[index] not in "\r\n":
+        index += 1
+    if index < len(content) and content[index] == "\r" and index + 1 < len(content) and content[index + 1] == "\n":
+        return index + 2
+    return index + 1 if index < len(content) else index
+
+
+def _run_end(content: str, start: int, character: str) -> int:
+    index = start
+    while index < len(content) and content[index] == character:
+        index += 1
+    return index
+
+
+def _protected_end(spans: list[tuple[int, int]], index: int) -> int | None:
+    for start, end in spans:
+        if index < start:
+            return None
+        if start <= index < end:
+            return end
+    return None
+
+
+def _shift_spans_for_insert(
+    spans: list[tuple[int, int]],
+    start: int,
+    replaced_length: int,
+    replacement_length: int,
+) -> list[tuple[int, int]]:
+    delta = replacement_length - replaced_length
+    shifted = [
+        (span_start + delta, span_end + delta) if span_start >= start else (span_start, span_end)
+        for span_start, span_end in spans
+    ]
+    shifted.append((start, start + replacement_length))
+    return _merge_spans(shifted)
+
+
+def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted((start, end) for start, end in spans if start < end):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
