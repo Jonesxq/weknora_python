@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from uuid import UUID
 
 from app.wiki.ingest.schemas import (
@@ -23,6 +24,36 @@ LEGACY_INDEX_PLACEHOLDERS = frozenset(("", "Wiki Index", "知识库索引"))
 INDEX_INTRO_MAX_CHARS = 4000
 
 
+@dataclass(frozen=True, slots=True)
+class IndexIntroPlanning:
+    """将模型请求与生成该请求时捕获的 Index CAS 快照绑定。"""
+
+    request: IndexIntroRequest
+    expected_page_id: UUID | None
+    expected_version: int | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, IndexIntroRequest):
+            raise ValueError("index intro planning request 无效")
+        has_page = self.expected_page_id is not None
+        if has_page != (self.expected_version is not None):
+            raise ValueError(
+                "expected_page_id 与 expected_version 必须同时存在或同时为空"
+            )
+        if self.expected_page_id is not None and not isinstance(
+            self.expected_page_id, UUID
+        ):
+            raise ValueError("expected_page_id 必须是 UUID")
+        if self.expected_version is not None and (
+            isinstance(self.expected_version, bool)
+            or not isinstance(self.expected_version, int)
+            or self.expected_version < 1
+        ):
+            raise ValueError("expected_version 必须是正整数")
+        if self.request.mode == "update" and not has_page:
+            raise ValueError("update index intro planning 必须提供 expected page")
+
+
 def clean_index_intro(value: str) -> str:
     """保留模型的 Markdown 正文，移除其附加的目录段。"""
     if not isinstance(value, str):
@@ -38,15 +69,15 @@ def clean_index_intro(value: str) -> str:
     return intro
 
 
-def build_index_intro_request(
+def build_index_intro_planning(
     context: IndexIntroContext,
     *,
     completed_op_ids: Iterable[UUID],
     pages: Iterable[ReducedPage],
     contribution_deltas: Iterable[ContributionDelta],
     operation_actions: Iterable[tuple[str, str]],
-) -> IndexIntroRequest | None:
-    """根据已完成操作为 Index 生成一次模型请求。"""
+) -> IndexIntroPlanning | None:
+    """一次性生成模型请求并捕获对应 Index 的 CAS 快照。"""
     completed = tuple(completed_op_ids)
     if not completed:
         return None
@@ -59,11 +90,21 @@ def build_index_intro_request(
 
     page_snapshots = tuple(_snapshot_page(page) for page in pages)
     delta_snapshots = tuple(_snapshot_delta(delta) for delta in contribution_deltas)
+    completed_set = set(completed)
     mode = "create" if _is_create_context(context) else "update"
     if mode == "create":
-        return IndexIntroRequest(
-            mode="create",
-            summaries=_create_summaries(page_snapshots, context.recent_summaries),
+        return _planning_from_context(
+            context,
+            IndexIntroRequest(
+                mode="create",
+                summaries=_create_summaries(
+                    page_snapshots,
+                    context.recent_summaries,
+                    eligible_slugs=_completed_current_summary_slugs(
+                        delta_snapshots, completed_set
+                    ),
+                ),
+            ),
         )
 
     index = context.index
@@ -78,61 +119,60 @@ def build_index_intro_request(
                 knowledge_id,
                 final_pages,
                 delta_snapshots,
-                set(completed),
+                completed_set,
             ),
         )
         for action, knowledge_id in actions
     )
-    return IndexIntroRequest(
-        mode="update", existing_intro=index.content, changes=changes
+    return _planning_from_context(
+        context,
+        IndexIntroRequest(
+            mode="update", existing_intro=index.content, changes=changes
+        ),
     )
 
 
 def build_success_index_intro_plan(
-    context: IndexIntroContext,
-    request: IndexIntroRequest,
+    planning: IndexIntroPlanning,
     output: IndexIntroOutput,
 ) -> IndexIntroPlan:
     """把清理后的模型输出转换为带 CAS 快照的写入计划。"""
-    _validate_request_context(context, request)
+    if not isinstance(planning, IndexIntroPlanning):
+        raise ValueError("index intro planning 无效")
     if not isinstance(output, IndexIntroOutput):
         raise ValueError("index intro output 无效")
-    expected_page_id, expected_version = _expected_index(context)
     return IndexIntroPlan(
-        mode=request.mode,
-        expected_page_id=expected_page_id,
-        expected_version=expected_version,
+        mode=planning.request.mode,
+        expected_page_id=planning.expected_page_id,
+        expected_version=planning.expected_version,
         intro=clean_index_intro(output.intro),
         model_status="generated",
     )
 
 
 def fallback_index_intro_plan(
-    context: IndexIntroContext,
-    request: IndexIntroRequest,
+    planning: IndexIntroPlanning,
     *,
     error_code: str,
 ) -> IndexIntroPlan:
     """模型调用失败时，生成可安全应用的默认或保留计划。"""
-    _validate_request_context(context, request)
-    expected_page_id, expected_version = _expected_index(context)
-    if request.mode == "create":
+    if not isinstance(planning, IndexIntroPlanning):
+        raise ValueError("index intro planning 无效")
+    if planning.request.mode == "create":
         return IndexIntroPlan(
             mode="create",
-            expected_page_id=expected_page_id,
-            expected_version=expected_version,
+            expected_page_id=planning.expected_page_id,
+            expected_version=planning.expected_version,
             intro=DEFAULT_INDEX_INTRO,
             model_status="defaulted",
             error_code=error_code,
         )
 
-    index = context.index
-    assert index is not None
     return IndexIntroPlan(
         mode="update",
-        expected_page_id=expected_page_id,
-        expected_version=expected_version,
-        intro=index.content,
+        expected_page_id=planning.expected_page_id,
+        expected_version=planning.expected_version,
+        intro=planning.request.existing_intro,
         model_status="kept_after_error",
         error_code=error_code,
     )
@@ -180,16 +220,37 @@ def _is_create_context(context: IndexIntroContext) -> bool:
 
 
 def _create_summaries(
-    pages: tuple[ReducedPage, ...], recent_summaries: tuple[IndexSummaryItem, ...]
+    pages: tuple[ReducedPage, ...],
+    recent_summaries: tuple[IndexSummaryItem, ...],
+    *,
+    eligible_slugs: set[str],
 ) -> tuple[IndexSummaryItem, ...]:
     items: list[IndexSummaryItem] = []
     items.extend(
         _summary_from_page(page)
         for page in pages
-        if page.page_type == "summary" and not page.deleted
+        if (
+            page.page_type == "summary"
+            and not page.deleted
+            and page.slug in eligible_slugs
+        )
     )
     items.extend(recent_summaries)
     return _deduplicate_summaries(items)[:200]
+
+
+def _completed_current_summary_slugs(
+    deltas: tuple[ContributionDelta, ...], completed_op_ids: set[UUID]
+) -> set[str]:
+    return {
+        delta.current.slug
+        for delta in deltas
+        if (
+            delta.pending_op_id in completed_op_ids
+            and delta.current is not None
+            and delta.current.page_type == "summary"
+        )
+    }
 
 
 def _final_summary_pages(
@@ -249,24 +310,15 @@ def _deduplicate_summaries(
     return tuple(unique)
 
 
-def _expected_index(context: IndexIntroContext) -> tuple[UUID | None, int | None]:
+def _planning_from_context(
+    context: IndexIntroContext, request: IndexIntroRequest
+) -> IndexIntroPlanning:
     if context.index is None:
-        return None, None
-    return context.index.id, context.index.version
-
-
-def _validate_request_context(
-    context: IndexIntroContext, request: IndexIntroRequest,
-) -> None:
-    if not isinstance(context, IndexIntroContext) or not isinstance(
-        request, IndexIntroRequest
-    ):
-        raise ValueError("index intro context 或 request 无效")
-    expected_mode = "create" if _is_create_context(context) else "update"
-    if request.mode != expected_mode:
-        raise ValueError("index intro request 与 context mode 不一致")
-    if request.mode == "update":
-        index = context.index
-        assert index is not None
-        if request.existing_intro != index.content:
-            raise ValueError("index intro request 与 context 内容不一致")
+        return IndexIntroPlanning(
+            request=request, expected_page_id=None, expected_version=None
+        )
+    return IndexIntroPlanning(
+        request=request,
+        expected_page_id=context.index.id,
+        expected_version=context.index.version,
+    )
