@@ -335,14 +335,24 @@ async def test_real_worker_applies_taxonomy_once_and_replay_is_idempotent(
                 )
             ).scalars()
         }
+        folders = {
+            folder.path: folder
+            for folder in (
+                await session.execute(
+                    select(WikiFolder).where(
+                        WikiFolder.tenant_id == scope.tenant_id,
+                        WikiFolder.knowledge_base_id == scope.knowledge_base_id,
+                    )
+                )
+            ).scalars()
+        }
         versions = {slug: page.version for slug, page in pages.items()}
-        folder_count = await session.scalar(
-            select(func.count(WikiFolder.id)).where(
-                WikiFolder.tenant_id == scope.tenant_id,
-                WikiFolder.knowledge_base_id == scope.knowledge_base_id,
-            )
-        )
+        folder_count = len(folders)
 
+    organizations = folders["/Organizations"]
+    products = folders["/Organizations/Products"]
+    assert products.parent_id == organizations.id
+    assert pages["entity/acme"].folder_id == products.id
     assert pages["entity/acme"].category_path == ["Organizations", "Products"]
     assert pages["entity/acme"].wiki_path == "/Organizations/Products/entity/acme"
     assert pages["entity/acme"].depth == 2
@@ -355,6 +365,9 @@ async def test_real_worker_applies_taxonomy_once_and_replay_is_idempotent(
     replay = await store.apply_results_with_outcome(scope, request)
 
     assert replay.applied is False
+    assert replay.completed_op_ids == (op_id,)
+    assert replay.failed_op_ids == ()
+    assert replay.superseded_op_ids == ()
     async with postgres_factory() as session:
         replayed_versions = dict(
             (
@@ -651,7 +664,25 @@ async def test_concurrent_new_topics_share_one_new_taxonomy_chain(
     scope = WikiScope(
         tenant_id=51, knowledge_base_id=uuid4(), actor_id="task11-concurrent"
     )
-    first_store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
+    first_inside = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class PausingSqlAlchemyIngestStore(SqlAlchemyIngestStore):
+        async def _resolve_folder_assignment(
+            self,
+            session: AsyncSession,
+            actual_scope: WikiScope,
+            assignment: FolderAssignment,
+        ):
+            first_inside.set()
+            await release_first.wait()
+            return await super()._resolve_folder_assignment(
+                session, actual_scope, assignment
+            )
+
+    first_store = PausingSqlAlchemyIngestStore(
+        postgres_factory, SqlFinalizationPort()
+    )
     second_store = SqlAlchemyIngestStore(postgres_factory, SqlFinalizationPort())
     first_pending = await _claim_taxonomy_ingest(
         first_store, scope, knowledge_id="same-chain-first"
@@ -698,13 +729,34 @@ async def test_concurrent_new_topics_share_one_new_taxonomy_chain(
         ),
     )
 
-    outcomes = await asyncio.wait_for(
-        asyncio.gather(
-            first_store.apply_results_with_outcome(scope, first_request),
-            second_store.apply_results_with_outcome(scope, second_request),
-        ),
-        timeout=10,
+    first_task = asyncio.create_task(
+        first_store.apply_results_with_outcome(scope, first_request)
     )
+    second_task: asyncio.Task[BatchApplyOutcome] | None = None
+    try:
+        await asyncio.wait_for(first_inside.wait(), timeout=5)
+        assert not first_task.done()
+        second_task = asyncio.create_task(
+            second_store.apply_results_with_outcome(scope, second_request)
+        )
+        await asyncio.sleep(0)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(second_task), timeout=0.1)
+        assert not second_task.done()
+
+        release_first.set()
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(first_task, second_task), timeout=10
+        )
+    finally:
+        release_first.set()
+        tasks = (first_task,) if second_task is None else (first_task, second_task)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True), timeout=10
+        )
 
     assert [outcome.applied for outcome in outcomes] == [True, True]
     async with postgres_factory() as session:
@@ -1130,7 +1182,11 @@ async def test_invalid_taxonomy_base_rolls_back_without_residual_folder(
     async with postgres_factory() as session:
         assert (
             await session.scalar(
-                select(func.count(WikiFolder.id)).where(WikiFolder.name == "Products")
+                select(func.count(WikiFolder.id)).where(
+                    WikiFolder.tenant_id == scope.tenant_id,
+                    WikiFolder.knowledge_base_id == scope.knowledge_base_id,
+                    WikiFolder.name == "Products",
+                )
             )
             == 0
         )
