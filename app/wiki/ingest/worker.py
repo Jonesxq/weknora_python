@@ -21,6 +21,7 @@ from app.wiki.ingest.errors import WikiBatchBusy
 from app.wiki.ingest.index_intro import (
     build_index_intro_planning,
     build_success_index_intro_plan,
+    clean_index_intro,
     fallback_index_intro_plan,
 )
 from app.wiki.ingest.map_document import map_document
@@ -635,17 +636,14 @@ class WikiIngestWorker:
             )
 
         try:
-            output_payload = (
-                raw_output.model_dump(mode="python", warnings="error")
-                if isinstance(raw_output, IndexIntroOutput)
-                else raw_output
-            )
-            output = IndexIntroOutput.model_validate(output_payload)
-            return build_success_index_intro_plan(planning, output)
-        except (ValidationError, TypeError, AttributeError, ValueError):
+            snapshot = IndexIntroOutput.model_validate(raw_output)
+            cleaned_intro = clean_index_intro(snapshot.intro)
+            cleaned_output = IndexIntroOutput(intro=cleaned_intro)
+        except (ValidationError, TypeError, ValueError):
             return fallback_index_intro_plan(
                 planning, error_code="INDEX_INTRO_INVALID_OUTPUT"
             )
+        return build_success_index_intro_plan(planning, cleaned_output)
 
     @staticmethod
     def _is_control_error(error: Exception) -> bool:

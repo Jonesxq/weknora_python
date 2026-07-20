@@ -885,6 +885,37 @@ async def test_index_intro_invalid_or_clean_empty_output_uses_invalid_fallback(
 
 
 @pytest.mark.asyncio
+async def test_index_intro_success_plan_error_propagates_without_fallback_or_apply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = fake_dataset(("doc-a",), include_shared=False)
+    model = OrderedIndexModel(dataset)
+    store = WorkerStore([pending_op(OP_A, "doc-a")])
+    fallback_calls = 0
+    original_fallback = worker_module.fallback_index_intro_plan
+
+    def fail_success_plan(*args: object, **kwargs: object) -> None:
+        raise ValueError("success plan invariant")
+
+    def record_fallback(*args: object, **kwargs: object):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return original_fallback(*args, **kwargs)
+
+    monkeypatch.setattr(
+        worker_module, "build_success_index_intro_plan", fail_success_plan
+    )
+    monkeypatch.setattr(worker_module, "fallback_index_intro_plan", record_fallback)
+
+    with pytest.raises(ValueError, match="success plan invariant"):
+        await worker(store, FakeKnowledgeSource(dataset), model).run_batch(SCOPE)
+
+    assert fallback_calls == 0
+    assert store.apply_calls == []
+    assert store.release_calls == [(SCOPE, [OP_A], CLAIM_TOKEN)]
+
+
+@pytest.mark.asyncio
 async def test_index_intro_context_error_propagates_and_releases_claim() -> None:
     dataset = fake_dataset(("doc-a",), include_shared=False)
     model = OrderedIndexModel(dataset)
