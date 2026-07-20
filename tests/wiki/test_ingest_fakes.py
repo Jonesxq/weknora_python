@@ -330,6 +330,33 @@ def test_fixture_rejects_unknown_index_intro_transient_response_key() -> None:
         FakeDataset.model_validate(payload)
 
 
+@pytest.mark.parametrize(
+    "knowledge_id",
+    ["knowledge 1", "knowledge\t1", "knowledge\n1", "knowledge,1", "knowledge:1"],
+)
+def test_fixture_rejects_index_intro_update_key_with_invalid_knowledge_id(
+    knowledge_id: str,
+) -> None:
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["index_intros"] = {
+        f"index_intro:update:ingest:{knowledge_id}": {"intro": "Updated"}
+    }
+
+    with pytest.raises(ValidationError):
+        FakeDataset.model_validate(payload)
+
+
+@pytest.mark.parametrize("knowledge_id", ["knowledge-1", "knowledge_1", "knowledge/1"])
+def test_fixture_accepts_index_intro_update_key_with_common_knowledge_ids(
+    knowledge_id: str,
+) -> None:
+    payload = deepcopy(FIXTURE)
+    key = f"index_intro:update:ingest:{knowledge_id}"
+    payload["model_responses"]["index_intros"] = {key: {"intro": "Updated"}}
+
+    assert key in FakeDataset.model_validate(payload).model_responses.index_intros
+
+
 @pytest.mark.asyncio
 async def test_fake_embedding_transient_failure_uses_existing_failure_counter() -> None:
     payload = deepcopy(FIXTURE)

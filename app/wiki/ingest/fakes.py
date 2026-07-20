@@ -95,7 +95,12 @@ class _ModelResponses(_StrictModel):
                     for raw_change in raw_changes:
                         action, knowledge_id = raw_change.split(":")
                         change = IndexIntroChange(action=action, knowledge_id=knowledge_id)
-                        if change.knowledge_id != knowledge_id:
+                        if (
+                            change.knowledge_id != knowledge_id
+                            or any(character.isspace() for character in knowledge_id)
+                            or "," in knowledge_id
+                            or ":" in knowledge_id
+                        ):
                             raise ValueError
                         changes.append((change.action, change.knowledge_id))
                     if len(changes) != len(set(changes)) or changes != sorted(changes):
