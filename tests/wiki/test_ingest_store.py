@@ -1217,7 +1217,12 @@ async def test_load_index_intro_context_uses_scoped_narrow_queries_and_snapshots
     assert "wiki_pages.deleted_at IS NULL" in identity_sql
     assert "wiki_pages.slug =" in identity_sql
     assert " OR wiki_pages.page_type =" in identity_sql
-    assert 2 in session.statements[0].compile(dialect=postgresql.dialect()).params.values()
+    assert "wiki_pages.status =" in identity_sql
+    identity_params = session.statements[0].compile(
+        dialect=postgresql.dialect()
+    ).params.values()
+    assert "published" in identity_params
+    assert 2 in identity_params
     assert "wiki_pages.slug" in summary_sql
     assert "wiki_pages.title" in summary_sql
     assert "wiki_pages.summary" in summary_sql
@@ -1274,7 +1279,6 @@ async def test_load_index_intro_context_rejects_identity_conflict_without_summar
     [
         (uuid4(), "index", "summary", "published", 1, "", ""),
         (uuid4(), "summary/index", "index", "published", 1, "", ""),
-        (uuid4(), "index", "index", "archived", 1, "", ""),
     ],
 )
 async def test_load_index_intro_context_rejects_noncanonical_identity_row(
@@ -1289,6 +1293,22 @@ async def test_load_index_intro_context_rejects_noncanonical_identity_row(
         await store.load_index_intro_context(SCOPE)
 
     assert len(session.statements) == 1
+
+
+@pytest.mark.asyncio
+async def test_load_index_intro_context_treats_draft_and_archived_index_as_absent() -> None:
+    session = _ScriptedSession([_ScriptedResult(rows=[]), _ScriptedResult(rows=[])])
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), SqlFinalizationPort()
+    )  # type: ignore[arg-type]
+
+    context = await store.load_index_intro_context(SCOPE)
+
+    assert context.index is None
+    assert context.recent_summaries == ()
+    assert "published" in session.statements[0].compile(
+        dialect=postgresql.dialect()
+    ).params.values()
 
 
 @pytest.mark.asyncio

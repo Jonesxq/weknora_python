@@ -1963,6 +1963,7 @@ class SqlAlchemyIngestStore:
                             WikiPage.tenant_id == scope.tenant_id,
                             WikiPage.knowledge_base_id == scope.knowledge_base_id,
                             WikiPage.deleted_at.is_(None),
+                            WikiPage.status == "published",
                             or_(
                                 WikiPage.slug == "index",
                                 WikiPage.page_type == "index",
