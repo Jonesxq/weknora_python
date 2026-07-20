@@ -1485,8 +1485,6 @@ class IndexIntroPlan(_ValidatedFrozenModel):
             raise ValueError(
                 "expected_page_id 与 expected_version 必须同时存在或同时为空"
             )
-        if self.mode == "create" and has_page:
-            raise ValueError("create index intro 不能提供 expected page")
         if self.mode == "update" and not has_page:
             raise ValueError("update index intro 必须提供 expected page")
         if self.model_status == "generated" and self.error_code is not None:

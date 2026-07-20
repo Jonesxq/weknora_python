@@ -730,6 +730,14 @@ def test_index_intro_output_and_plan_validate_cross_field_contracts() -> None:
     assert _index_plan().intro == "Index introduction"
     assert _index_plan(model_status="defaulted", error_code=" MODEL_FAILED ").error_code == "MODEL_FAILED"
     assert _index_plan(mode="update", model_status="kept_after_error", error_code="MODEL_FAILED").expected_version == 1
+    placeholder_plan = IndexIntroPlan(
+        mode="create",
+        expected_page_id=uuid4(),
+        expected_version=3,
+        intro="Index introduction",
+        model_status="generated",
+    )
+    assert placeholder_plan.expected_version == 3
 
     with pytest.raises(ValidationError):
         IndexIntroOutput(intro=" ")
