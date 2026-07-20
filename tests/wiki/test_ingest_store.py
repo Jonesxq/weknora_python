@@ -19,6 +19,7 @@ from app.wiki.ingest.schemas import (
     FinalizationRequest,
     FolderAssignment,
     IndexIntroContext,
+    IndexIntroPlan,
     OperationFailure,
     PageExpectation,
     ReducedPage,
@@ -833,7 +834,14 @@ async def test_modern_apply_results_returns_idempotent_noop_for_same_scope_log(
 
     session = Session()
     store = SqlAlchemyIngestStore(lambda: session, SqlFinalizationPort())  # type: ignore[arg-type]
-    request = _batch_request(operation_id=operation_id)
+    request = _batch_request(
+        operation_id=operation_id,
+        index_intro_plan=IndexIntroPlan(
+            mode="create",
+            intro="Must not be replayed",
+            model_status="generated",
+        ),
+    )
     assert existing_log.result_outcome is None
 
     if detailed:
@@ -2210,6 +2218,345 @@ class _OneSessionFactory:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("plan", "stale", "expected_result"),
+    [
+        (None, False, "not_requested"),
+        (
+            IndexIntroPlan(
+                mode="create",
+                intro="Generated intro",
+                model_status="generated",
+            ),
+            True,
+            "stale_skipped",
+        ),
+    ],
+)
+async def test_index_intro_apply_short_circuits_without_identity_sql(
+    plan: IndexIntroPlan | None,
+    stale: bool,
+    expected_result: str,
+) -> None:
+    session = _ScriptedSession([])
+
+    outcome = await ingest_store._apply_index_intro_plan(
+        session, SCOPE, plan, stale=stale
+    )
+
+    assert outcome.result == expected_result
+    assert outcome.changed_page is None
+    assert session.statements == []
+
+
+@pytest.mark.asyncio
+async def test_lock_index_identity_uses_scoped_unfiltered_for_update_query() -> None:
+    page = _page(slug="index", page_type="index")
+    session = _ScriptedSession([_ScriptedResult(rows=[page])])
+
+    selected = await ingest_store._lock_index_identity(session, SCOPE)
+
+    assert selected is page
+    sql = _sql(session.statements[0])
+    assert "wiki_pages.tenant_id" in sql
+    assert "wiki_pages.knowledge_base_id" in sql
+    assert "wiki_pages.deleted_at IS NULL" in sql
+    assert "wiki_pages.slug =" in sql and "wiki_pages.page_type =" in sql
+    assert "wiki_pages.status" not in sql.split(" WHERE ", 1)[1]
+    assert "FOR UPDATE" in sql
+    assert "LIMIT" in sql
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "row_specs",
+    [
+        [("index", "index", "published"), ("index", "index", "published")],
+        [("index", "concept", "published")],
+        [("other", "index", "published")],
+        [("index", "index", "draft")],
+        [("index", "index", "archived")],
+    ],
+)
+async def test_lock_index_identity_rejects_conflicting_rows(
+    row_specs: list[tuple[str, str, str]],
+) -> None:
+    rows = []
+    for slug, page_type, status in row_specs:
+        page = _page(slug=slug, page_type=page_type)
+        page.status = status
+        rows.append(page)
+    session = _ScriptedSession([_ScriptedResult(rows=rows)])
+
+    with pytest.raises(InvariantError, match="Index"):
+        await ingest_store._lock_index_identity(session, SCOPE)
+
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("op", ["ingest", "noop"])
+async def test_apply_rejects_forged_index_plan_before_page_or_link_writes(
+    op: str,
+) -> None:
+    token = uuid4()
+    pending = _pending(op=op, claimed=True)
+    pending.claim_token = token
+    request = _batch_request(
+        claim_token=token,
+        completed_op_ids=(pending.id,),
+        index_intro_plan=IndexIntroPlan(
+            mode="create",
+            intro="Forged intro",
+            model_status="generated",
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            *([_ScriptedResult(rows=[])] if op == "ingest" else []),
+        ]
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), _RecordingFinalization(session.events)
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(InvariantError, match="Index"):
+        await store._apply_batch_results(SCOPE, request, require_taxonomy=False)
+
+    assert session.rolled_back is True
+    assert session.added == []
+    assert not any(
+        _sql(statement).startswith(("INSERT", "UPDATE", "DELETE"))
+        for statement in session.statements
+    )
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_status", "error_code", "expected_result"),
+    [
+        ("generated", None, "created"),
+        ("defaulted", "MODEL_FAILED", "defaulted"),
+    ],
+)
+async def test_create_index_intro_inserts_explicit_canonical_page(
+    model_status: str,
+    error_code: str | None,
+    expected_result: str,
+) -> None:
+    inserted_id = uuid4()
+    plan = IndexIntroPlan(
+        mode="create",
+        intro="Canonical intro",
+        model_status=model_status,
+        error_code=error_code,
+    )
+    session = _ScriptedSession(
+        [_ScriptedResult(rows=[]), _ScriptedResult(scalar=inserted_id)]
+    )
+
+    outcome = await ingest_store._apply_index_intro_plan(
+        session, SCOPE, plan, stale=False
+    )
+
+    assert outcome.result == expected_result
+    assert outcome.changed_page == {"slug": "index", "title": "Index"}
+    insert = session.statements[1]
+    sql = _sql(insert)
+    params = insert.compile(dialect=postgresql.dialect()).params
+    assert sql.startswith("INSERT INTO wiki_pages")
+    assert "ON CONFLICT (knowledge_base_id, slug)" in sql
+    assert "WHERE deleted_at IS NULL DO NOTHING" in sql
+    assert "RETURNING wiki_pages.id" in sql
+    assert params["tenant_id"] == SCOPE.tenant_id
+    assert params["knowledge_base_id"] == SCOPE.knowledge_base_id
+    assert params["slug"] == "index"
+    assert params["title"] == "Index"
+    assert params["page_type"] == "index"
+    assert params["status"] == "published"
+    assert params["content"] == params["summary"] == "Canonical intro"
+    assert params["aliases"] == []
+    assert params["source_refs"] == []
+    assert params["chunk_refs"] == []
+    assert params["folder_id"] is None
+    assert params["category_path"] == []
+    assert params["wiki_path"] == "/index"
+    assert params["depth"] == params["sort_order"] == 0
+    assert params["page_metadata"] == {}
+    assert params["version"] == 1
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
+async def test_create_index_intro_conflict_rechecks_identity_and_skips_canonical() -> None:
+    winner = _page(slug="index", page_type="index")
+    plan = IndexIntroPlan(
+        mode="create", intro="Losing intro", model_status="generated"
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(scalar=None),
+            _ScriptedResult(rows=[winner]),
+        ]
+    )
+
+    outcome = await ingest_store._apply_index_intro_plan(
+        session, SCOPE, plan, stale=False
+    )
+
+    assert outcome.result == "stale_skipped"
+    assert outcome.changed_page is None
+    assert winner.content != plan.intro
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
+async def test_create_index_intro_conflict_recheck_rejects_noncanonical() -> None:
+    conflict = _page(slug="index", page_type="index")
+    conflict.status = "archived"
+    plan = IndexIntroPlan(
+        mode="create", intro="Losing intro", model_status="generated"
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(scalar=None),
+            _ScriptedResult(rows=[conflict]),
+        ]
+    )
+
+    with pytest.raises(InvariantError, match="Index"):
+        await ingest_store._apply_index_intro_plan(
+            session, SCOPE, plan, stale=False
+        )
+
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "mode",
+        "model_status",
+        "error_code",
+        "content",
+        "summary",
+        "intro",
+        "expected_result",
+        "changed",
+    ),
+    [
+        ("create", "generated", None, "Same", "Same", "Same", "unchanged", False),
+        ("create", "generated", None, "Old", "Old", "New", "updated", True),
+        (
+            "create",
+            "defaulted",
+            "MODEL_FAILED",
+            "Same",
+            "Same",
+            "Same",
+            "defaulted",
+            False,
+        ),
+        (
+            "create",
+            "defaulted",
+            "MODEL_FAILED",
+            "Old",
+            "Old",
+            "Fallback",
+            "defaulted",
+            True,
+        ),
+        ("update", "generated", None, "Same", "Same", "Same", "unchanged", False),
+        ("update", "generated", None, "Old", "Drifted", "New", "updated", True),
+        (
+            "update",
+            "kept_after_error",
+            "MODEL_FAILED",
+            "Old",
+            "Drifted",
+            "Ignored",
+            "kept_after_error",
+            False,
+        ),
+    ],
+)
+async def test_existing_index_intro_uses_locked_identity_version_cas(
+    mode: str,
+    model_status: str,
+    error_code: str | None,
+    content: str,
+    summary: str,
+    intro: str,
+    expected_result: str,
+    changed: bool,
+) -> None:
+    page = _page(slug="index", page_type="index")
+    page.content = content
+    page.summary = summary
+    original_version = page.version
+    plan = IndexIntroPlan(
+        mode=mode,
+        expected_page_id=page.id,
+        expected_version=page.version,
+        intro=intro,
+        model_status=model_status,
+        error_code=error_code,
+    )
+    session = _ScriptedSession([_ScriptedResult(rows=[page])])
+
+    outcome = await ingest_store._apply_index_intro_plan(
+        session, SCOPE, plan, stale=False
+    )
+
+    assert outcome.result == expected_result
+    assert outcome.changed_page == (
+        {"slug": "index", "title": "Index"} if changed else None
+    )
+    assert page.version == original_version + int(changed)
+    if changed:
+        assert page.content == page.summary == intro
+        assert session.events[-1] == "FLUSH"
+    else:
+        assert page.content == content
+        assert page.summary == summary
+        assert "FLUSH" not in session.events
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [True, False])
+async def test_existing_index_intro_skips_stale_snapshot(missing: bool) -> None:
+    page = _page(slug="index", page_type="index")
+    plan = IndexIntroPlan(
+        mode="update",
+        expected_page_id=uuid4() if not missing else page.id,
+        expected_version=page.version,
+        intro="New intro",
+        model_status="generated",
+    )
+    session = _ScriptedSession(
+        [_ScriptedResult(rows=[] if missing else [page])]
+    )
+
+    outcome = await ingest_store._apply_index_intro_plan(
+        session, SCOPE, plan, stale=False
+    )
+
+    assert outcome.result == "stale_skipped"
+    assert outcome.changed_page is None
+    assert page.version == 4
+    assert "FLUSH" not in session.events
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
 async def test_scripted_session_requires_explicit_link_candidate_results() -> None:
     session = _ScriptedSession([])
     statement = ingest_store._build_old_link_candidate_edges_statement(
@@ -3048,6 +3395,11 @@ async def test_modern_apply_linkifies_final_selected_pages_without_version_bump(
             ),
             PageExpectation(slug=fresh.slug),
         ),
+        index_intro_plan=IndexIntroPlan(
+            mode="create",
+            intro="SECRET GENERATED INDEX BODY",
+            model_status="generated",
+        ),
     )
     session = _ScriptedSession(
         [
@@ -3057,6 +3409,8 @@ async def test_modern_apply_linkifies_final_selected_pages_without_version_bump(
             _ScriptedResult(rows=[source]),
             _ScriptedResult(rowcount=1),
             _ScriptedResult(rowcount=1),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(scalar=uuid4()),
             _ScriptedResult(rowcount=1),
             _ScriptedResult(rowcount=1),
             _ScriptedResult(scalar=0),
@@ -3110,6 +3464,34 @@ async def test_modern_apply_linkifies_final_selected_pages_without_version_bump(
         if isinstance(item, WikiPage) and item.slug == fresh.slug
     )
     assert inserted.version == 1
+    log = next(item for item in session.added if isinstance(item, WikiLogEntry))
+    assert log.message == (
+        "完成 1 个 Wiki 操作，跳过 0 个过期操作；"
+        "自动链接页面=1，新增链接=2，Index=created"
+    )
+    assert "SECRET" not in log.message
+    assert log.pages_affected == [
+        {"slug": source.slug, "title": source_reduced.title},
+        {"slug": fresh.slug, "title": fresh.title},
+        {"slug": "index", "title": "Index"},
+    ]
+    index_select_sql = next(
+        sql
+        for sql in session.events
+        if sql.startswith("SELECT wiki_pages.")
+        and "wiki_pages.page_type =" in sql
+        and "FOR UPDATE" in sql
+    )
+    assert session.events.index(index_select_sql) > max(
+        index
+        for index, event in enumerate(session.events)
+        if event.startswith("UPDATE wiki_links")
+    )
+    assert session.events.index(index_select_sql) < next(
+        index
+        for index, event in enumerate(session.events)
+        if event == "ADD:WikiLogEntry"
+    )
     session.assert_consumed()
 
 
@@ -4030,6 +4412,11 @@ async def test_later_retract_supersedes_ingest_without_writing_its_slug(
         ),
         completed_op_ids=(ingest.id,),
         expected_pages=(PageExpectation(slug=page.slug),),
+        index_intro_plan=IndexIntroPlan(
+            mode="create",
+            intro="Stale model output",
+            model_status="generated",
+        ),
     )
     session = _ScriptedSession(
         [
@@ -4064,7 +4451,15 @@ async def test_later_retract_supersedes_ingest_without_writing_its_slug(
         ("release", "wiki")
     ]
     log = next(item for item in session.added if isinstance(item, WikiLogEntry))
-    assert "跳过 1" in log.message
+    assert log.message == (
+        "完成 0 个 Wiki 操作，跳过 1 个过期操作；"
+        "自动链接页面=0，新增链接=0，Index=stale_skipped"
+    )
+    assert not any(
+        _sql(statement).startswith("SELECT wiki_pages.")
+        and "wiki_pages.page_type =" in _sql(statement)
+        for statement in session.statements
+    )
     expected_outcome = {
         "completed_op_ids": [],
         "superseded_op_ids": [str(ingest.id)],
@@ -4288,6 +4683,7 @@ async def test_modern_finalization_failure_rolls_back_and_stops_pending_delete()
     pending = _pending(claimed=True)
     pending.claim_token = token
     page = _page(sources=[pending.knowledge_id])
+    index_page = _page(slug="index", page_type="index")
     reduced = ReducedPage(
         slug=page.slug,
         title="最终写入前失败",
@@ -4314,6 +4710,13 @@ async def test_modern_finalization_failure_rolls_back_and_stops_pending_delete()
         expected_pages=(
             PageExpectation(slug=page.slug, page_id=page.id, version=page.version),
         ),
+        index_intro_plan=IndexIntroPlan(
+            mode="update",
+            expected_page_id=index_page.id,
+            expected_version=index_page.version,
+            intro="Updated before finalization",
+            model_status="generated",
+        ),
     )
     session = _ScriptedSession(
         [
@@ -4323,6 +4726,7 @@ async def test_modern_finalization_failure_rolls_back_and_stops_pending_delete()
             _ScriptedResult(rows=[page]),
             _ScriptedResult(),
             _ScriptedResult(),
+            _ScriptedResult(rows=[index_page]),
         ],
         allow_empty_link_candidates=True,
     )
@@ -4333,6 +4737,8 @@ async def test_modern_finalization_failure_rolls_back_and_stops_pending_delete()
         await store.apply_results(SCOPE, request)
 
     assert session.rolled_back is True
+    assert index_page.version == 5
+    assert any(isinstance(item, WikiLogEntry) for item in session.added)
     assert len(finalization.requests) == 1
     assert not any(
         _sql(statement).startswith("DELETE FROM wiki_pending_ops")
@@ -4342,6 +4748,98 @@ async def test_modern_finalization_failure_rolls_back_and_stops_pending_delete()
         _sql(statement).startswith("INSERT INTO task_outbox")
         for statement in session.statements
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ["index", "log"])
+async def test_index_or_log_failure_rolls_back_before_finalization(
+    failure_point: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = uuid4()
+    pending = _pending(claimed=True)
+    pending.claim_token = token
+    page = _page(sources=[pending.knowledge_id])
+    index_page = _page(slug="index", page_type="index")
+    reduced = ReducedPage(
+        slug=page.slug,
+        title="Atomic page",
+        page_type=page.page_type,
+        content="Atomic content",
+        summary=page.summary,
+        source_refs=[pending.knowledge_id],
+        contributor_op_ids=[pending.id],
+    )
+    request = _batch_request(
+        claim_token=token,
+        pages=(reduced,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="add",
+                slug=page.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=None,
+                current=_stored_contribution(version=pending.op_version),
+            ),
+        ),
+        completed_op_ids=(pending.id,),
+        expected_pages=(
+            PageExpectation(slug=page.slug, page_id=page.id, version=page.version),
+        ),
+        index_intro_plan=IndexIntroPlan(
+            mode="update",
+            expected_page_id=index_page.id,
+            expected_version=index_page.version,
+            intro="Atomic index intro",
+            model_status="generated",
+        ),
+    )
+
+    class FailingLogSession(_ScriptedSession):
+        def add(self, value) -> None:
+            if failure_point == "log" and isinstance(value, WikiLogEntry):
+                raise RuntimeError("log write failed")
+            super().add(value)
+
+    index_result: _ScriptedResult | BaseException = (
+        RuntimeError("index database failed")
+        if failure_point == "index"
+        else _ScriptedResult(rows=[index_page])
+    )
+    session = FailingLogSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[page]),
+            _ScriptedResult(rowcount=1),
+            index_result,
+        ],
+        allow_empty_link_candidates=True,
+    )
+
+    async def no_replace(*_args) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "app.wiki.ingest.store.SqlAlchemyPageStore.replace_page_links", no_replace
+    )
+    finalization = _RecordingFinalization(session.events)
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), finalization
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match=failure_point):
+        await store.apply_results(SCOPE, request)
+
+    assert session.rolled_back is True
+    assert finalization.requests == []
+    assert not any(
+        _sql(statement).startswith("DELETE FROM wiki_pending_ops")
+        for statement in session.statements
+    )
+    session.assert_consumed()
 
 
 @pytest.mark.asyncio

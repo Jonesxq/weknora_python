@@ -12,7 +12,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Literal, Mapping, Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
@@ -46,6 +46,7 @@ from app.wiki.ingest.schemas import (
     FolderAssignment,
     FolderCatalogEntry,
     IndexIntroContext,
+    IndexIntroPlan,
     IndexPageSnapshot,
     IndexSummaryItem,
     OperationFailure,
@@ -174,6 +175,147 @@ class PageConflict(IngestStoreError):
 
 class InvariantError(IngestStoreError):
     """调用参数违反摄取事务不变量。"""
+
+
+IndexApplyResult = Literal[
+    "created",
+    "updated",
+    "unchanged",
+    "defaulted",
+    "kept_after_error",
+    "stale_skipped",
+    "not_requested",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexApplyOutcome:
+    result: IndexApplyResult
+    changed_page: dict[str, str] | None = None
+
+
+async def _lock_index_identity(
+    session: AsyncSession, scope: WikiScope
+) -> WikiPage | None:
+    rows = list(
+        (
+            await session.execute(
+                select(WikiPage)
+                .where(
+                    WikiPage.tenant_id == scope.tenant_id,
+                    WikiPage.knowledge_base_id == scope.knowledge_base_id,
+                    WikiPage.deleted_at.is_(None),
+                    or_(WikiPage.slug == "index", WikiPage.page_type == "index"),
+                )
+                .limit(2)
+                .with_for_update()
+            )
+        ).scalars()
+    )
+    if len(rows) > 1:
+        raise InvariantError("Index 页面身份存在多个活跃记录")
+    if not rows:
+        return None
+    row = rows[0]
+    if (
+        row.tenant_id != scope.tenant_id
+        or row.knowledge_base_id != scope.knowledge_base_id
+        or row.slug != "index"
+        or row.page_type != "index"
+        or row.status != "published"
+        or row.deleted_at is not None
+    ):
+        raise InvariantError("Index 页面身份不是 canonical published 页面")
+    return row
+
+
+async def _apply_index_intro_plan(
+    session: AsyncSession,
+    scope: WikiScope,
+    plan: IndexIntroPlan | None,
+    *,
+    stale: bool,
+) -> _IndexApplyOutcome:
+    if plan is None:
+        return _IndexApplyOutcome("not_requested")
+    if stale:
+        return _IndexApplyOutcome("stale_skipped")
+    row = await _lock_index_identity(session, scope)
+    if plan.mode == "create" and plan.expected_page_id is None:
+        if row is not None:
+            return _IndexApplyOutcome("stale_skipped")
+        inserted_id = (
+            await session.execute(
+                postgresql.insert(WikiPage)
+                .values(
+                    id=uuid4(),
+                    tenant_id=scope.tenant_id,
+                    knowledge_base_id=scope.knowledge_base_id,
+                    slug="index",
+                    title="Index",
+                    page_type="index",
+                    status="published",
+                    content=plan.intro,
+                    summary=plan.intro,
+                    aliases=[],
+                    source_refs=[],
+                    chunk_refs=[],
+                    parent_slug=None,
+                    folder_id=None,
+                    category_path=[],
+                    wiki_path="/index",
+                    depth=0,
+                    sort_order=0,
+                    page_metadata={},
+                    version=1,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        WikiPage.knowledge_base_id,
+                        WikiPage.slug,
+                    ],
+                    index_where=WikiPage.deleted_at.is_(None),
+                )
+                .returning(WikiPage.id)
+            )
+        ).scalar_one_or_none()
+        if inserted_id is not None:
+            result: IndexApplyResult = (
+                "defaulted"
+                if plan.model_status == "defaulted"
+                else "created"
+            )
+            return _IndexApplyOutcome(
+                result, {"slug": "index", "title": "Index"}
+            )
+        if await _lock_index_identity(session, scope) is None:
+            raise InvariantError("Index 并发创建冲突后未发现 canonical 页面")
+        return _IndexApplyOutcome("stale_skipped")
+    if (
+        row is None
+        or row.id != plan.expected_page_id
+        or row.version != plan.expected_version
+    ):
+        return _IndexApplyOutcome("stale_skipped")
+    if plan.model_status == "kept_after_error":
+        return _IndexApplyOutcome("kept_after_error")
+    changed = row.content != plan.intro or row.summary != plan.intro
+    if changed:
+        row.content = plan.intro
+        row.summary = plan.intro
+        row.version += 1
+        await session.flush()
+    result = (
+        "defaulted"
+        if plan.model_status == "defaulted"
+        else "updated"
+        if changed
+        else "unchanged"
+    )
+    return _IndexApplyOutcome(
+        result,
+        {"slug": "index", "title": "Index"} if changed else None,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2508,6 +2650,26 @@ class SqlAlchemyIngestStore:
                 ]
                 completed_id_set = set(completed_ids)
                 terminal_ids = [*completed_ids, *superseded_ids]
+                active_deltas = [
+                    delta
+                    for delta in request.contribution_deltas
+                    if delta.pending_op_id in completed_id_set
+                ]
+                index_plan_stale = tuple(completed_ids) != tuple(
+                    request.completed_op_ids
+                )
+                if request.index_intro_plan is not None and not index_plan_stale:
+                    active_delta_ids = {
+                        delta.pending_op_id for delta in active_deltas
+                    }
+                    if not any(
+                        op_id in active_delta_ids
+                        and pending_by_id[op_id].op in {"ingest", "retract"}
+                        for op_id in completed_ids
+                    ):
+                        raise InvariantError(
+                            "Index 计划必须来自实际完成且有贡献差量的 Wiki 操作"
+                        )
 
                 auto_superseded_slugs = {
                     delta.slug
@@ -2629,11 +2791,6 @@ class SqlAlchemyIngestStore:
                     for assignment in assignments
                 }
 
-                active_deltas = [
-                    delta
-                    for delta in request.contribution_deltas
-                    if delta.pending_op_id in completed_ids
-                ]
                 previous_deletions: dict[
                     tuple[int, UUID, str, str, str],
                     tuple[StoredContributionRecord, str],
@@ -2708,6 +2865,8 @@ class SqlAlchemyIngestStore:
 
                 now = datetime.now(UTC)
                 persisted: list[tuple[WikiPage, object]] = []
+                linkified_page_count = 0
+                added_link_count = 0
                 for row, reduced in selected_pages:
                     if row is None:
                         if reduced.deleted:
@@ -2722,6 +2881,9 @@ class SqlAlchemyIngestStore:
                             candidates=link_candidates_by_source[reduced.slug],
                         )
                         persisted_content = linkify_result.content
+                        if linkify_result.added_slugs:
+                            linkified_page_count += 1
+                            added_link_count += len(linkify_result.added_slugs)
                     if row is None:
                         folder_id, category_path, wiki_path, depth = placements.get(
                             reduced.slug,
@@ -2797,6 +2959,13 @@ class SqlAlchemyIngestStore:
                             build_link_backfill_statement(scope, row.slug, row.id)
                         )
 
+                index_outcome = await _apply_index_intro_plan(
+                    session,
+                    scope,
+                    request.index_intro_plan,
+                    stale=index_plan_stale,
+                )
+
                 actual_outcome = _batch_apply_outcome(
                     request,
                     applied=True,
@@ -2811,6 +2980,13 @@ class SqlAlchemyIngestStore:
                     if op_kinds == {"retract"}
                     else "wiki_incremental_batch"
                 )
+                pages_affected = [
+                    {"slug": page.slug, "title": page.title} for page in pages
+                ]
+                if index_outcome.changed_page is not None and not any(
+                    page["slug"] == "index" for page in pages_affected
+                ):
+                    pages_affected.append(index_outcome.changed_page)
                 session.add(
                     WikiLogEntry(
                         tenant_id=scope.tenant_id,
@@ -2819,11 +2995,12 @@ class SqlAlchemyIngestStore:
                         action=action,
                         message=(
                             f"完成 {len(completed_ids)} 个 Wiki 操作，"
-                            f"跳过 {len(superseded_ids)} 个过期操作"
+                            f"跳过 {len(superseded_ids)} 个过期操作；"
+                            f"自动链接页面={linkified_page_count}，"
+                            f"新增链接={added_link_count}，"
+                            f"Index={index_outcome.result}"
                         ),
-                        pages_affected=[
-                            {"slug": page.slug, "title": page.title} for page in pages
-                        ],
+                        pages_affected=pages_affected,
                         result_outcome=_serialize_batch_outcome(actual_outcome),
                         actor_id=scope.actor_id,
                     )
