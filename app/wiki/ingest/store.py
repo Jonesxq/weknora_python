@@ -33,7 +33,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.exc import IntegrityError
 
-from app.wiki.domain import extract_wiki_links
+from app.wiki.domain import WikiSlugError, extract_wiki_links, normalize_slug
 from app.wiki.ingest.ports import FinalizationPort
 from app.wiki.ingest.retract import project_active_refs
 from app.wiki.ingest.schemas import (
@@ -67,6 +67,7 @@ from app.wiki.models import (
     WikiPageContribution,
     WikiPendingOp,
 )
+from app.wiki.linkify import LinkCandidate, linkify_markdown
 from app.wiki.scope import WikiScope
 from app.wiki.sql_page_store import (
     SqlAlchemyPageStore,
@@ -169,6 +170,212 @@ class PageConflict(IngestStoreError):
 
 class InvariantError(IngestStoreError):
     """调用参数违反摄取事务不变量。"""
+
+
+@dataclass(frozen=True, slots=True)
+class _LinkCandidatePage:
+    """脱离 ORM 的严格自动链接候选页面快照。"""
+
+    slug: str
+    title: str
+    aliases: tuple[str, ...]
+    page_type: str
+
+    def __post_init__(self) -> None:
+        try:
+            normalized_slug = normalize_slug(self.slug)
+        except (TypeError, AttributeError, WikiSlugError) as exc:
+            raise InvariantError("link candidate slug 无效") from exc
+        if normalized_slug != self.slug:
+            raise InvariantError("link candidate slug 未规范化")
+        if self.page_type not in {"summary", "entity", "concept"}:
+            raise InvariantError("link candidate page_type 无效")
+        if not self.slug.startswith(f"{self.page_type}/"):
+            raise InvariantError("link candidate page_type 与 slug 不一致")
+        _validate_link_display(self.title, field="title")
+        if not isinstance(self.aliases, tuple):
+            raise InvariantError("link candidate aliases 必须是 tuple")
+        for alias in self.aliases:
+            _validate_link_display(alias, field="alias")
+
+
+def _validate_link_display(value: object, *, field: str) -> None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or any(character in value for character in "]\r\n")
+    ):
+        raise InvariantError(f"link candidate {field} 无效")
+
+
+def _build_link_candidates_by_source(
+    source_slugs: Sequence[str],
+    *,
+    fresh_pages: Sequence[_LinkCandidatePage],
+    historical_by_source: Mapping[str, Sequence[_LinkCandidatePage]],
+) -> dict[str, tuple[LinkCandidate, ...]]:
+    """合并本批候选与各 source 的历史出链候选，不修改输入。"""
+
+    fresh_by_slug: dict[str, _LinkCandidatePage] = {}
+    for page in fresh_pages:
+        if page.slug in fresh_by_slug:
+            raise InvariantError("fresh link candidate slug 重复")
+        fresh_by_slug[page.slug] = page
+
+    result: dict[str, tuple[LinkCandidate, ...]] = {}
+    for source_slug in dict.fromkeys(source_slugs):
+        historical_pages = historical_by_source.get(source_slug, ())
+        merged: dict[str, _LinkCandidatePage] = {}
+        for page in historical_pages:
+            if page.slug in merged:
+                raise InvariantError("historical link candidate slug 重复")
+            merged[page.slug] = page
+        merged.update(fresh_by_slug)
+
+        candidates: list[LinkCandidate] = []
+        for slug in sorted(merged):
+            page = merged[slug]
+            displays = dict.fromkeys((page.title, *page.aliases))
+            candidates.extend(
+                LinkCandidate(slug=slug, display=display) for display in displays
+            )
+        result[source_slug] = tuple(candidates)
+    return result
+
+
+def _semantic_content_changed(
+    old_content: str, semantic_content: str, persisted_content: str
+) -> bool:
+    return old_content != semantic_content and old_content != persisted_content
+
+
+def _build_old_link_candidate_edges_statement(
+    scope: WikiScope, source_page_ids: Sequence[UUID]
+) -> Select[tuple[UUID, str]]:
+    return (
+        select(WikiLink.source_page_id, WikiLink.target_slug)
+        .where(
+            WikiLink.tenant_id == scope.tenant_id,
+            WikiLink.knowledge_base_id == scope.knowledge_base_id,
+            WikiLink.source_page_id.in_(source_page_ids),
+        )
+        .order_by(WikiLink.source_page_id, WikiLink.target_slug)
+    )
+
+
+def _build_historical_link_candidate_pages_statement(
+    scope: WikiScope, target_slugs: Sequence[str]
+) -> Select[tuple[str, str, list[str], str]]:
+    return (
+        select(WikiPage.slug, WikiPage.title, WikiPage.aliases, WikiPage.page_type)
+        .where(
+            WikiPage.tenant_id == scope.tenant_id,
+            WikiPage.knowledge_base_id == scope.knowledge_base_id,
+            WikiPage.deleted_at.is_(None),
+            WikiPage.status == "published",
+            WikiPage.slug.in_(target_slugs),
+            WikiPage.page_type.not_in(("index", "log")),
+        )
+        .order_by(WikiPage.slug)
+    )
+
+
+async def _load_selected_link_candidates(
+    session: AsyncSession,
+    scope: WikiScope,
+    selected_pages: Sequence[tuple[WikiPage | None, ReducedPage]],
+) -> dict[str, tuple[LinkCandidate, ...]]:
+    """批量加载 selected 页面可用的 fresh 与历史自动链接候选。"""
+
+    source_slugs = tuple(
+        reduced.slug
+        for row, reduced in selected_pages
+        if row is not None or not reduced.deleted
+    )
+    existing_source_slugs: dict[UUID, str] = {}
+    for row, reduced in selected_pages:
+        if row is None:
+            continue
+        if row.id in existing_source_slugs:
+            raise InvariantError("selected source page id 重复")
+        existing_source_slugs[row.id] = reduced.slug
+
+    targets_by_source_id: dict[UUID, list[str]] = {
+        source_id: [] for source_id in existing_source_slugs
+    }
+    target_slugs: set[str] = set()
+    if existing_source_slugs:
+        edge_rows = (
+            await session.execute(
+                _build_old_link_candidate_edges_statement(
+                    scope, tuple(existing_source_slugs)
+                )
+            )
+        ).all()
+        seen_edges: set[tuple[UUID, str]] = set()
+        for source_page_id, target_slug in edge_rows:
+            if source_page_id not in existing_source_slugs:
+                raise InvariantError("旧出链查询返回了越界 source_page_id")
+            try:
+                normalized_target = normalize_slug(target_slug)
+            except (TypeError, AttributeError, WikiSlugError) as exc:
+                raise InvariantError("旧出链查询返回了无效 target_slug") from exc
+            if normalized_target != target_slug:
+                raise InvariantError("旧出链查询返回了未规范化 target_slug")
+            identity = (source_page_id, target_slug)
+            if identity in seen_edges:
+                raise InvariantError("旧出链查询返回了重复记录")
+            seen_edges.add(identity)
+            targets_by_source_id[source_page_id].append(target_slug)
+            target_slugs.add(target_slug)
+
+    historical_by_slug: dict[str, _LinkCandidatePage] = {}
+    if target_slugs:
+        page_rows = (
+            await session.execute(
+                _build_historical_link_candidate_pages_statement(
+                    scope, tuple(sorted(target_slugs))
+                )
+            )
+        ).all()
+        for slug, title, aliases, page_type in page_rows:
+            if slug not in target_slugs:
+                raise InvariantError("历史候选查询返回了越界 slug")
+            if slug in historical_by_slug:
+                raise InvariantError("历史候选查询返回了重复活跃 slug")
+            if not isinstance(aliases, (list, tuple)):
+                raise InvariantError("历史候选 aliases 无效")
+            historical_by_slug[slug] = _LinkCandidatePage(
+                slug=slug,
+                title=title,
+                aliases=tuple(aliases),
+                page_type=page_type,
+            )
+
+    historical_by_source: dict[str, tuple[_LinkCandidatePage, ...]] = {}
+    for source_page_id, source_slug in existing_source_slugs.items():
+        historical_by_source[source_slug] = tuple(
+            historical_by_slug[target_slug]
+            for target_slug in targets_by_source_id[source_page_id]
+            if target_slug in historical_by_slug
+        )
+
+    fresh_pages = tuple(
+        _LinkCandidatePage(
+            slug=reduced.slug,
+            title=reduced.title,
+            aliases=tuple(reduced.aliases),
+            page_type=reduced.page_type,
+        )
+        for _row, reduced in selected_pages
+        if not reduced.deleted and reduced.page_type not in {"index", "log"}
+    )
+    return _build_link_candidates_by_source(
+        source_slugs,
+        fresh_pages=fresh_pages,
+        historical_by_source=historical_by_source,
+    )
 
 
 @runtime_checkable
@@ -2386,6 +2593,9 @@ class SqlAlchemyIngestStore:
                         raise PageConflict("已有页面类型与结果 slug 类型不一致")
                     selected_pages.append((row, reduced))
 
+                link_candidates_by_source = await _load_selected_link_candidates(
+                    session, scope, selected_pages
+                )
                 assignments = _folder_assignments_for_new_topics(
                     selected_pages,
                     request.folder_assignments,
@@ -2486,10 +2696,23 @@ class SqlAlchemyIngestStore:
 
                 now = datetime.now(UTC)
                 persisted: list[tuple[WikiPage, object]] = []
+                linkify_results_by_slug = {}
                 for row, reduced in selected_pages:
                     if row is None:
                         if reduced.deleted:
                             continue
+                    semantic_content = reduced.content
+                    if reduced.deleted or reduced.page_type in {"index", "log"}:
+                        persisted_content = semantic_content
+                    else:
+                        linkify_result = linkify_markdown(
+                            semantic_content,
+                            current_slug=reduced.slug,
+                            candidates=link_candidates_by_source[reduced.slug],
+                        )
+                        persisted_content = linkify_result.content
+                        linkify_results_by_slug[reduced.slug] = linkify_result
+                    if row is None:
                         folder_id, category_path, wiki_path, depth = placements.get(
                             reduced.slug,
                             (None, [], f"/{reduced.slug}", 0),
@@ -2501,7 +2724,7 @@ class SqlAlchemyIngestStore:
                             title=reduced.title,
                             page_type=reduced.page_type,
                             status="published",
-                            content=reduced.content,
+                            content=persisted_content,
                             summary=reduced.summary,
                             aliases=list(reduced.aliases),
                             source_refs=list(reduced.source_refs),
@@ -2519,7 +2742,6 @@ class SqlAlchemyIngestStore:
                         )
                         values = {
                             "title": reduced.title,
-                            "content": reduced.content,
                             "summary": reduced.summary,
                             "aliases": list(reduced.aliases),
                             "source_refs": list(reduced.source_refs),
@@ -2527,12 +2749,17 @@ class SqlAlchemyIngestStore:
                             "status": "published",
                             "deleted_at": target_deleted_at,
                         }
-                        if any(
+                        non_content_changed = any(
                             getattr(row, key) != value for key, value in values.items()
-                        ):
+                        )
+                        content_changed = _semantic_content_changed(
+                            row.content, semantic_content, persisted_content
+                        )
+                        if non_content_changed or content_changed:
                             row.version += 1
                         for key, value in values.items():
                             setattr(row, key, value)
+                        row.content = persisted_content
                     persisted.append((row, reduced))
                 try:
                     await session.flush()
@@ -2542,7 +2769,7 @@ class SqlAlchemyIngestStore:
                 page_store = SqlAlchemyPageStore(session)
                 for row, reduced in persisted:
                     targets = (
-                        [] if reduced.deleted else extract_wiki_links(reduced.content)
+                        [] if reduced.deleted else extract_wiki_links(row.content)
                     )
                     await page_store.replace_page_links(scope, row, targets)
                     if reduced.deleted:

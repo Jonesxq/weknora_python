@@ -2126,8 +2126,18 @@ class _ScriptedResult:
 
 
 class _ScriptedSession:
-    def __init__(self, results, events: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        results,
+        events: list[str] | None = None,
+        *,
+        statement_results: dict[str, list[_ScriptedResult]] | None = None,
+    ) -> None:
         self.results = list(results)
+        self.statement_results = {
+            pattern: list(values)
+            for pattern, values in (statement_results or {}).items()
+        }
         self.statements = []
         self.events = events if events is not None else []
         self.rolled_back = False
@@ -2149,6 +2159,13 @@ class _ScriptedSession:
         sql = _sql(statement)
         self.events.append(sql)
         if "pg_advisory_xact_lock" in sql:
+            return _ScriptedResult()
+        for pattern, values in self.statement_results.items():
+            if pattern in sql:
+                if not values:
+                    raise AssertionError(f"exhausted scripted SQL pattern: {pattern}")
+                return values.pop(0)
+        if sql.startswith("SELECT wiki_links.source_page_id, wiki_links.target_slug"):
             return _ScriptedResult()
         if not self.results:
             raise AssertionError(f"unexpected SQL: {sql}")
@@ -2527,6 +2544,408 @@ def _knowledge(version: str = "version-2") -> SourceKnowledge:
         title="Document",
         op_version=version,
     )
+
+
+def test_link_candidates_merge_fresh_and_per_source_history_deterministically() -> None:
+    source_python = "concept/python"
+    source_go = "concept/go"
+    fresh_postgres = ingest_store._LinkCandidatePage(
+        slug="concept/postgresql",
+        title="PostgreSQL",
+        aliases=("Postgres",),
+        page_type="concept",
+    )
+    historical_postgres = ingest_store._LinkCandidatePage(
+        slug="concept/postgresql",
+        title="Old PostgreSQL",
+        aliases=("Old Postgres",),
+        page_type="concept",
+    )
+    historical_redis = ingest_store._LinkCandidatePage(
+        slug="concept/redis",
+        title="Redis",
+        aliases=("Redis DB",),
+        page_type="concept",
+    )
+    historical_go = ingest_store._LinkCandidatePage(
+        slug="concept/golang",
+        title="Go",
+        aliases=(),
+        page_type="concept",
+    )
+    fresh = (fresh_postgres,)
+    historical = {
+        source_python: (historical_redis, historical_postgres),
+        source_go: (historical_go,),
+    }
+
+    candidates = ingest_store._build_link_candidates_by_source(
+        (source_go, source_python),
+        fresh_pages=fresh,
+        historical_by_source=historical,
+    )
+
+    assert [
+        (candidate.slug, candidate.display)
+        for candidate in candidates[source_python]
+    ] == [
+        ("concept/postgresql", "PostgreSQL"),
+        ("concept/postgresql", "Postgres"),
+        ("concept/redis", "Redis"),
+        ("concept/redis", "Redis DB"),
+    ]
+    assert [
+        (candidate.slug, candidate.display) for candidate in candidates[source_go]
+    ] == [
+        ("concept/golang", "Go"),
+        ("concept/postgresql", "PostgreSQL"),
+        ("concept/postgresql", "Postgres"),
+    ]
+    assert fresh == (fresh_postgres,)
+    assert historical[source_python] == (historical_redis, historical_postgres)
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ({"slug": "Concept/PostgreSQL"}, "slug"),
+        ({"title": " PostgreSQL "}, "title"),
+        ({"aliases": ("",)}, "alias"),
+        ({"aliases": ("bad]alias",)}, "alias"),
+        ({"page_type": "index"}, "page_type"),
+        ({"page_type": "entity"}, "page_type"),
+    ],
+)
+def test_link_candidate_page_rejects_dirty_values(
+    values: dict[str, object], message: str
+) -> None:
+    defaults: dict[str, object] = {
+        "slug": "concept/postgresql",
+        "title": "PostgreSQL",
+        "aliases": ("Postgres",),
+        "page_type": "concept",
+    }
+    defaults.update(values)
+
+    with pytest.raises(InvariantError, match=message):
+        ingest_store._LinkCandidatePage(**defaults)
+
+
+def test_old_link_candidate_edges_statement_is_scoped_narrow_and_stable() -> None:
+    source_ids = (uuid4(), uuid4())
+
+    statement = ingest_store._build_old_link_candidate_edges_statement(
+        SCOPE, source_ids
+    )
+    sql = _sql(statement)
+
+    assert sql.startswith(
+        "SELECT wiki_links.source_page_id, wiki_links.target_slug FROM wiki_links"
+    )
+    assert "wiki_links.tenant_id =" in sql
+    assert "wiki_links.knowledge_base_id =" in sql
+    assert "wiki_links.source_page_id IN" in sql
+    assert sql.endswith(
+        "ORDER BY wiki_links.source_page_id, wiki_links.target_slug"
+    )
+    assert "target_page_id" not in sql
+
+
+def test_historical_link_candidate_pages_statement_is_scoped_narrow_and_stable() -> (
+    None
+):
+    statement = ingest_store._build_historical_link_candidate_pages_statement(
+        SCOPE, ("concept/postgresql", "concept/redis")
+    )
+    sql = _sql(statement)
+
+    assert sql.startswith(
+        "SELECT wiki_pages.slug, wiki_pages.title, wiki_pages.aliases, "
+        "wiki_pages.page_type FROM wiki_pages"
+    )
+    assert "wiki_pages.tenant_id =" in sql
+    assert "wiki_pages.knowledge_base_id =" in sql
+    assert "wiki_pages.deleted_at IS NULL" in sql
+    assert "wiki_pages.status =" in sql
+    assert "wiki_pages.slug IN" in sql
+    assert "wiki_pages.page_type NOT IN" in sql
+    assert sql.endswith("ORDER BY wiki_pages.slug")
+    assert "wiki_pages.content" not in sql
+
+
+@pytest.mark.asyncio
+async def test_load_selected_link_candidates_batches_history_and_uses_final_fresh_pages() -> (
+    None
+):
+    source = _page(slug="concept/python", page_type="concept")
+    source_reduced = ReducedPage(
+        slug=source.slug,
+        title="Python",
+        page_type="concept",
+        content="PostgreSQL and Redis",
+        summary="Python",
+        aliases=["Py"],
+        contributor_op_ids=[uuid4()],
+    )
+    fresh = ReducedPage(
+        slug="concept/postgresql",
+        title="PostgreSQL",
+        page_type="concept",
+        content="Database",
+        summary="Database",
+        aliases=["Postgres"],
+        contributor_op_ids=[uuid4()],
+    )
+    session = _ScriptedSession(
+        [],
+        statement_results={
+            "SELECT wiki_links.source_page_id, wiki_links.target_slug": [
+                _ScriptedResult(rows=[(source.id, "concept/redis")])
+            ],
+            "SELECT wiki_pages.slug, wiki_pages.title, wiki_pages.aliases, wiki_pages.page_type": [
+                _ScriptedResult(
+                    rows=[("concept/redis", "Redis", ["Redis DB"], "concept")]
+                )
+            ],
+        },
+    )
+
+    candidates = await ingest_store._load_selected_link_candidates(
+        session,
+        SCOPE,
+        ((source, source_reduced), (None, fresh)),
+    )
+
+    assert {
+        (candidate.slug, candidate.display) for candidate in candidates[source.slug]
+    } >= {
+        ("concept/postgresql", "PostgreSQL"),
+        ("concept/postgresql", "Postgres"),
+        ("concept/redis", "Redis"),
+        ("concept/redis", "Redis DB"),
+    }
+    assert len(session.statements) == 2
+    assert _sql(session.statements[0]).startswith(
+        "SELECT wiki_links.source_page_id, wiki_links.target_slug"
+    )
+    assert _sql(session.statements[1]).startswith(
+        "SELECT wiki_pages.slug, wiki_pages.title, wiki_pages.aliases, wiki_pages.page_type"
+    )
+
+
+@pytest.mark.asyncio
+async def test_load_selected_link_candidates_skips_queries_without_existing_sources() -> (
+    None
+):
+    fresh = ReducedPage(
+        slug="concept/postgresql",
+        title="PostgreSQL",
+        page_type="concept",
+        content="Database",
+        summary="Database",
+        aliases=[],
+        contributor_op_ids=[uuid4()],
+    )
+    session = _ScriptedSession([])
+
+    candidates = await ingest_store._load_selected_link_candidates(
+        session, SCOPE, ((None, fresh),)
+    )
+
+    assert session.statements == []
+    assert [(item.slug, item.display) for item in candidates[fresh.slug]] == [
+        (fresh.slug, fresh.title)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_load_selected_link_candidates_rejects_dirty_query_rows() -> None:
+    source = _page(slug="concept/python", page_type="concept")
+    reduced = ReducedPage(
+        slug=source.slug,
+        title="Python",
+        page_type="concept",
+        content="Redis",
+        summary="Python",
+        aliases=[],
+        contributor_op_ids=[uuid4()],
+    )
+    foreign_source_id = uuid4()
+    session = _ScriptedSession(
+        [],
+        statement_results={
+            "SELECT wiki_links.source_page_id, wiki_links.target_slug": [
+                _ScriptedResult(rows=[(foreign_source_id, "concept/redis")])
+            ]
+        },
+    )
+
+    with pytest.raises(InvariantError, match="source"):
+        await ingest_store._load_selected_link_candidates(
+            session, SCOPE, ((source, reduced),)
+        )
+
+
+@pytest.mark.parametrize(
+    ("old_content", "semantic_content", "persisted_content", "changed"),
+    [
+        ("PostgreSQL", "PostgreSQL", "[[concept/postgresql|PostgreSQL]]", False),
+        (
+            "[[concept/postgresql|PostgreSQL]]",
+            "PostgreSQL",
+            "[[concept/postgresql|PostgreSQL]]",
+            False,
+        ),
+        ("Old semantic", "PostgreSQL", "[[concept/postgresql|PostgreSQL]]", True),
+    ],
+)
+def test_semantic_content_change_ignores_automatic_markup_only(
+    old_content: str,
+    semantic_content: str,
+    persisted_content: str,
+    changed: bool,
+) -> None:
+    assert (
+        ingest_store._semantic_content_changed(
+            old_content, semantic_content, persisted_content
+        )
+        is changed
+    )
+
+
+@pytest.mark.asyncio
+async def test_modern_apply_linkifies_final_selected_pages_without_version_bump(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = uuid4()
+    pending = _pending(claimed=True)
+    pending.claim_token = token
+    source = _page(slug="concept/python", page_type="concept")
+    source.title = "Python"
+    source.content = "PostgreSQL and Redis.\n\n`Redis`"
+    source.summary = "Python"
+    source.aliases = ["Py"]
+    source.source_refs = [pending.knowledge_id]
+    source.chunk_refs = ["chunk:python"]
+    source_reduced = ReducedPage(
+        slug=source.slug,
+        title=source.title,
+        page_type="concept",
+        content=source.content,
+        summary=source.summary,
+        aliases=source.aliases,
+        source_refs=source.source_refs,
+        chunk_refs=source.chunk_refs,
+        contributor_op_ids=[pending.id],
+    )
+    fresh = ReducedPage(
+        slug="concept/postgresql",
+        title="PostgreSQL",
+        page_type="concept",
+        content="PostgreSQL database",
+        summary="Database",
+        aliases=["Postgres"],
+        source_refs=[pending.knowledge_id],
+        chunk_refs=["chunk:postgresql"],
+        contributor_op_ids=[pending.id],
+    )
+
+    def current_for(page: ReducedPage) -> StoredContributionRecord:
+        return _stored_contribution(version=pending.op_version).model_copy(
+            update={
+                "slug": page.slug,
+                "page_type": page.page_type,
+                "title": page.title,
+                "content": page.content,
+                "summary": page.summary,
+                "aliases": tuple(page.aliases),
+                "chunk_refs": tuple(page.chunk_refs),
+            }
+        )
+
+    request = _batch_request(
+        claim_token=token,
+        pages=(source_reduced, fresh),
+        contribution_deltas=tuple(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="add",
+                slug=page.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=None,
+                current=current_for(page),
+            )
+            for page in (source_reduced, fresh)
+        ),
+        completed_op_ids=(pending.id,),
+        expected_pages=(
+            PageExpectation(
+                slug=source.slug, page_id=source.id, version=source.version
+            ),
+            PageExpectation(slug=fresh.slug),
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[source]),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(scalar=0),
+        ],
+        statement_results={
+            "SELECT wiki_links.source_page_id, wiki_links.target_slug": [
+                _ScriptedResult(rows=[(source.id, "concept/redis")])
+            ],
+            "SELECT wiki_pages.slug, wiki_pages.title, wiki_pages.aliases, wiki_pages.page_type": [
+                _ScriptedResult(rows=[("concept/redis", "Redis", [], "concept")])
+            ],
+        },
+    )
+    replaced: list[tuple[str, str, list[str], int]] = []
+
+    async def record_replace(_store, _scope, row, targets):
+        replaced.append((row.slug, row.content, targets, session.events.count("FLUSH")))
+
+    monkeypatch.setattr(
+        "app.wiki.ingest.store.SqlAlchemyPageStore.replace_page_links",
+        record_replace,
+    )
+    class RecordingStore(SqlAlchemyIngestStore):
+        async def _resolve_folder_assignment(
+            self,
+            actual_session: AsyncSession,
+            actual_scope: WikiScope,
+            assignment: FolderAssignment,
+        ) -> tuple[UUID | None, list[str], str, int]:
+            assert actual_session is session
+            assert actual_scope == SCOPE
+            return None, [], f"/{assignment.slug}", 0
+
+    store = RecordingStore(
+        _OneSessionFactory(session), _RecordingFinalization(session.events)
+    )  # type: ignore[arg-type]
+
+    assert await store.apply_results(SCOPE, request) is True
+
+    assert source.content == (
+        "[[concept/postgresql|PostgreSQL]] and [[concept/redis|Redis]].\n\n`Redis`"
+    )
+    assert source.version == 4
+    source_replace = next(item for item in replaced if item[0] == source.slug)
+    assert source_replace[1] == source.content
+    assert source_replace[2] == ["concept/postgresql", "concept/redis"]
+    assert source_replace[3] >= 2
+    inserted = next(
+        item
+        for item in session.added
+        if isinstance(item, WikiPage) and item.slug == fresh.slug
+    )
+    assert inserted.version == 1
 
 
 @pytest.mark.asyncio
@@ -3214,7 +3633,7 @@ async def test_modern_retract_soft_deletes_page_and_clears_visible_links() -> No
     link_sql = [
         _sql(statement)
         for statement in session.statements
-        if "wiki_links" in _sql(statement)
+        if _sql(statement).startswith(("DELETE FROM wiki_links", "UPDATE wiki_links"))
     ]
     assert link_sql[0].startswith("DELETE FROM wiki_links")
     assert link_sql[1].startswith("UPDATE wiki_links")
