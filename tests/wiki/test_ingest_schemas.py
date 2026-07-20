@@ -767,6 +767,12 @@ def test_batch_apply_request_index_plan_requires_completed_operation_and_validat
     with pytest.raises(ValidationError):
         old_request.model_copy(update={"index_intro_plan": plan})
     with pytest.raises(ValidationError):
+        updated.model_copy(update={"completed_op_ids": ()})
+    with pytest.raises(ValidationError):
+        old_request.model_copy(
+            update={"index_intro_plan": plan, "completed_op_ids": ()}
+        )
+    with pytest.raises(ValidationError):
         request.model_copy(
             update={
                 "index_intro_plan": {

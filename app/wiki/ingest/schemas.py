@@ -1514,23 +1514,17 @@ class BatchApplyRequest(_FrozenValueModel):
     def model_copy(
         self, *, update: Mapping[str, Any] | None = None, deep: bool = False
     ) -> Self:
-        if not update or not {"folder_assignments", "index_intro_plan"}.intersection(
-            update
-        ):
+        if not update:
             return super().model_copy(update=update, deep=deep)
-        source = super().model_copy(deep=deep)
-        payload = {
-            field_name: getattr(source, field_name)
-            for field_name in type(self).model_fields
-        }
+        payload = self.model_dump(mode="python")
         payload.update(update)
         validated = type(self).model_validate(payload)
         object.__setattr__(
             validated,
             "__pydantic_fields_set__",
-            source.model_fields_set | set(update),
+            self.model_fields_set | set(update),
         )
-        private_state = getattr(source, "__pydantic_private__", None)
+        private_state = getattr(self, "__pydantic_private__", None)
         if private_state is not None:
             object.__setattr__(validated, "__pydantic_private__", private_state)
         return validated
