@@ -373,3 +373,26 @@ def test_main_scan_uses_cursor_for_many_protected_spans(monkeypatch) -> None:
 
     assert result == module.LinkifyResult(content, False, ())
     assert comparisons < 100_000
+
+
+def test_markdown_parenthesis_scan_is_near_linear_with_many_unclosed_destinations() -> None:
+    prefix = "[x](" * 4000
+    content = _CountingText(prefix + "[AI](url)")
+
+    spans = _api()._markdown_link_spans(content)
+
+    assert spans == [(len(prefix), len(content))]
+    assert content.index_reads < 100_000
+
+
+def test_markdown_link_destination_supports_escaped_parentheses() -> None:
+    content = r"[AI](https://example.test/a\(b\)) AI"
+
+    result = _linkify(
+        content,
+        current_slug="concept/overview",
+        candidates=(_candidate("concept/ai", "AI"),),
+    )
+
+    assert result.content == content[:-2] + "[[concept/ai|AI]]"
+    assert result.added_slugs == ("concept/ai",)

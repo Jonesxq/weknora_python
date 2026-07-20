@@ -271,7 +271,8 @@ def _non_wiki_markdown_spans(content: str) -> list[tuple[int, int]]:
 
 def _markdown_link_spans(content: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
-    bracket_pairs = _bracket_pairs(content)
+    bracket_pairs = _delimiter_pairs(content, "[", "]")
+    parenthesis_pairs = _delimiter_pairs(content, "(", ")")
     index = 0
     while index < len(content):
         opening = content.find("[", index)
@@ -284,7 +285,7 @@ def _markdown_link_spans(content: str) -> list[tuple[int, int]]:
         start = opening - 1 if opening > 0 and content[opening - 1] == "!" else opening
         next_index = closing + 1
         if next_index < len(content) and content[next_index] == "(":
-            end = _closing_parenthesis(content, next_index)
+            end = parenthesis_pairs.get(next_index)
             if end is not None:
                 spans.append((start, end + 1))
                 index = end + 1
@@ -299,30 +300,15 @@ def _markdown_link_spans(content: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _bracket_pairs(content: str) -> dict[int, int]:
+def _delimiter_pairs(content: str, opening: str, closing: str) -> dict[int, int]:
     openings: list[int] = []
     pairs: dict[int, int] = {}
     for index, character in enumerate(content):
-        if character == "[" and not _is_escaped(content, index):
+        if character == opening and not _is_escaped(content, index):
             openings.append(index)
-        elif character == "]" and openings and not _is_escaped(content, index):
+        elif character == closing and openings and not _is_escaped(content, index):
             pairs[openings.pop()] = index
     return pairs
-
-
-def _closing_parenthesis(content: str, opening: int) -> int | None:
-    depth = 0
-    index = opening
-    while index < len(content):
-        character = content[index]
-        if character == "(" and not _is_escaped(content, index):
-            depth += 1
-        elif character == ")" and not _is_escaped(content, index):
-            depth -= 1
-            if depth == 0:
-                return index
-        index += 1
-    return None
 
 
 def _line_end(content: str, start: int) -> int:
