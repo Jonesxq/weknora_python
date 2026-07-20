@@ -8,6 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _POWERSHELL_LANGUAGES = frozenset({"powershell", "pwsh"})
 _SHELL_LANGUAGES = frozenset({"bash", "sh", "shell"})
 _TERMINAL_LANGUAGES = _POWERSHELL_LANGUAGES | _SHELL_LANGUAGES
+_CONTINUATION_OPERATORS = ("&&", "||", "|")
 
 
 def _read_project_text(relative_path: str) -> str:
@@ -71,13 +72,26 @@ def _is_fence_closer(line: str, marker: str, minimum_length: int) -> bool:
     )
 
 
+def _trailing_character_count(value: str, character: str) -> int:
+    count = 0
+    for current in reversed(value):
+        if current != character:
+            break
+        count += 1
+    return count
+
+
 def _continues_terminal_command(line: str, language: str) -> bool:
     stripped = line.rstrip()
+    if stripped.endswith(_CONTINUATION_OPERATORS):
+        return True
     if language in _POWERSHELL_LANGUAGES:
-        return stripped.endswith("`")
-    if language in _SHELL_LANGUAGES:
-        return stripped.endswith("\\")
-    raise AssertionError(f"不支持的 terminal fence language: {language}")
+        escape = "`"
+    elif language in _SHELL_LANGUAGES:
+        escape = "\\"
+    else:
+        raise AssertionError(f"不支持的 terminal fence language: {language}")
+    return _trailing_character_count(stripped, escape) % 2 == 1
 
 
 def _assert_terminal_commands_have_chinese_comments(text: str) -> None:
@@ -170,30 +184,75 @@ def test_powershell_trailing_backslash_does_not_continue_command(language: str):
 
 
 @pytest.mark.parametrize("language", ["powershell", "pwsh"])
-def test_powershell_backtick_continuation_is_allowed(language: str):
-    markdown = (
-        f"```{language}\n"
-        "# 运行多行 PowerShell 命令\n"
-        "uv run pytest `\n"
-        "  tests/wiki/test_linkify.py `\n"
-        "  -q\n"
-        "```\n"
-    )
+def test_powershell_uses_odd_trailing_backticks_for_continuation(language: str):
+    for escape_count in (1, 3):
+        escape_suffix = "`" * escape_count
+        markdown = (
+            f"```{language}\n"
+            "# 运行多行 PowerShell 命令\n"
+            f"Write-Output first{escape_suffix}\n"
+            "  Write-Output second\n"
+            "```\n"
+        )
 
-    _assert_terminal_commands_have_chinese_comments(markdown)
+        _assert_terminal_commands_have_chinese_comments(markdown)
+
+    for escape_count in (2, 4):
+        escape_suffix = "`" * escape_count
+        markdown = (
+            f"```{language}\n"
+            "# 输出字面反引号\n"
+            f"Write-Output first{escape_suffix}\n"
+            "Write-Output missing-comment\n"
+            "```\n"
+        )
+
+        with pytest.raises(AssertionError, match="命令缺少中文用途注释"):
+            _assert_terminal_commands_have_chinese_comments(markdown)
 
 
 @pytest.mark.parametrize("language", ["bash", "sh", "shell"])
-def test_shell_backslash_continuation_is_allowed(language: str):
-    markdown = (
-        f"~~~{language}\n"
-        "# 运行多行 shell 命令\n"
-        "printf '%s' \\\n"
-        "  value\n"
-        "~~~\n"
-    )
+def test_shell_uses_odd_trailing_backslashes_for_continuation(language: str):
+    for escape_count in (1, 3):
+        escape_suffix = "\\" * escape_count
+        markdown = (
+            f"~~~{language}\n"
+            "# 运行多行 shell 命令\n"
+            f"printf first{escape_suffix}\n"
+            "  value\n"
+            "~~~\n"
+        )
 
-    _assert_terminal_commands_have_chinese_comments(markdown)
+        _assert_terminal_commands_have_chinese_comments(markdown)
+
+    for escape_count in (2, 4):
+        escape_suffix = "\\" * escape_count
+        markdown = (
+            f"~~~{language}\n"
+            "# 输出字面反斜杠\n"
+            f"printf first{escape_suffix}\n"
+            "printf missing-comment\n"
+            "~~~\n"
+        )
+
+        with pytest.raises(AssertionError, match="命令缺少中文用途注释"):
+            _assert_terminal_commands_have_chinese_comments(markdown)
+
+
+@pytest.mark.parametrize(
+    "language", ["powershell", "pwsh", "bash", "sh", "shell"]
+)
+def test_terminal_operators_continue_commands(language: str):
+    for operator in ("|", "&&", "||"):
+        markdown = (
+            f"```{language}\n"
+            "# 运行包含续行操作符的命令\n"
+            f"first-command {operator}\n"
+            "  second-command\n"
+            "```\n"
+        )
+
+        _assert_terminal_commands_have_chinese_comments(markdown)
 
 
 def test_phase_four_b_doc_describes_implemented_contracts():
