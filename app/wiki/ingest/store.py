@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.exc import IntegrityError
 
 from app.wiki.domain import WikiSlugError, extract_wiki_links, normalize_slug
+from app.wiki.enums import WikiPageType
 from app.wiki.ingest.ports import FinalizationPort
 from app.wiki.ingest.retract import project_active_refs
 from app.wiki.ingest.schemas import (
@@ -80,6 +81,16 @@ from app.wiki.sql_page_store import (
 )
 
 _MAX_DEDUP_QUERY_NAMES = 64
+_LINK_CANDIDATE_PAGE_TYPES = tuple(
+    page_type.value
+    for page_type in (
+        WikiPageType.SUMMARY,
+        WikiPageType.ENTITY,
+        WikiPageType.CONCEPT,
+        WikiPageType.SYNTHESIS,
+        WikiPageType.COMPARISON,
+    )
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,7 +347,7 @@ class _LinkCandidatePage:
             raise InvariantError("link candidate slug 无效") from exc
         if normalized_slug != self.slug:
             raise InvariantError("link candidate slug 未规范化")
-        if self.page_type not in {"summary", "entity", "concept"}:
+        if self.page_type not in _LINK_CANDIDATE_PAGE_TYPES:
             raise InvariantError("link candidate page_type 无效")
         if not self.slug.startswith(f"{self.page_type}/"):
             raise InvariantError("link candidate page_type 与 slug 不一致")
@@ -427,7 +438,7 @@ def _build_historical_link_candidate_pages_statement(
             WikiPage.deleted_at.is_(None),
             WikiPage.status == "published",
             WikiPage.slug.in_(target_slugs),
-            WikiPage.page_type.not_in(("index", "log")),
+            WikiPage.page_type.in_(_LINK_CANDIDATE_PAGE_TYPES),
         )
         .order_by(WikiPage.slug)
     )
@@ -443,14 +454,14 @@ async def _load_selected_link_candidates(
     source_slugs = tuple(
         reduced.slug
         for _row, reduced in selected_pages
-        if not reduced.deleted and reduced.page_type not in {"index", "log"}
+        if not reduced.deleted and reduced.page_type in _LINK_CANDIDATE_PAGE_TYPES
     )
     existing_source_slugs: dict[UUID, str] = {}
     for row, reduced in selected_pages:
         if (
             row is None
             or reduced.deleted
-            or reduced.page_type in {"index", "log"}
+            or reduced.page_type not in _LINK_CANDIDATE_PAGE_TYPES
         ):
             continue
         if row.id in existing_source_slugs:
@@ -525,7 +536,7 @@ async def _load_selected_link_candidates(
             page_type=reduced.page_type,
         )
         for _row, reduced in selected_pages
-        if not reduced.deleted and reduced.page_type not in {"index", "log"}
+        if not reduced.deleted and reduced.page_type in _LINK_CANDIDATE_PAGE_TYPES
     )
     return _build_link_candidates_by_source(
         source_slugs,

@@ -3056,6 +3056,31 @@ def test_link_candidates_merge_fresh_and_per_source_history_deterministically() 
 
 
 @pytest.mark.parametrize(
+    "page_type", ["summary", "entity", "concept", "synthesis", "comparison"]
+)
+def test_link_candidate_page_accepts_all_linkable_page_types(page_type: str) -> None:
+    page = ingest_store._LinkCandidatePage(
+        slug=f"{page_type}/target",
+        title="Target",
+        aliases=("Target alias",),
+        page_type=page_type,
+    )
+
+    assert page.page_type == page_type
+
+
+@pytest.mark.parametrize("page_type", ["index", "log", "system", "unknown"])
+def test_link_candidate_page_rejects_non_linkable_page_types(page_type: str) -> None:
+    with pytest.raises(InvariantError, match="page_type"):
+        ingest_store._LinkCandidatePage(
+            slug=f"{page_type}/target",
+            title="Target",
+            aliases=(),
+            page_type=page_type,
+        )
+
+
+@pytest.mark.parametrize(
     ("values", "message"),
     [
         ({"slug": "Concept/PostgreSQL"}, "slug"),
@@ -3118,9 +3143,23 @@ def test_historical_link_candidate_pages_statement_is_scoped_narrow_and_stable()
     assert "wiki_pages.deleted_at IS NULL" in sql
     assert "wiki_pages.status =" in sql
     assert "wiki_pages.slug IN" in sql
-    assert "wiki_pages.page_type NOT IN" in sql
+    assert "wiki_pages.page_type IN" in sql
+    assert "wiki_pages.page_type NOT IN" not in sql
     assert sql.endswith("ORDER BY wiki_pages.slug")
     assert "wiki_pages.content" not in sql
+    compiled = statement.compile(dialect=postgresql.dialect())
+    allowed_page_types = next(
+        value
+        for key, value in compiled.params.items()
+        if key.startswith("page_type")
+    )
+    assert set(allowed_page_types) == {
+        "summary",
+        "entity",
+        "concept",
+        "synthesis",
+        "comparison",
+    }
 
 
 @pytest.mark.asyncio
@@ -3886,6 +3925,103 @@ async def test_modern_apply_keeps_ambiguous_fresh_and_historical_display_unlinke
         "Redis",
         [],
     )
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_type", ["synthesis", "comparison"])
+async def test_modern_apply_linkifies_historical_extended_page_types(
+    monkeypatch: pytest.MonkeyPatch,
+    page_type: str,
+) -> None:
+    token = uuid4()
+    pending = _pending(claimed=True)
+    pending.claim_token = token
+    target_slug = f"{page_type}/historical-target"
+    target_title = f"{page_type.title()} target"
+    target_alias = f"{page_type.title()} alias"
+    source = _page(slug="concept/source", page_type="concept")
+    source.title = "Source"
+    source.content = f"{target_alias} references {target_title}"
+    source.summary = "Source"
+    source.aliases = []
+    source.source_refs = [pending.knowledge_id]
+    source.chunk_refs = ["chunk:source"]
+    reduced = ReducedPage(
+        slug=source.slug,
+        title=source.title,
+        page_type="concept",
+        content=source.content,
+        summary=source.summary,
+        source_refs=source.source_refs,
+        chunk_refs=source.chunk_refs,
+        contributor_op_ids=[pending.id],
+    )
+    request = _batch_request(
+        claim_token=token,
+        pages=(reduced,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="add",
+                slug=reduced.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=None,
+                current=_current_for_reduced(pending, reduced),
+            ),
+        ),
+        completed_op_ids=(pending.id,),
+        expected_pages=(
+            PageExpectation(
+                slug=source.slug,
+                page_id=source.id,
+                version=source.version,
+            ),
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[source]),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(scalar=0),
+        ],
+        statement_results={
+            "SELECT wiki_links.source_page_id, wiki_links.target_slug": [
+                _ScriptedResult(rows=[(source.id, target_slug)])
+            ],
+            "SELECT wiki_pages.slug, wiki_pages.title, wiki_pages.aliases, wiki_pages.page_type": [
+                _ScriptedResult(
+                    rows=[(target_slug, target_title, [target_alias], page_type)]
+                )
+            ],
+        },
+    )
+    replaced: list[tuple[str, str, list[str]]] = []
+
+    async def record_replace(_store, _scope, row, targets):
+        replaced.append((row.slug, row.content, targets))
+
+    monkeypatch.setattr(
+        "app.wiki.ingest.store.SqlAlchemyPageStore.replace_page_links",
+        record_replace,
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), _RecordingFinalization(session.events)
+    )  # type: ignore[arg-type]
+
+    assert await store.apply_results(SCOPE, request) is True
+
+    assert source.content == (
+        f"[[{target_slug}|{target_alias}]] references {target_title}"
+    )
+    assert source.version == 4
+    assert replaced == [(source.slug, source.content, [target_slug])]
+    assert session.rolled_back is False
     session.assert_consumed()
 
 
