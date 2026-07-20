@@ -51,7 +51,8 @@ def linkify_markdown(
     code_spans.extend(_inline_code_spans(content, code_spans))
     code_spans = _merge_spans(code_spans)
     spans = list(protected_spans(content))
-    existing_slugs = _existing_wiki_slugs(content, code_spans)
+    unsafe_body_spans = _merge_spans(code_spans + _non_wiki_markdown_spans(content))
+    existing_slugs = _existing_wiki_slugs(content, unsafe_body_spans)
     prepared = _prepare_candidates(candidates, normalized_current_slug, existing_slugs)
     added_slugs: list[str] = []
     index = 0
@@ -62,7 +63,7 @@ def linkify_markdown(
             index = protected_end
             continue
 
-        candidate = _candidate_at(content, index, prepared, set(added_slugs))
+        candidate = _candidate_at(content, index, prepared, set(added_slugs), spans)
         if candidate is None:
             index += 1
             continue
@@ -112,12 +113,17 @@ def _candidate_at(
     index: int,
     candidates: tuple[LinkCandidate, ...],
     added_slugs: set[str],
+    protected: list[tuple[int, int]],
 ) -> LinkCandidate | None:
     for candidate in candidates:
         if candidate.slug in added_slugs or not content.startswith(candidate.display, index):
             continue
         end = index + len(candidate.display)
-        if _is_escaped(content, index) or not _has_valid_boundary(content, index, end, candidate.display):
+        if (
+            _is_escaped(content, index)
+            or _overlaps_protected(protected, index, end)
+            or not _has_valid_boundary(content, index, end, candidate.display)
+        ):
             continue
         return candidate
     return None
@@ -141,10 +147,10 @@ def _is_escaped(content: str, index: int) -> bool:
     return slash_count % 2 == 1
 
 
-def _existing_wiki_slugs(content: str, code_spans: list[tuple[int, int]]) -> set[str]:
+def _existing_wiki_slugs(content: str, unsafe_body_spans: list[tuple[int, int]]) -> set[str]:
     existing: set[str] = set()
     for match in _WIKI_LINK_RE.finditer(content):
-        if _protected_end(code_spans, match.start()) is not None:
+        if _overlaps_protected(unsafe_body_spans, match.start(), match.end()):
             continue
         try:
             existing.add(normalize_slug(match.group(1)))
@@ -245,6 +251,12 @@ def _inline_code_spans(content: str, fenced_spans: list[tuple[int, int]]) -> lis
 
 def _markdown_spans(content: str) -> list[tuple[int, int]]:
     spans = [(match.start(), match.end()) for match in _WIKI_MARKUP_RE.finditer(content)]
+    spans.extend(_non_wiki_markdown_spans(content))
+    return spans
+
+
+def _non_wiki_markdown_spans(content: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
     spans.extend((match.start(), match.end()) for match in _REFERENCE_DEFINITION_RE.finditer(content))
     spans.extend((match.start(), match.end()) for match in _AUTOLINK_RE.finditer(content))
     spans.extend(_markdown_link_spans(content))
@@ -333,6 +345,15 @@ def _protected_end(spans: list[tuple[int, int]], index: int) -> int | None:
         if start <= index < end:
             return end
     return None
+
+
+def _overlaps_protected(spans: list[tuple[int, int]], start: int, end: int) -> bool:
+    for span_start, span_end in spans:
+        if span_start >= end:
+            return False
+        if span_end > start:
+            return True
+    return False
 
 
 def _shift_spans_for_insert(

@@ -266,3 +266,44 @@ def test_autolink_with_whitespace_is_not_overprotected() -> None:
 
     assert result.content == "<https://example.test [[concept/ai|AI]]> AI"
     assert result.added_slugs == ("concept/ai",)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Alpha [AI](https://example.test)",
+        "Alpha `AI`",
+        "Alpha [[concept/ai|AI]]",
+    ],
+)
+def test_long_candidate_does_not_overlap_protected_markup(content: str) -> None:
+    result = _linkify(
+        content,
+        current_slug="concept/overview",
+        candidates=(_candidate("concept/composite", content),),
+    )
+
+    assert result == _api().LinkifyResult(content, False, ())
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "```\n[[concept/ai]]\n```\nAI",
+        "`[[concept/ai]]` AI",
+        "[label [[concept/ai]]](https://example.test) AI",
+        "![label [[concept/ai]]](image.png) AI",
+        "[label [[concept/ai]]][ref]\n[ref]: https://example.test\nAI",
+        "[ref]: https://example.test/[[concept/ai]]\nAI",
+        "<https://example.test/[[concept/ai]]> AI",
+    ],
+)
+def test_existing_wiki_link_outside_safe_body_does_not_suppress_candidate(content: str) -> None:
+    result = _linkify(
+        content,
+        current_slug="concept/overview",
+        candidates=(_candidate("concept/ai", "AI"),),
+    )
+
+    assert result.content == content[:-2] + "[[concept/ai|AI]]"
+    assert result.added_slugs == ("concept/ai",)
