@@ -9,7 +9,7 @@ import re
 from app.wiki.domain import WikiSlugError, normalize_slug
 
 
-_AUTOLINK_RE = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]*:[^<>\s]+>")
+_AUTOLINK_RE = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]+>")
 _REFERENCE_DEFINITION_RE = re.compile(r"(?m)^[ \t]{0,3}\[[^\]\r\n]+\]:[^\r\n]*(?:\r\n|\r|\n|$)")
 _WIKI_LINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]*)?\]\]")
 _WIKI_MARKUP_RE = re.compile(r"\[\[[^\]\r\n]*\]\]")

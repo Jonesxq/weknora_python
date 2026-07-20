@@ -142,6 +142,24 @@ def test_extract_safe_wiki_links_skips_custom_uri_autolinks() -> None:
     )
 
 
+def test_extract_safe_wiki_links_accepts_two_character_uri_schemes() -> None:
+    assert _api().extract_safe_wiki_links("<ab:[[concept/ai]]> [[concept/real]]") == (
+        "concept/real",
+    )
+
+
+@pytest.mark.parametrize("scheme", ["x", "a" * 33])
+def test_invalid_length_uri_schemes_leave_wiki_markup_in_safe_body(scheme: str) -> None:
+    content = f"<{scheme}:[[topic|Topic]]> Topic"
+
+    assert _api().extract_safe_wiki_links(content) == ("topic",)
+    assert _linkify(
+        content,
+        current_slug="concept/overview",
+        candidates=(_candidate("topic", "Topic"),),
+    ) == _api().LinkifyResult(content, False, ())
+
+
 def test_custom_uri_autolink_does_not_suppress_later_safe_candidate() -> None:
     content = "<foo:[[concept/ai|AI]]> AI"
 
