@@ -2759,6 +2759,96 @@ async def test_load_selected_link_candidates_skips_queries_without_existing_sour
 
 
 @pytest.mark.asyncio
+async def test_load_selected_link_candidates_skips_existing_deleted_source() -> None:
+    source = _page()
+    deleted = ReducedPage(
+        slug=source.slug,
+        title=source.title,
+        page_type="entity",
+        content=source.content,
+        summary=source.summary,
+        aliases=source.aliases,
+        contributor_op_ids=[uuid4()],
+        deleted=True,
+    )
+    session = _ScriptedSession([])
+
+    candidates = await ingest_store._load_selected_link_candidates(
+        session, SCOPE, ((source, deleted),)
+    )
+
+    assert candidates == {}
+    assert session.statements == []
+
+
+@pytest.mark.asyncio
+async def test_load_selected_link_candidates_skips_existing_system_source() -> None:
+    source = _page(slug="index/overview", page_type="index")
+    system = ReducedPage.model_construct(
+        slug=source.slug,
+        title="Overview",
+        page_type="index",
+        content="Overview",
+        summary="Overview",
+        aliases=[],
+        source_refs=[],
+        chunk_refs=[],
+        contributor_op_ids=[uuid4()],
+        deleted=False,
+    )
+    session = _ScriptedSession([])
+
+    candidates = await ingest_store._load_selected_link_candidates(
+        session, SCOPE, ((source, system),)
+    )
+
+    assert candidates == {}
+    assert session.statements == []
+
+
+@pytest.mark.asyncio
+async def test_load_selected_link_candidates_queries_only_eligible_existing_sources() -> (
+    None
+):
+    normal = _page(slug="concept/python", page_type="concept")
+    normal_reduced = ReducedPage(
+        slug=normal.slug,
+        title="Python",
+        page_type="concept",
+        content="Python",
+        summary="Python",
+        aliases=[],
+        contributor_op_ids=[uuid4()],
+    )
+    deleted = _page(slug="entity/acme", page_type="entity")
+    deleted_reduced = ReducedPage(
+        slug=deleted.slug,
+        title=deleted.title,
+        page_type="entity",
+        content=deleted.content,
+        summary=deleted.summary,
+        aliases=deleted.aliases,
+        contributor_op_ids=[uuid4()],
+        deleted=True,
+    )
+    session = _ScriptedSession([])
+
+    candidates = await ingest_store._load_selected_link_candidates(
+        session,
+        SCOPE,
+        ((normal, normal_reduced), (deleted, deleted_reduced)),
+    )
+
+    assert set(candidates) == {normal.slug}
+    assert len(session.statements) == 1
+    params = session.statements[0].compile(dialect=postgresql.dialect()).params
+    queried_source_ids = next(
+        value for key, value in params.items() if key.startswith("source_page_id")
+    )
+    assert queried_source_ids == [normal.id]
+
+
+@pytest.mark.asyncio
 async def test_load_selected_link_candidates_rejects_dirty_query_rows() -> None:
     source = _page(slug="concept/python", page_type="concept")
     reduced = ReducedPage(

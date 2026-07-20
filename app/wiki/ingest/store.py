@@ -290,12 +290,16 @@ async def _load_selected_link_candidates(
 
     source_slugs = tuple(
         reduced.slug
-        for row, reduced in selected_pages
-        if row is not None or not reduced.deleted
+        for _row, reduced in selected_pages
+        if not reduced.deleted and reduced.page_type not in {"index", "log"}
     )
     existing_source_slugs: dict[UUID, str] = {}
     for row, reduced in selected_pages:
-        if row is None:
+        if (
+            row is None
+            or reduced.deleted
+            or reduced.page_type in {"index", "log"}
+        ):
             continue
         if row.id in existing_source_slugs:
             raise InvariantError("selected source page id 重复")
