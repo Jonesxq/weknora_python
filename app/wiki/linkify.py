@@ -9,10 +9,13 @@ import re
 from app.wiki.domain import WikiSlugError, normalize_slug
 
 
-_AUTOLINK_RE = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]+>")
+_AUTOLINK_RE = re.compile(r"<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^\x00-\x20\x7f<>]*>")
 _REFERENCE_DEFINITION_RE = re.compile(r"(?m)^[ \t]{0,3}\[[^\]\r\n]+\]:[^\r\n]*(?:\r\n|\r|\n|$)")
-_WIKI_LINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|[^\]]*)?\]\]")
-_WIKI_MARKUP_RE = re.compile(r"\[\[[^\]\r\n]*\]\]")
+_WIKI_TARGET_RE = r"[^\]|\r\n]+"
+_WIKI_DISPLAY_RE = r"[^\]\r\n]*"
+_WIKI_LINK_RE = re.compile(rf"\[\[({_WIKI_TARGET_RE})(?:\|{_WIKI_DISPLAY_RE})?\]\]")
+_WIKI_MARKUP_RE = re.compile(rf"\[\[{_WIKI_TARGET_RE}(?:\|{_WIKI_DISPLAY_RE})?\]\]")
+_MULTILINE_WIKI_MARKUP_RE = re.compile(r"\[\[[^\]]*[\r\n][^\]]*\]\]")
 _ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_]")
 
 
@@ -77,7 +80,7 @@ def linkify_markdown(
     code_spans.extend(_inline_code_spans(content, code_spans))
     code_spans = _merge_spans(code_spans)
     non_wiki_markdown_spans = _non_wiki_markdown_spans(content)
-    wiki_markup_spans = [(match.start(), match.end()) for match in _WIKI_MARKUP_RE.finditer(content)]
+    wiki_markup_spans = _wiki_markup_spans(content)
     spans = _merge_spans(code_spans + wiki_markup_spans + non_wiki_markdown_spans)
     unsafe_body_spans = _merge_spans(code_spans + non_wiki_markdown_spans)
     existing_slugs = set(_extract_safe_wiki_links(content, unsafe_body_spans))
@@ -291,8 +294,14 @@ def _inline_code_spans(content: str, fenced_spans: list[tuple[int, int]]) -> lis
 
 
 def _markdown_spans(content: str) -> list[tuple[int, int]]:
-    spans = [(match.start(), match.end()) for match in _WIKI_MARKUP_RE.finditer(content)]
+    spans = _wiki_markup_spans(content)
     spans.extend(_non_wiki_markdown_spans(content))
+    return spans
+
+
+def _wiki_markup_spans(content: str) -> list[tuple[int, int]]:
+    spans = [(match.start(), match.end()) for match in _WIKI_MARKUP_RE.finditer(content)]
+    spans.extend((match.start(), match.end()) for match in _MULTILINE_WIKI_MARKUP_RE.finditer(content))
     return spans
 
 

@@ -4,7 +4,7 @@ import importlib
 
 import pytest
 
-from app.wiki.domain import WikiSlugError
+from app.wiki.domain import WikiSlugError, extract_wiki_links
 
 
 def _api():
@@ -148,6 +148,22 @@ def test_extract_safe_wiki_links_accepts_two_character_uri_schemes() -> None:
     )
 
 
+def test_empty_uri_autolink_is_protected_but_later_safe_text_is_linked() -> None:
+    content = "<ab:> ab"
+
+    result = _linkify(
+        content,
+        current_slug="concept/overview",
+        candidates=(
+            _candidate("concept/uri", "<ab:>"),
+            _candidate("concept/ab", "ab"),
+        ),
+    )
+
+    assert result.content == "<ab:> [[concept/ab|ab]]"
+    assert result.added_slugs == ("concept/ab",)
+
+
 @pytest.mark.parametrize("scheme", ["x", "a" * 33])
 def test_invalid_length_uri_schemes_leave_wiki_markup_in_safe_body(scheme: str) -> None:
     content = f"<{scheme}:[[topic|Topic]]> Topic"
@@ -163,6 +179,36 @@ def test_invalid_length_uri_schemes_leave_wiki_markup_in_safe_body(scheme: str) 
 def test_custom_uri_autolink_does_not_suppress_later_safe_candidate() -> None:
     content = "<foo:[[concept/ai|AI]]> AI"
 
+    result = _linkify(
+        content,
+        current_slug="concept/overview",
+        candidates=(_candidate("concept/ai", "AI"),),
+    )
+
+    assert result.content == content[:-2] + "[[concept/ai|AI]]"
+    assert result.added_slugs == ("concept/ai",)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "[[concept/\nAI]]",
+        "[[concept/ai|prefix\nAI]]",
+    ],
+)
+def test_cross_line_wiki_markup_is_not_extracted_by_helper_or_domain(content: str) -> None:
+    assert _api().extract_safe_wiki_links(content) == ()
+    assert extract_wiki_links(content) == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "[[concept/\nAI]] AI",
+        "[[concept/ai|prefix\nAI]] AI",
+    ],
+)
+def test_linkify_does_not_insert_into_cross_line_wiki_markup(content: str) -> None:
     result = _linkify(
         content,
         current_slug="concept/overview",
@@ -439,27 +485,18 @@ def test_markdown_bracket_scan_is_near_linear_with_many_unclosed_brackets() -> N
     assert content.index_reads < 100_000
 
 
-def test_main_scan_uses_cursor_for_many_protected_spans(monkeypatch) -> None:
+def test_main_scan_does_not_use_legacy_linear_protected_lookup(monkeypatch) -> None:
     module = _api()
-    comparisons = 0
 
-    def counted_protected_end(spans, index):
-        nonlocal comparisons
-        for start, end in spans:
-            comparisons += 1
-            if index < start:
-                return None
-            if start <= index < end:
-                return end
-        return None
+    def fail_on_legacy_lookup(*_args, **_kwargs):
+        pytest.fail("主扫描不应对每个字符线性扫描所有 protected spans")
 
-    monkeypatch.setattr(module, "_protected_end", counted_protected_end)
+    monkeypatch.setattr(module, "_protected_end", fail_on_legacy_lookup)
     content = " ".join("[AI](x)" for _ in range(4000))
 
     result = module.linkify_markdown(content, current_slug="concept/overview", candidates=())
 
     assert result == module.LinkifyResult(content, False, ())
-    assert comparisons < 100_000
 
 
 def test_markdown_parenthesis_scan_is_near_linear_with_many_unclosed_destinations() -> None:
