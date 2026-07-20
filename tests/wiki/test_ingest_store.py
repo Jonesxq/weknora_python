@@ -2276,7 +2276,6 @@ async def test_lock_index_identity_uses_scoped_unfiltered_for_update_query() -> 
         [("index", "concept", "published")],
         [("other", "index", "published")],
         [("index", "index", "draft")],
-        [("index", "index", "archived")],
     ],
 )
 async def test_lock_index_identity_rejects_conflicting_rows(
@@ -2296,12 +2295,10 @@ async def test_lock_index_identity_rejects_conflicting_rows(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("op", ["ingest", "noop"])
 async def test_apply_rejects_forged_index_plan_before_page_or_link_writes(
-    op: str,
 ) -> None:
     token = uuid4()
-    pending = _pending(op=op, claimed=True)
+    pending = _pending(op="noop", claimed=True)
     pending.claim_token = token
     request = _batch_request(
         claim_token=token,
@@ -2316,14 +2313,16 @@ async def test_apply_rejects_forged_index_plan_before_page_or_link_writes(
         [
             _ScriptedResult(),
             _ScriptedResult(rows=[pending]),
-            *([_ScriptedResult(rows=[])] if op == "ingest" else []),
         ]
     )
     store = SqlAlchemyIngestStore(
         _OneSessionFactory(session), _RecordingFinalization(session.events)
     )  # type: ignore[arg-type]
 
-    with pytest.raises(InvariantError, match="Index"):
+    with pytest.raises(
+        InvariantError,
+        match="^Index intro 计划没有对应的成功增量操作$",
+    ):
         await store._apply_batch_results(SCOPE, request, require_taxonomy=False)
 
     assert session.rolled_back is True
@@ -2332,6 +2331,62 @@ async def test_apply_rejects_forged_index_plan_before_page_or_link_writes(
         _sql(statement).startswith(("INSERT", "UPDATE", "DELETE"))
         for statement in session.statements
     )
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
+async def test_lock_index_identity_returns_archived_canonical_row() -> None:
+    page = _page(slug="index", page_type="index")
+    page.status = "archived"
+    session = _ScriptedSession([_ScriptedResult(rows=[page])])
+
+    selected = await ingest_store._lock_index_identity(session, SCOPE)
+
+    assert selected is page
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("op", ["ingest", "retract"])
+async def test_index_plan_allows_successful_operation_without_contribution_delta(
+    op: str,
+) -> None:
+    token = uuid4()
+    pending = _pending(op=op, claimed=True)
+    pending.claim_token = token
+    request = _batch_request(
+        claim_token=token,
+        pages=(),
+        contribution_deltas=(),
+        completed_op_ids=(pending.id,),
+        expected_pages=(),
+        index_intro_plan=IndexIntroPlan(
+            mode="create",
+            intro=f"Created after {op}",
+            model_status="generated",
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            *([_ScriptedResult(rows=[])] if op == "ingest" else []),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(scalar=uuid4()),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=0),
+        ]
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), _RecordingFinalization(session.events)
+    )  # type: ignore[arg-type]
+
+    assert await store.apply_results(SCOPE, request) is True
+
+    log = next(item for item in session.added if isinstance(item, WikiLogEntry))
+    assert log.message.endswith("Index=created")
+    assert log.pages_affected == [{"slug": "index", "title": "Index"}]
     session.assert_consumed()
 
 
@@ -2416,9 +2471,11 @@ async def test_create_index_intro_conflict_rechecks_identity_and_skips_canonical
 
 
 @pytest.mark.asyncio
-async def test_create_index_intro_conflict_recheck_rejects_noncanonical() -> None:
+async def test_create_index_intro_conflict_recheck_skips_archived_canonical() -> None:
     conflict = _page(slug="index", page_type="index")
     conflict.status = "archived"
+    original_content = conflict.content
+    original_version = conflict.version
     plan = IndexIntroPlan(
         mode="create", intro="Losing intro", model_status="generated"
     )
@@ -2430,11 +2487,14 @@ async def test_create_index_intro_conflict_recheck_rejects_noncanonical() -> Non
         ]
     )
 
-    with pytest.raises(InvariantError, match="Index"):
-        await ingest_store._apply_index_intro_plan(
-            session, SCOPE, plan, stale=False
-        )
+    outcome = await ingest_store._apply_index_intro_plan(
+        session, SCOPE, plan, stale=False
+    )
 
+    assert outcome.result == "stale_skipped"
+    assert outcome.changed_page is None
+    assert conflict.content == original_content
+    assert conflict.version == original_version
     session.assert_consumed()
 
 
@@ -3496,6 +3556,99 @@ async def test_modern_apply_linkifies_final_selected_pages_without_version_bump(
 
 
 @pytest.mark.asyncio
+async def test_archived_canonical_index_update_is_stale_while_page_commits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = uuid4()
+    pending = _pending(claimed=True)
+    pending.claim_token = token
+    page = ReducedPage(
+        slug="summary/committed",
+        title="Committed summary",
+        page_type="summary",
+        content="Committed body",
+        summary="Committed summary",
+        contributor_op_ids=[pending.id],
+    )
+    current = _stored_contribution(version=pending.op_version).model_copy(
+        update={
+            "slug": page.slug,
+            "page_type": page.page_type,
+            "title": page.title,
+            "content": page.content,
+            "summary": page.summary,
+            "aliases": (),
+            "chunk_refs": (),
+        }
+    )
+    archived_index = _page(slug="index", page_type="index")
+    archived_index.status = "archived"
+    original_intro = archived_index.content
+    original_version = archived_index.version
+    request = _batch_request(
+        claim_token=token,
+        pages=(page,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=pending.id,
+                action="add",
+                slug=page.slug,
+                knowledge_id=pending.knowledge_id,
+                previous=None,
+                current=current,
+            ),
+        ),
+        completed_op_ids=(pending.id,),
+        expected_pages=(PageExpectation(slug=page.slug),),
+        index_intro_plan=IndexIntroPlan(
+            mode="update",
+            expected_page_id=archived_index.id,
+            expected_version=archived_index.version,
+            intro="Must not replace archived intro",
+            model_status="generated",
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[pending]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rows=[]),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(rows=[archived_index]),
+            _ScriptedResult(rowcount=1),
+            _ScriptedResult(),
+            _ScriptedResult(scalar=0),
+        ]
+    )
+
+    async def no_replace(*_args) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "app.wiki.ingest.store.SqlAlchemyPageStore.replace_page_links", no_replace
+    )
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), _RecordingFinalization(session.events)
+    )  # type: ignore[arg-type]
+
+    assert await store.apply_results(SCOPE, request) is True
+
+    stored_page = next(
+        item
+        for item in session.added
+        if isinstance(item, WikiPage) and item.slug == page.slug
+    )
+    assert stored_page.content == page.content
+    assert archived_index.content == original_intro
+    assert archived_index.version == original_version
+    log = next(item for item in session.added if isinstance(item, WikiLogEntry))
+    assert log.message.endswith("Index=stale_skipped")
+    assert log.pages_affected == [{"slug": page.slug, "title": page.title}]
+    session.assert_consumed()
+
+
+@pytest.mark.asyncio
 async def test_modern_apply_excludes_failed_and_superseded_pages_from_fresh_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4412,11 +4565,6 @@ async def test_later_retract_supersedes_ingest_without_writing_its_slug(
         ),
         completed_op_ids=(ingest.id,),
         expected_pages=(PageExpectation(slug=page.slug),),
-        index_intro_plan=IndexIntroPlan(
-            mode="create",
-            intro="Stale model output",
-            model_status="generated",
-        ),
     )
     session = _ScriptedSession(
         [
@@ -4453,7 +4601,7 @@ async def test_later_retract_supersedes_ingest_without_writing_its_slug(
     log = next(item for item in session.added if isinstance(item, WikiLogEntry))
     assert log.message == (
         "完成 0 个 Wiki 操作，跳过 1 个过期操作；"
-        "自动链接页面=0，新增链接=0，Index=stale_skipped"
+        "自动链接页面=0，新增链接=0，Index=not_requested"
     )
     assert not any(
         _sql(statement).startswith("SELECT wiki_pages.")
@@ -4477,6 +4625,64 @@ async def test_later_retract_supersedes_ingest_without_writing_its_slug(
         assert replay.applied is False
         assert replay.completed_op_ids == replay.failed_op_ids == ()
         assert replay.superseded_op_ids == (ingest.id,)
+
+
+@pytest.mark.asyncio
+async def test_index_plan_rejects_when_all_completed_operations_are_superseded() -> None:
+    token = uuid4()
+    ingest = _pending(claimed=True)
+    ingest.claim_token = token
+    retract = _pending(
+        knowledge_id=ingest.knowledge_id,
+        op="retract",
+        version="delete-1",
+    )
+    retract.enqueued_at = NOW + timedelta(seconds=1)
+    current = _stored_contribution(version=ingest.op_version)
+    page = _result_page().model_copy(update={"contributor_op_ids": [ingest.id]})
+    request = _batch_request(
+        claim_token=token,
+        pages=(page,),
+        contribution_deltas=(
+            ContributionDelta(
+                pending_op_id=ingest.id,
+                action="add",
+                slug=current.slug,
+                knowledge_id=current.knowledge_id,
+                previous=None,
+                current=current,
+            ),
+        ),
+        completed_op_ids=(ingest.id,),
+        expected_pages=(PageExpectation(slug=page.slug),),
+        index_intro_plan=IndexIntroPlan(
+            mode="create",
+            intro="Stale model output",
+            model_status="generated",
+        ),
+    )
+    session = _ScriptedSession(
+        [
+            _ScriptedResult(),
+            _ScriptedResult(rows=[ingest]),
+            _ScriptedResult(rows=[retract]),
+        ]
+    )
+    finalization = _RecordingFinalization(session.events)
+    store = SqlAlchemyIngestStore(
+        _OneSessionFactory(session), finalization
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(
+        InvariantError,
+        match="^Index intro 计划没有对应的成功增量操作$",
+    ):
+        await store.apply_results(SCOPE, request)
+
+    assert session.rolled_back is True
+    assert session.added == []
+    assert finalization.requests == []
+    session.assert_consumed()
 
 
 @pytest.mark.asyncio

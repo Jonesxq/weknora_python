@@ -222,7 +222,7 @@ async def _lock_index_identity(
         or row.knowledge_base_id != scope.knowledge_base_id
         or row.slug != "index"
         or row.page_type != "index"
-        or row.status != "published"
+        or row.status not in {"published", "archived"}
         or row.deleted_at is not None
     ):
         raise InvariantError("Index 页面身份不是 canonical published 页面")
@@ -241,6 +241,8 @@ async def _apply_index_intro_plan(
     if stale:
         return _IndexApplyOutcome("stale_skipped")
     row = await _lock_index_identity(session, scope)
+    if row is not None and row.status != "published":
+        return _IndexApplyOutcome("stale_skipped")
     if plan.mode == "create" and plan.expected_page_id is None:
         if row is not None:
             return _IndexApplyOutcome("stale_skipped")
@@ -2658,17 +2660,13 @@ class SqlAlchemyIngestStore:
                 index_plan_stale = tuple(completed_ids) != tuple(
                     request.completed_op_ids
                 )
-                if request.index_intro_plan is not None and not index_plan_stale:
-                    active_delta_ids = {
-                        delta.pending_op_id for delta in active_deltas
-                    }
+                if request.index_intro_plan is not None:
                     if not any(
-                        op_id in active_delta_ids
-                        and pending_by_id[op_id].op in {"ingest", "retract"}
+                        pending_by_id[op_id].op in {"ingest", "retract"}
                         for op_id in completed_ids
                     ):
                         raise InvariantError(
-                            "Index 计划必须来自实际完成且有贡献差量的 Wiki 操作"
+                            "Index intro 计划没有对应的成功增量操作"
                         )
 
                 auto_superseded_slugs = {
