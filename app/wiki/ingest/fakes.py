@@ -59,6 +59,8 @@ class _ModelResponses(_StrictModel):
     def validate_embedding_responses(cls, value: object) -> object:
         if not isinstance(value, Mapping):
             raise ValueError("embeddings 响应必须是映射")
+        if not value:
+            return {}
         for raw_key in value:
             if not isinstance(raw_key, str) or _normalize_embedding_key(raw_key) != raw_key:
                 raise ValueError("embeddings 响应键必须是非空规范 key")

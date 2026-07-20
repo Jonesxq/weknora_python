@@ -8,14 +8,22 @@ from uuid import UUID
 
 import pytest
 from celery.exceptions import Retry
+import yaml
 
 from app.wiki.ingest.errors import WikiBatchBusy
-from app.wiki.ingest.schemas import BatchResult
+from app.wiki.ingest.schemas import BatchResult, WikiWorkerOptions
 from app.wiki.tasks import wiki_tasks
 from app.wiki.tasks.tombstones import MemoryTombstones, RedisTombstones
 
 
 KB_ID = UUID("11111111-1111-1111-1111-111111111111")
+ROOT = Path(__file__).resolve().parents[2]
+TAXONOMY_ENV_DEFAULTS = {
+    "GRAPH_WIKI_TAXONOMY_TOPIC_BATCH_SIZE": "60",
+    "GRAPH_WIKI_TAXONOMY_PARALLEL": "4",
+    "GRAPH_WIKI_TAXONOMY_FULL_CATALOG_LIMIT": "120",
+    "GRAPH_WIKI_TAXONOMY_RELATED_FOLDER_LIMIT": "40",
+}
 
 
 def _write_fake_fixture(path: Path) -> None:
@@ -227,6 +235,11 @@ async def test_build_runtime_creates_independent_batch_resources_and_disposes_ow
     assert first.worker._store is first.enqueue.store
     assert second.worker._store is second.enqueue.store
     assert first.worker._store is not second.worker._store
+    assert first.embedding_model is first.worker._embedding_model
+    assert second.embedding_model is second.worker._embedding_model
+    assert first.embedding_model is not second.embedding_model
+    assert first.embedding_model is not first.worker._model
+    assert second.embedding_model is not second.worker._model
     assert first.worker._locks is second.worker._locks is locks
     assert isinstance(first.tombstones, MemoryTombstones)
     assert isinstance(second.tombstones, MemoryTombstones)
@@ -241,6 +254,54 @@ async def test_build_runtime_creates_independent_batch_resources_and_disposes_ow
     assert engines[1].dispose_count == 0
     await second.aclose()
     assert engines[1].dispose_count == 1
+
+
+def test_taxonomy_runtime_environment_defaults_are_documented_and_worker_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for key in TAXONOMY_ENV_DEFAULTS:
+        monkeypatch.delenv(key, raising=False)
+
+    options = WikiWorkerOptions.from_env()
+
+    assert {
+        "GRAPH_WIKI_TAXONOMY_TOPIC_BATCH_SIZE": str(
+            options.taxonomy_topic_batch_size
+        ),
+        "GRAPH_WIKI_TAXONOMY_PARALLEL": str(options.taxonomy_parallel),
+        "GRAPH_WIKI_TAXONOMY_FULL_CATALOG_LIMIT": str(
+            options.taxonomy_full_catalog_limit
+        ),
+        "GRAPH_WIKI_TAXONOMY_RELATED_FOLDER_LIMIT": str(
+            options.taxonomy_related_folder_limit
+        ),
+    } == TAXONOMY_ENV_DEFAULTS
+
+    env_values = dict(
+        line.split("=", 1)
+        for raw_line in (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+        if (line := raw_line.strip()) and not line.startswith("#") and "=" in line
+    )
+    assert {key: env_values.get(key) for key in TAXONOMY_ENV_DEFAULTS} == (
+        TAXONOMY_ENV_DEFAULTS
+    )
+
+    compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    services = compose["services"]
+    worker_environment = dict(
+        item.split("=", 1) for item in services["wiki-worker"]["environment"]
+    )
+    expected_compose = {
+        key: f"${{{key}:-{default}}}"
+        for key, default in TAXONOMY_ENV_DEFAULTS.items()
+    }
+    assert {key: worker_environment.get(key) for key in expected_compose} == (
+        expected_compose
+    )
+    for service in ("postgres", "redis", "outbox-dispatcher"):
+        service_environment = services[service].get("environment", [])
+        service_keys = {str(item).split("=", 1)[0] for item in service_environment}
+        assert TAXONOMY_ENV_DEFAULTS.keys().isdisjoint(service_keys)
 
 
 def test_build_runtime_defaults_to_independent_redis_tombstones(

@@ -8,7 +8,7 @@ from uuid import UUID
 
 import pytest
 
-from app.wiki.ingest.fakes import FakeDataset
+from app.wiki.ingest.fakes import FakeDataset, load_fake_runtime_adapters
 from app.wiki.ingest.schemas import EnqueueResult
 from app.wiki.tasks import enqueue_fake, wiki_tasks
 
@@ -304,6 +304,26 @@ def test_example_fixture_has_strict_incremental_model_responses() -> None:
     fixture_path = Path(__file__).parents[2] / "examples" / "wiki_fake_data.json"
     raw = json.loads(fixture_path.read_text(encoding="utf-8"))
     dataset = FakeDataset.model_validate(raw)
+    source, chat_model, embedding_model = load_fake_runtime_adapters(fixture_path)
+
+    assert source is not chat_model
+    assert chat_model is not embedding_model
+    assert embedding_model is not source
+    assert embedding_model.calls == []
+    assert dataset.model_responses.embeddings == {}
+    assert {
+        key: [
+            (decision.slug, decision.new_segments) for decision in output.decisions
+        ]
+        for key, output in dataset.model_responses.taxonomies.items()
+    } == {
+        "concept/retrieval": [("concept/retrieval", ())],
+        "entity/acme": [("entity/acme", ("Organizations", "Products"))],
+        "concept/retrieval,entity/acme": [
+            ("concept/retrieval", ()),
+            ("entity/acme", ("Organizations", "Products")),
+        ],
+    }
 
     citations = dataset.model_responses.citations["knowledge-1"]
     assert len(citations) >= 2

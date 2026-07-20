@@ -115,6 +115,37 @@
         "candidate_slug": "concept/grounding",
         "canonical_slug": "concept/retrieval"
       }
+    },
+    "embeddings": {},
+    "taxonomies": {
+      "concept/retrieval": {
+        "decisions": [
+          {
+            "slug": "concept/retrieval",
+            "new_segments": []
+          }
+        ]
+      },
+      "entity/acme": {
+        "decisions": [
+          {
+            "slug": "entity/acme",
+            "new_segments": ["Organizations", "Products"]
+          }
+        ]
+      },
+      "concept/retrieval,entity/acme": {
+        "decisions": [
+          {
+            "slug": "concept/retrieval",
+            "new_segments": []
+          },
+          {
+            "slug": "entity/acme",
+            "new_segments": ["Organizations", "Products"]
+          }
+        ]
+      }
     }
   },
   "transient_failures": {}

@@ -361,6 +361,18 @@ def test_fixture_rejects_embedding_identity_and_finite_value_boundaries(
         FakeDataset.model_validate(payload)
 
 
+def test_fixture_accepts_explicit_empty_embeddings_with_independent_state() -> None:
+    payload = deepcopy(FIXTURE)
+    payload["model_responses"]["embeddings"] = {}
+
+    first = FakeDataset.model_validate(payload)
+    second = FakeDataset.model_validate(payload)
+
+    assert first.model_responses.embeddings == second.model_responses.embeddings == {}
+    assert first.model_responses.embeddings is not second.model_responses.embeddings
+    assert first.model_responses.embeddings is not payload["model_responses"]["embeddings"]
+
+
 @pytest.mark.parametrize("batch_key", ["", ",entity/acme", "entity/acme,"])
 def test_fixture_rejects_empty_taxonomy_batch_key_segments(batch_key: str) -> None:
     payload = deepcopy(FIXTURE)

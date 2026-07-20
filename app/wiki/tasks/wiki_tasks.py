@@ -22,8 +22,8 @@ from app.infrastructure.database.session import create_database_engine, create_s
 from app.infrastructure.tasks.celery_app import celery_app
 from app.wiki.ingest.enqueue import WikiEnqueueService
 from app.wiki.ingest.errors import WikiBatchBusy
-from app.wiki.ingest.fakes import load_fake_adapters
-from app.wiki.ingest.ports import TombstonePort
+from app.wiki.ingest.fakes import load_fake_runtime_adapters
+from app.wiki.ingest.ports import EmbeddingModelPort, TombstonePort
 from app.wiki.ingest.schemas import BatchResult, WikiWorkerOptions
 from app.wiki.ingest.store import SqlAlchemyIngestStore, SqlFinalizationPort
 from app.wiki.ingest.worker import WikiIngestWorker
@@ -42,6 +42,7 @@ class WikiTaskRuntime:
     worker: WikiIngestWorker
     enqueue: WikiEnqueueService
     tombstones: TombstonePort
+    embedding_model: EmbeddingModelPort
 
     async def aclose(self) -> None:
         await self.engine.dispose()
@@ -198,7 +199,7 @@ def build_runtime() -> WikiTaskRuntime:
     else:
         raise RuntimeError("GRAPH_WIKI_TOMBSTONE_MODE 只能是 redis 或 memory")
     locks = build_lock_manager_from_env()
-    source, model = load_fake_adapters(Path(fixture_value))
+    source, model, embedding_model = load_fake_runtime_adapters(Path(fixture_value))
 
     engine = create_database_engine(database_settings)
     session_factory = create_session_factory(engine)
@@ -208,6 +209,7 @@ def build_runtime() -> WikiTaskRuntime:
         locks=locks,
         source=source,
         model=model,
+        embedding_model=embedding_model,
         tombstones=tombstones,
         options=worker_options,
     )
@@ -217,6 +219,7 @@ def build_runtime() -> WikiTaskRuntime:
         worker=worker,
         enqueue=enqueue,
         tombstones=tombstones,
+        embedding_model=embedding_model,
     )
 
 
