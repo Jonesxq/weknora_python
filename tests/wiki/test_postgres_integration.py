@@ -1603,6 +1603,227 @@ async def test_page_store_enforces_scope_links_and_optimistic_version(
         await service.get_page(other_tenant, source.slug)
 
 
+async def _create_graph_page(
+    service: WikiPageService,
+    scope: WikiScope,
+    *,
+    slug: str,
+    page_type: str = "entity",
+    content: str = "",
+):
+    return await service.create_page(
+        scope,
+        WikiPageCreateRequest(
+            slug=slug,
+            title=slug,
+            page_type=page_type,
+            content=content,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_graph_excludes_inactive_unresolved_edges_and_sorts_visible_edges(
+    postgres_session: AsyncSession,
+) -> None:
+    scope = WikiScope(
+        tenant_id=7,
+        knowledge_base_id=uuid4(),
+        actor_id="owner-graph-visible",
+        can_write=True,
+    )
+    pages = WikiPageService(SqlAlchemyPageStore(postgres_session))
+    active_a = await _create_graph_page(
+        pages, scope, slug="entity/active-a"
+    )
+    active_z = await _create_graph_page(
+        pages,
+        scope,
+        slug="entity/active-z",
+        content=f"[[{active_a.slug}]]",
+    )
+    archived_target = await _create_graph_page(
+        pages, scope, slug="entity/archived-target"
+    )
+    deleted_target = await _create_graph_page(
+        pages, scope, slug="entity/deleted-target"
+    )
+    source = await _create_graph_page(
+        pages,
+        scope,
+        slug="entity/source",
+        content=" ".join(
+            f"[[{slug}]]"
+            for slug in (
+                active_z.slug,
+                active_a.slug,
+                archived_target.slug,
+                deleted_target.slug,
+                "entity/missing-target",
+            )
+        ),
+    )
+    archived_source = await _create_graph_page(
+        pages,
+        scope,
+        slug="entity/archived-source",
+        content=f"[[{active_a.slug}]]",
+    )
+    deleted_source = await _create_graph_page(
+        pages,
+        scope,
+        slug="entity/deleted-source",
+        content=f"[[{active_a.slug}]]",
+    )
+    await postgres_session.execute(
+        update(WikiPage)
+        .where(WikiPage.id.in_([archived_target.id, archived_source.id]))
+        .values(status="archived")
+    )
+    await postgres_session.execute(
+        update(WikiPage)
+        .where(WikiPage.id.in_([deleted_target.id, deleted_source.id]))
+        .values(deleted_at=datetime.now(UTC))
+    )
+    await postgres_session.commit()
+
+    source_links = {
+        link.target_slug: link.target_page_id
+        for link in (
+            await postgres_session.execute(
+                select(WikiLink).where(
+                    WikiLink.tenant_id == scope.tenant_id,
+                    WikiLink.knowledge_base_id == scope.knowledge_base_id,
+                    WikiLink.source_page_id == source.id,
+                )
+            )
+        ).scalars()
+    }
+    assert source_links[active_a.slug] == active_a.id
+    assert source_links[active_z.slug] == active_z.id
+    assert source_links[archived_target.slug] == archived_target.id
+    assert source_links[deleted_target.slug] == deleted_target.id
+    assert source_links["entity/missing-target"] is None
+    stale_source_ids = set(
+        (
+            await postgres_session.execute(
+                select(WikiLink.source_page_id).where(
+                    WikiLink.source_page_id.in_(
+                        [archived_source.id, deleted_source.id]
+                    )
+                )
+            )
+        ).scalars()
+    )
+    assert stale_source_ids == {archived_source.id, deleted_source.id}
+
+    graph = await WikiQueryService(postgres_session).get_graph(
+        scope,
+        mode="overview",
+        center=None,
+        hops=1,
+        limit=3,
+        types={"entity"},
+    )
+
+    assert [(node.slug, node.link_count) for node in graph.nodes] == [
+        (active_a.slug, 2),
+        (active_z.slug, 2),
+        (source.slug, 2),
+    ]
+    assert [(edge.source, edge.target) for edge in graph.edges] == [
+        (active_z.slug, active_a.slug),
+        (source.slug, active_a.slug),
+        (source.slug, active_z.slug),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_graph_overview_returns_only_edges_between_top_nodes(
+    postgres_session: AsyncSession,
+) -> None:
+    scope = WikiScope(
+        tenant_id=7,
+        knowledge_base_id=uuid4(),
+        actor_id="owner-graph-overview",
+        can_write=True,
+    )
+    pages = WikiPageService(SqlAlchemyPageStore(postgres_session))
+    page_c = await _create_graph_page(pages, scope, slug="entity/c")
+    page_b = await _create_graph_page(
+        pages,
+        scope,
+        slug="entity/b",
+        content=f"[[{page_c.slug}]]",
+    )
+    page_a = await _create_graph_page(
+        pages,
+        scope,
+        slug="entity/a",
+        content=f"[[{page_b.slug}]]",
+    )
+    await postgres_session.commit()
+
+    graph = await WikiQueryService(postgres_session).get_graph(
+        scope,
+        mode="overview",
+        center=None,
+        hops=1,
+        limit=2,
+        types={"entity"},
+    )
+
+    assert [(node.slug, node.link_count) for node in graph.nodes] == [
+        (page_b.slug, 2),
+        (page_a.slug, 1),
+    ]
+    assert [(edge.source, edge.target) for edge in graph.edges] == [
+        (page_a.slug, page_b.slug)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_graph_types_do_not_expand_through_hidden_frontier(
+    postgres_session: AsyncSession,
+) -> None:
+    scope = WikiScope(
+        tenant_id=7,
+        knowledge_base_id=uuid4(),
+        actor_id="owner-graph-types",
+        can_write=True,
+    )
+    pages = WikiPageService(SqlAlchemyPageStore(postgres_session))
+    second_hop = await _create_graph_page(
+        pages, scope, slug="entity/second-hop"
+    )
+    hidden_middle = await _create_graph_page(
+        pages,
+        scope,
+        slug="concept/hidden-middle",
+        page_type="concept",
+        content=f"[[{second_hop.slug}]]",
+    )
+    center = await _create_graph_page(
+        pages,
+        scope,
+        slug="entity/center",
+        content=f"[[{hidden_middle.slug}]]",
+    )
+    await postgres_session.commit()
+
+    graph = await WikiQueryService(postgres_session).get_graph(
+        scope,
+        mode="ego",
+        center=center.slug,
+        hops=2,
+        limit=10,
+        types={"entity"},
+    )
+
+    assert [node.slug for node in graph.nodes] == [center.slug]
+    assert graph.edges == []
+
+
 @pytest.mark.asyncio
 async def test_ingest_store_is_atomic_idempotent_and_writes_follow_up(
     postgres_factory: async_sessionmaker[AsyncSession],

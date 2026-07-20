@@ -112,17 +112,56 @@ def build_search_statement(scope: WikiScope, query: str, *, limit: int):
     )
 
 
-def _graph_degree_cte(scope: WikiScope):
-    edge_nodes = union_all(
-        select(WikiLink.source_page_id.label("page_id")).where(
-            WikiLink.tenant_id == scope.tenant_id,
-            WikiLink.knowledge_base_id == scope.knowledge_base_id,
-        ),
-        select(WikiLink.target_page_id.label("page_id")).where(
+def build_index_intro_statement(scope: WikiScope):
+    return (
+        select(
+            WikiPage.slug,
+            WikiPage.page_type,
+            WikiPage.content,
+            WikiPage.version,
+        )
+        .where(
+            *_active_page_scope(scope),
+            or_(
+                WikiPage.slug == "index",
+                WikiPage.page_type == WikiPageType.INDEX.value,
+            ),
+        )
+        .limit(2)
+    )
+
+
+def _visible_edges_cte(scope: WikiScope):
+    source_page = aliased(WikiPage, name="source_page")
+    target_page = aliased(WikiPage, name="target_page")
+    return (
+        select(WikiLink.source_page_id, WikiLink.target_page_id)
+        .select_from(WikiLink)
+        .join(source_page, source_page.id == WikiLink.source_page_id)
+        .join(target_page, target_page.id == WikiLink.target_page_id)
+        .where(
             WikiLink.tenant_id == scope.tenant_id,
             WikiLink.knowledge_base_id == scope.knowledge_base_id,
             WikiLink.target_page_id.is_not(None),
-        ),
+            source_page.tenant_id == scope.tenant_id,
+            source_page.knowledge_base_id == scope.knowledge_base_id,
+            source_page.deleted_at.is_(None),
+            source_page.status == "published",
+            target_page.tenant_id == scope.tenant_id,
+            target_page.knowledge_base_id == scope.knowledge_base_id,
+            target_page.deleted_at.is_(None),
+            target_page.status == "published",
+        )
+        .cte("visible_edges")
+    )
+
+
+def _graph_degree_cte(scope: WikiScope, visible_edges=None):
+    if visible_edges is None:
+        visible_edges = _visible_edges_cte(scope)
+    edge_nodes = union_all(
+        select(visible_edges.c.source_page_id.label("page_id")),
+        select(visible_edges.c.target_page_id.label("page_id")),
     ).cte("edge_nodes")
     return (
         select(edge_nodes.c.page_id, func.count().label("link_count"))
@@ -141,11 +180,15 @@ def build_ego_neighbor_statement(
 ):
     """为一层 BFS 返回去重、稳定排序且受预算限制的邻居。"""
 
+    visible_edges = _visible_edges_cte(scope)
     neighbor = aliased(WikiPage, name="neighbor")
-    degree = _graph_degree_cte(scope)
+    degree = _graph_degree_cte(scope, visible_edges)
     neighbor_id = case(
-        (WikiLink.source_page_id.in_(frontier), WikiLink.target_page_id),
-        else_=WikiLink.source_page_id,
+        (
+            visible_edges.c.source_page_id.in_(frontier),
+            visible_edges.c.target_page_id,
+        ),
+        else_=visible_edges.c.source_page_id,
     )
     link_count = func.coalesce(degree.c.link_count, 0).label("link_count")
     statement = (
@@ -156,16 +199,13 @@ def build_ego_neighbor_statement(
             neighbor.page_type,
             link_count,
         )
-        .select_from(WikiLink)
+        .select_from(visible_edges)
         .join(neighbor, neighbor.id == neighbor_id)
         .outerjoin(degree, degree.c.page_id == neighbor.id)
         .where(
-            WikiLink.tenant_id == scope.tenant_id,
-            WikiLink.knowledge_base_id == scope.knowledge_base_id,
-            WikiLink.target_page_id.is_not(None),
             or_(
-                WikiLink.source_page_id.in_(frontier),
-                WikiLink.target_page_id.in_(frontier),
+                visible_edges.c.source_page_id.in_(frontier),
+                visible_edges.c.target_page_id.in_(frontier),
             ),
             neighbor.tenant_id == scope.tenant_id,
             neighbor.knowledge_base_id == scope.knowledge_base_id,
@@ -256,16 +296,20 @@ class WikiQueryService:
         limit: int = 50,
     ) -> WikiIndexResponse:
         limit = max(1, min(limit, 200))
-        intro_result = await self._session.execute(
-            select(WikiPage.content, WikiPage.version)
-            .where(
-                *_active_page_scope(scope),
-                WikiPage.page_type == WikiPageType.INDEX.value,
-            )
-            .order_by(WikiPage.updated_at.desc())
-            .limit(1)
+        intro_rows = list(
+            (await self._session.execute(build_index_intro_statement(scope))).all()
         )
-        intro_row = intro_result.first()
+        if len(intro_rows) > 1 or (
+            intro_rows
+            and (
+                intro_rows[0].slug != "index"
+                or intro_rows[0].page_type != WikiPageType.INDEX.value
+            )
+        ):
+            raise WikiValidationError(
+                "INDEX_IDENTITY_CONFLICT", "canonical Index 身份冲突"
+            )
+        intro_row = intro_rows[0] if intro_rows else None
 
         groups: list[WikiIndexGroup] = []
         for selected_type in ((page_type,) if page_type else self._INDEX_TYPES):
@@ -745,16 +789,21 @@ class WikiQueryService:
     ) -> list[WikiGraphEdgeResponse]:
         if not page_ids:
             return []
+        visible_edges = _visible_edges_cte(scope)
         rows = (
             await self._session.execute(
-                select(WikiLink.source_page_id, WikiLink.target_page_id)
-                .where(
-                    WikiLink.tenant_id == scope.tenant_id,
-                    WikiLink.knowledge_base_id == scope.knowledge_base_id,
-                    WikiLink.source_page_id.in_(page_ids),
-                    WikiLink.target_page_id.in_(page_ids),
+                select(
+                    visible_edges.c.source_page_id,
+                    visible_edges.c.target_page_id,
                 )
-                .order_by(WikiLink.source_page_id, WikiLink.target_page_id)
+                .where(
+                    visible_edges.c.source_page_id.in_(page_ids),
+                    visible_edges.c.target_page_id.in_(page_ids),
+                )
+                .order_by(
+                    visible_edges.c.source_page_id,
+                    visible_edges.c.target_page_id,
+                )
                 .limit(self.GRAPH_EDGE_HARD_LIMIT)
             )
         ).all()
